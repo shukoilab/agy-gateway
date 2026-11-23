@@ -1,0 +1,540 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"agy-gateway/internal/acp"
+	"agy-gateway/internal/config"
+	"agy-gateway/internal/models"
+	"agy-gateway/internal/openai"
+	"agy-gateway/internal/pool"
+	"agy-gateway/internal/telemetry"
+)
+
+// OpenAIHandlers handles public OpenAI-compatible endpoints.
+type OpenAIHandlers struct {
+	cfg           *config.Config
+	pool          *pool.Pool
+	failover      *pool.FailoverCoordinator
+	modelRegistry *models.ModelRegistry
+	translator    *openai.Translator
+	logger        *slog.Logger
+}
+
+// NewOpenAIHandlers creates an initialized handler suite.
+func NewOpenAIHandlers(
+	cfg *config.Config,
+	p *pool.Pool,
+	failover *pool.FailoverCoordinator,
+	modelRegistry *models.ModelRegistry,
+	logger *slog.Logger,
+) *OpenAIHandlers {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &OpenAIHandlers{
+		cfg:           cfg,
+		pool:          p,
+		failover:      failover,
+		modelRegistry: modelRegistry,
+		translator:    openai.NewTranslator(),
+		logger:        logger,
+	}
+}
+
+// HandleChatCompletions serves POST /v1/chat/completions.
+func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	telemetry.DefaultMetrics.RequestsTotal.Add(1)
+
+	var req openai.ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.writeOpenAIError(w, http.StatusBadRequest, "Invalid JSON payload: "+err.Error(), "invalid_request_error", "invalid_json", "")
+		return
+	}
+
+	if req.Model == "" {
+		req.Model = h.modelRegistry.DefaultModel()
+	}
+
+	modelEntry, found := h.modelRegistry.FindModel(req.Model)
+	if !found {
+		h.writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model %q does not exist", req.Model), "invalid_request_error", "model_not_found", "model")
+		return
+	}
+
+	if req.N != nil && *req.N > 1 {
+		h.writeOpenAIError(w, http.StatusBadRequest, "n > 1 is not supported by this gateway", "invalid_request_error", "unsupported_value", "n")
+		return
+	}
+
+	// 1. Translate prompt and deduplicate JIT tools into ACP prompt blocks
+	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+	promptBlocks := h.translator.Translate(&req, delimiter)
+
+	effort := req.ReasoningEffort
+	if effort == "" && modelEntry.PresetEffort != "" {
+		effort = modelEntry.PresetEffort
+	}
+	thoughtLevel := config.MapReasoningEffort(effort, h.cfg.OpenAI.DefaultReasoningEffort)
+
+	// 2. Execute turn through worker pool with transparent failover
+	createdTime := time.Now().Unix()
+	completionID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:14])
+
+	if req.Stream {
+		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID, createdTime)
+	} else {
+		h.handleSync(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID, createdTime)
+	}
+}
+
+func (h *OpenAIHandlers) handleSync(
+	w http.ResponseWriter,
+	r *http.Request,
+	req *openai.ChatCompletionRequest,
+	modelEntry *models.ModelInfo,
+	thoughtLevel string,
+	promptBlocks []acp.PromptBlock,
+	completionID string,
+	createdTime int64,
+) {
+	var fullText strings.Builder
+	var fullThoughts strings.Builder
+	var turnMu sync.Mutex
+
+	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, h.cfg.Accounts.MaxFailoverRetries, func(ctx context.Context, worker *pool.Worker) error {
+		// A. Call session/new (pure editor cwd boundary, 100% compliant with standard ACP)
+		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
+		defer cancelSess()
+
+		newParams := acp.SessionNewParams{
+			CWD: worker.Cwd,
+		}
+		var newResult acp.SessionNewResult
+		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
+			var respErr *acp.ResponseError
+			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
+				time.Sleep(1 * time.Second)
+				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		// B. Apply session config options
+		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+			SessionID: newResult.SessionID,
+			ConfigID:  acp.ConfigIDMode,
+			Value:     h.cfg.Execution.AcpSessionMode,
+		}, nil)
+		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+			SessionID: newResult.SessionID,
+			ConfigID:  acp.ConfigIDModel,
+			Value:     modelEntry.UpstreamModel,
+		}, nil)
+		if thoughtLevel != "" {
+			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+				SessionID: newResult.SessionID,
+				ConfigID:  acp.ConfigIDThoughtLevel,
+				Value:     thoughtLevel,
+			}, nil)
+		}
+
+		// C. Register listener for turn updates
+		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
+			turnMu.Lock()
+			defer turnMu.Unlock()
+
+			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
+				fullText.WriteString(update.Update.Content.Text)
+			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
+				fullThoughts.WriteString(update.Update.Content.Text)
+			} else if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+			}
+		})
+		defer worker.Transport.SetUpdateListener(nil)
+
+		// D. Send session/prompt turn
+		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
+		defer cancelPrompt()
+
+		var promptResult acp.PromptResult
+		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
+			SessionID: newResult.SessionID,
+			Prompt:    promptBlocks,
+		}, &promptResult); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		var respErr *acp.ResponseError
+		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
+			strings.Contains(err.Error(), "Authentication required") ||
+			strings.Contains(err.Error(), "transport is closed") {
+			h.writeOpenAIError(w, http.StatusServiceUnavailable, "No authenticated Antigravity accounts available. Please login an account via admin endpoint POST /admin/v1/accounts/login/init", "invalid_request_error", "account_auth_required", "")
+			return
+		}
+		h.writeOpenAIError(w, http.StatusInternalServerError, "Inference error: "+err.Error(), "api_error", "inference_error", "")
+		return
+	}
+
+	// 3. Parse text and JIT consumer tool calls
+	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+	cleanContent, toolCalls, hasTools := openai.ParseCompleteResponse(fullText.String(), delimiter)
+
+	finishReason := "stop"
+	var message openai.ChatMessage
+	if hasTools {
+		finishReason = "tool_calls"
+		message = openai.ChatMessage{
+			Role:      "assistant",
+			Content:   nil,
+			ToolCalls: toolCalls,
+		}
+	} else {
+		message = openai.ChatMessage{
+			Role:    "assistant",
+			Content: cleanContent,
+		}
+	}
+
+	if h.cfg.OpenAI.ExposeReasoningContent && fullThoughts.Len() > 0 {
+		message.ReasoningContent = fullThoughts.String()
+	}
+
+	promptTokens := openai.CountTokens(promptBlocks[0].Text)
+	compTokens := openai.CountTokens(cleanContent)
+	reasoningTokens := openai.CountTokens(fullThoughts.String())
+
+	resp := openai.ChatCompletionResponse{
+		ID:      completionID,
+		Object:  "chat.completion",
+		Created: createdTime,
+		Model:   req.Model,
+		Choices: []openai.ChatCompletionChoice{
+			{
+				Index:        0,
+				Message:      message,
+				FinishReason: finishReason,
+			},
+		},
+		Usage: openai.UsageDetails{
+			PromptTokens:     promptTokens,
+			CompletionTokens: compTokens + reasoningTokens,
+			TotalTokens:      promptTokens + compTokens + reasoningTokens,
+			PromptTokensDetails: &openai.PromptTokensDetails{
+				CachedTokens: 0,
+			},
+			CompletionTokensDetails: &openai.CompletionTokensDetails{
+				ReasoningTokens: reasoningTokens,
+			},
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *OpenAIHandlers) handleStreaming(
+	w http.ResponseWriter,
+	r *http.Request,
+	req *openai.ChatCompletionRequest,
+	modelEntry *models.ModelInfo,
+	thoughtLevel string,
+	promptBlocks []acp.PromptBlock,
+	completionID string,
+	createdTime int64,
+) {
+	telemetry.DefaultMetrics.RequestsStreaming.Add(1)
+
+	sseWriter, err := openai.NewSSEWriter(w)
+	if err != nil {
+		h.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported: "+err.Error(), "api_error", "streaming_error", "")
+		return
+	}
+
+	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+	streamParser := openai.NewStreamParser(delimiter)
+	firstChunkSent := false
+	hasToolCalls := false
+
+	var totalText strings.Builder
+	var totalThoughts strings.Builder
+
+	// Start keepalive ticker
+	keepaliveInterval := h.cfg.Server.SSEKeepaliveInterval
+	if keepaliveInterval <= 0 {
+		keepaliveInterval = 15 * time.Second
+	}
+	keepaliveTicker := time.NewTicker(keepaliveInterval)
+	defer keepaliveTicker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-keepaliveTicker.C:
+				_ = sseWriter.WriteKeepalive()
+			}
+		}
+	}()
+
+	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, h.cfg.Accounts.MaxFailoverRetries, func(ctx context.Context, worker *pool.Worker) error {
+		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
+		defer cancelSess()
+
+		newParams := acp.SessionNewParams{
+			CWD: worker.Cwd,
+		}
+		var newResult acp.SessionNewResult
+		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
+			var respErr *acp.ResponseError
+			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
+				time.Sleep(1 * time.Second)
+				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+			SessionID: newResult.SessionID,
+			ConfigID:  acp.ConfigIDMode,
+			Value:     h.cfg.Execution.AcpSessionMode,
+		}, nil)
+		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+			SessionID: newResult.SessionID,
+			ConfigID:  acp.ConfigIDModel,
+			Value:     modelEntry.UpstreamModel,
+		}, nil)
+		if thoughtLevel != "" {
+			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
+				SessionID: newResult.SessionID,
+				ConfigID:  acp.ConfigIDThoughtLevel,
+				Value:     thoughtLevel,
+			}, nil)
+		}
+
+		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
+			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
+				textChunk := update.Update.Content.Text
+				totalText.WriteString(textChunk)
+
+				textDelta, toolCalls := streamParser.ParseChunk(textChunk)
+
+				if len(toolCalls) > 0 {
+					hasToolCalls = true
+				}
+
+				if textDelta != "" || len(toolCalls) > 0 {
+					var delta openai.ChatCompletionChunkDelta
+					if !firstChunkSent {
+						delta.Role = "assistant"
+						firstChunkSent = true
+					}
+					if textDelta != "" {
+						delta.Content = &textDelta
+					}
+					if len(toolCalls) > 0 {
+						delta.ToolCalls = toolCalls
+					}
+
+					chunk := openai.ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: createdTime,
+						Model:   req.Model,
+						Choices: []openai.ChatCompletionChunkChoice{
+							{
+								Index: 0,
+								Delta: delta,
+							},
+						},
+					}
+					_ = sseWriter.WriteChunk(&chunk)
+				}
+			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
+				thoughtChunk := update.Update.Content.Text
+				totalThoughts.WriteString(thoughtChunk)
+
+				if h.cfg.OpenAI.ExposeReasoningContent {
+					chunk := openai.ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: createdTime,
+						Model:   req.Model,
+						Choices: []openai.ChatCompletionChunkChoice{
+							{
+								Index: 0,
+								Delta: openai.ChatCompletionChunkDelta{
+									ReasoningContent: &thoughtChunk,
+								},
+							},
+						},
+					}
+					_ = sseWriter.WriteChunk(&chunk)
+				}
+			} else if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+			}
+		})
+		defer worker.Transport.SetUpdateListener(nil)
+
+		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
+		defer cancelPrompt()
+
+		var promptResult acp.PromptResult
+		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
+			SessionID: newResult.SessionID,
+			Prompt:    promptBlocks,
+		}, &promptResult); err != nil {
+			return err
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		h.logger.Error("streaming turn failed", "err", err)
+		var respErr *acp.ResponseError
+		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
+			strings.Contains(err.Error(), "Authentication required") ||
+			strings.Contains(err.Error(), "transport is closed") {
+			_ = sseWriter.WriteError("No authenticated Antigravity accounts available. Please login an account via admin endpoint POST /admin/v1/accounts/login/init", "account_auth_required")
+			return
+		}
+		_ = sseWriter.WriteError("Inference error: "+err.Error(), "api_error")
+		return
+	}
+
+	// Emit finish reason chunk
+	finishReason := "stop"
+	if hasToolCalls {
+		finishReason = "tool_calls"
+	}
+
+	finishChunk := openai.ChatCompletionChunk{
+		ID:      completionID,
+		Object:  "chat.completion.chunk",
+		Created: createdTime,
+		Model:   req.Model,
+		Choices: []openai.ChatCompletionChunkChoice{
+			{
+				Index:        0,
+				Delta:        openai.ChatCompletionChunkDelta{},
+				FinishReason: &finishReason,
+			},
+		},
+	}
+	_ = sseWriter.WriteChunk(&finishChunk)
+
+	// Emit usage chunk if requested
+	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+		promptTokens := openai.CountTokens(promptBlocks[0].Text)
+		compTokens := openai.CountTokens(totalText.String())
+		reasoningTokens := openai.CountTokens(totalThoughts.String())
+
+		usageChunk := openai.ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: createdTime,
+			Model:   req.Model,
+			Choices: []openai.ChatCompletionChunkChoice{},
+			Usage: &openai.UsageDetails{
+				PromptTokens:     promptTokens,
+				CompletionTokens: compTokens + reasoningTokens,
+				TotalTokens:      promptTokens + compTokens + reasoningTokens,
+				PromptTokensDetails: &openai.PromptTokensDetails{
+					CachedTokens: 0,
+				},
+				CompletionTokensDetails: &openai.CompletionTokensDetails{
+					ReasoningTokens: reasoningTokens,
+				},
+			},
+		}
+		_ = sseWriter.WriteChunk(&usageChunk)
+	}
+
+	_ = sseWriter.Close()
+}
+
+// HandleListModels serves GET /v1/models.
+func (h *OpenAIHandlers) HandleListModels(w http.ResponseWriter, r *http.Request) {
+	resp := openai.ModelListResponse{
+		Object: "list",
+		Data:   h.modelRegistry.ListModels(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleGetModel serves GET /v1/models/{model}.
+func (h *OpenAIHandlers) HandleGetModel(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(pathParts) < 3 {
+		h.writeOpenAIError(w, http.StatusBadRequest, "Missing model identifier in path", "invalid_request_error", "missing_model", "model")
+		return
+	}
+	modelID := pathParts[2]
+
+	m, found := h.modelRegistry.FindModel(modelID)
+	if !found {
+		h.writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model %q does not exist", modelID), "invalid_request_error", "model_not_found", "model")
+		return
+	}
+
+	resp := openai.ModelObject{
+		ID:      m.ID,
+		Object:  "model",
+		Created: m.Created,
+		OwnedBy: m.OwnedBy,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *OpenAIHandlers) writeOpenAIError(w http.ResponseWriter, statusCode int, message, errType, errCode, param string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	details := openai.ErrorDetails{
+		Message: message,
+		Type:    errType,
+	}
+	if errCode != "" {
+		details.Code = &errCode
+	}
+	if param != "" {
+		details.Param = &param
+	}
+	_ = json.NewEncoder(w).Encode(openai.ErrorResponse{
+		Error: details,
+	})
+}

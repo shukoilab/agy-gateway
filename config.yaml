@@ -1,0 +1,94 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_header_timeout: "10s"
+  idle_timeout: "120s"
+  shutdown_drain_timeout: "30s"
+  max_request_body_bytes: 10485760 # 10 MiB
+  sse_keepalive_interval: "15s"
+
+security:
+  api_keys:
+    - id: "prod-client-1"
+      key_env: "AGY_GW_CLIENT_KEY_1"
+      key: "sk-antigravity-dev-test"
+      rate_limit_rpm: 120
+  admin_api_key_env: "AGY_GW_ADMIN_KEY"
+  admin_api_key: "admin-super-secret-key-change-me"
+  allow_remote_image_urls: false
+  allowed_cors_origins: []
+
+binaries:
+  agy_path: "/usr/local/bin/agy"
+  agy_min_version: "1.5.5"
+  agy_auth_path: "/usr/local/bin/agy-auth"
+  agy_acp_args:
+    - "acp"
+    - "--dangerously-skip-permissions"
+
+execution:
+  yolo_mode: true
+  acp_session_mode: "accept-edits"
+  auto_approve_permissions: true
+  clean_workspace_between_requests: true
+
+storage:
+  base_data_dir: "/var/lib/agy-gateway"
+  vault_xdg_config_dir: "/var/lib/agy-gateway/vault-xdg"
+  workers_root_dir: "/var/lib/agy-gateway/workers"
+  workers_tmp_dir: "/var/lib/agy-gateway/tmp"
+  workspaces_root_dir: "/var/lib/agy-gateway/workspaces"
+
+pool:
+  worker_count: 2
+  acquire_timeout: "15s"
+  handshake_timeout: "15s"
+  config_switch_timeout: "10s"
+  inference_timeout: "300s"
+  first_token_timeout: "45s"
+  process_kill_grace_period: "5s"
+  max_requests_per_worker: 250
+  max_worker_uptime: "2h"
+  max_scanner_buffer_bytes: 16777216
+
+accounts:
+  auto_rotate_enabled: true
+  allocation_strategy: "dedicated_per_worker"
+  quota_poll_interval: "30s"
+  min_remaining_quota_pct: 5.0
+  default_cooldown_5h: "30m"
+  default_cooldown_weekly: "6h"
+  max_failover_retries: 2
+
+admin:
+  command_timeout: "15s"
+  allow_credential_export: false
+  query_validation_regex: "^[a-zA-Z0-9@._:-]{1,128}$"
+  alias_validation_regex: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$"
+  runtime_overrides_file: "/var/lib/agy-gateway/vault-xdg/gateway-runtime-overrides.json"
+  oauth_onboarding:
+    enabled: true
+    max_concurrent_logins: 3
+    url_extract_timeout: "10s"
+    login_session_ttl: "5m"
+    loopback_replay_timeout: "15s"
+
+openai:
+  unsupported_param_policy: "strip_and_warn"
+  default_model: "gemini-3.8-flash"
+  default_reasoning_effort: "medium"
+  expose_reasoning_content: true
+
+mcp:
+  client_tool_calling:
+    enabled: true
+    default_parallel: true
+    strict_schema_validation: true
+    max_tool_argument_bytes: 1048576
+    delimiter_tag: "tool_call"
+
+observability:
+  log_level: "info"
+  log_format: "json"
+  metrics_enabled: true
+  metrics_path: "/metrics"

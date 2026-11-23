@@ -1,0 +1,57 @@
+services:
+  agy-gateway:
+    image: agy-gateway:3.3.0
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    container_name: agy-gateway
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    ports:
+      - "8080:8080"
+    environment:
+      - AGY_GW_ADMIN_KEY=${AGY_GW_ADMIN_KEY:-admin-super-secret-key-change-me}
+      - AGY_GW_CLIENT_KEY_1=${AGY_GW_CLIENT_KEY_1:-sk-antigravity-dev-test}
+      - AGY_AUTH_NO_UPDATE_CHECK=1
+    volumes:
+      - agy-vault-data:/var/lib/agy-gateway/vault-xdg
+      - agy-workspaces:/var/lib/agy-gateway/workspaces
+      - agy-workers:/var/lib/agy-gateway/workers
+      - home-agygw:/home/agygw
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=512m
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+        compress: "true"
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: "4G"
+        reservations:
+          cpus: "0.5"
+          memory: "512M"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - agy-net
+
+networks:
+  agy-net:
+    driver: bridge
+
+volumes:
+  agy-vault-data:
+  agy-workspaces:
+  agy-workers:
+  home-agygw:

@@ -1,0 +1,114 @@
+package server
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"agy-gateway/internal/config"
+)
+
+// Server coordinates the net/http server lifecycle and route registration.
+type Server struct {
+	httpServer *http.Server
+	cfg        *config.Config
+	logger     *slog.Logger
+}
+
+// NewServer configures routes, middleware, and timeout parameters.
+func NewServer(
+	cfg *config.Config,
+	openaiHandlers *OpenAIHandlers,
+	adminHandlers *AdminHandlers,
+	opsHandlers *OpsHandlers,
+	logger *slog.Logger,
+) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	mw := NewMiddleware(cfg)
+	mux := http.NewServeMux()
+
+	// 1. Operational Endpoints (Unauthenticated)
+	mux.HandleFunc("GET /healthz", opsHandlers.HandleHealthz)
+	mux.HandleFunc("GET /readyz", opsHandlers.HandleReadyz)
+	mux.HandleFunc("GET /metrics", opsHandlers.HandleMetrics)
+
+	// 2. OpenAI Endpoints (Protected by ClientAuth)
+	mux.Handle("POST /v1/chat/completions", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleChatCompletions)))
+	mux.Handle("GET /v1/models", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleListModels)))
+	mux.Handle("GET /v1/models/", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleGetModel)))
+
+	// 3. Admin Control Plane Endpoints (Protected by AdminAuth)
+	adminPrefix := "/admin/v1/"
+	mux.Handle(adminPrefix+"accounts", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleListAccounts)))
+	mux.Handle(adminPrefix+"accounts/quota", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleQuota)))
+	mux.Handle(adminPrefix+"accounts/quota/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleQuota)))
+	mux.Handle(adminPrefix+"accounts/usage", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleUsage)))
+	mux.Handle(adminPrefix+"accounts/switch", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleSwitch)))
+	mux.Handle(adminPrefix+"accounts/rotate", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleRotate)))
+	mux.Handle(adminPrefix+"accounts/login/init", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleLoginInit)))
+	mux.Handle(adminPrefix+"accounts/login/callback", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleLoginCallback)))
+	mux.Handle(adminPrefix+"accounts/login/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleLoginStatus)))
+	mux.Handle(adminPrefix+"vault/status", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultStatus)))
+	mux.Handle(adminPrefix+"vault/clean", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultClean)))
+
+	// Wrap root with RequestID and MaxBytes middleware
+	var rootHandler http.Handler = mux
+	rootHandler = mw.MaxBytes(rootHandler)
+	rootHandler = mw.RequestID(rootHandler)
+
+	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+	if strings.HasPrefix(addr, ":") {
+		addr = "0.0.0.0" + addr
+	}
+
+	readHeaderTimeout := cfg.Server.ReadHeaderTimeout
+	if readHeaderTimeout <= 0 {
+		readHeaderTimeout = 10 * time.Second
+	}
+	idleTimeout := cfg.Server.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 120 * time.Second
+	}
+
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           rootHandler,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+
+	return &Server{
+		httpServer: httpSrv,
+		cfg:        cfg,
+		logger:     logger,
+	}
+}
+
+// Start launches the HTTP server listening on the configured address.
+func (s *Server) Start() error {
+	s.logger.Info("agy-gateway HTTP server listening", "addr", s.httpServer.Addr)
+	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("server error: %w", err)
+	}
+	return nil
+}
+
+// Shutdown gracefully drains active connections within the configured timeout.
+func (s *Server) Shutdown(ctx context.Context) error {
+	drainTimeout := s.cfg.Server.ShutdownDrainTimeout
+	if drainTimeout <= 0 {
+		drainTimeout = 30 * time.Second
+	}
+
+	drainCtx, cancel := context.WithTimeout(ctx, drainTimeout)
+	defer cancel()
+
+	s.logger.Info("shutting down HTTP server gracefully", "timeout", drainTimeout)
+	return s.httpServer.Shutdown(drainCtx)
+}

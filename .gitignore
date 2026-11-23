@@ -1,0 +1,58 @@
+# Binaries and build outputs
+/bin/
+/agy-gateway
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor-bins/**/agy*
+!vendor-bins/**/.gitkeep
+
+# Go dependency and cache
+vendor/
+.cache/
+
+# Local sensitive configs and credentials
+.env
+*.env
+*.env.local
+config.local.yaml
+gateway-runtime-overrides.json
+encryption.key
+*.key
+*.pem
+*.cert
+*.crt
+
+# Antigravity Vault & Storage Data
+vault-xdg/
+agy-vault-data/
+workers/
+workspaces/
+tmp/
+.agents/
+.gemini/
+conversation_summaries.db
+*.installation_id
+registry*.json
+
+# Logs and runtime dumps
+*.log
+logs/
+crashes/
+*.prof
+
+# IDE and OS metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker local overrides
+docker-compose.override.yml
