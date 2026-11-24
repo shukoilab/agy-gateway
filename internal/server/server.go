@@ -12,6 +12,7 @@ import (
 
 	_ "agy-gateway/docs"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/mcp"
 )
 
 // Server coordinates the net/http server lifecycle and route registration.
@@ -28,6 +29,7 @@ func NewServer(
 	anthropicHandlers *AnthropicHandlers,
 	adminHandlers *AdminHandlers,
 	opsHandlers *OpsHandlers,
+	loopbackServer *mcp.LoopbackServer,
 	logger *slog.Logger,
 ) *Server {
 	if logger == nil {
@@ -41,6 +43,11 @@ func NewServer(
 	mux.HandleFunc("GET /healthz", opsHandlers.HandleHealthz)
 	mux.HandleFunc("GET /readyz", opsHandlers.HandleReadyz)
 	mux.HandleFunc("GET /metrics", opsHandlers.HandleMetrics)
+
+	// 1b. Internal Loopback MCP Bridge Endpoint (Localhost JSON-RPC 2.0 router for agy acp stdio bridge)
+	if loopbackServer != nil {
+		mux.HandleFunc("POST /internal/mcp/", loopbackServer.ServeHTTP)
+	}
 
 	// 2. OpenAI Endpoints (Protected by ClientAuth)
 	mux.Handle("POST /v1/chat/completions", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleChatCompletions)))

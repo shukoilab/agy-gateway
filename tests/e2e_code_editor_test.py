@@ -88,20 +88,36 @@ TOOLS = [
 ]
 
 
+def get_arg(arguments: dict, *keys: str) -> str:
+    """Helper to extract tool argument case-insensitively with fallback aliases."""
+    for k in keys:
+        if k in arguments and arguments[k] is not None:
+            return str(arguments[k])
+        for ak in arguments:
+            if ak.lower() == k.lower() and arguments[ak] is not None:
+                return str(arguments[ak])
+    return ""
+
+
 def execute_local_tool(name: str, arguments: dict) -> str:
     """Executes a requested code editor tool inside TEST_DIR."""
     print(f"  [Tool Exec] Calling {name} with args: {json.dumps(arguments)}")
     
     if name == "write_file":
-        rel_path = arguments.get("path", "").lstrip("/")
+        rel_path = get_arg(arguments, "path", "Path", "file_path").lstrip("/")
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(TEST_DIR, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        content = get_arg(arguments, "content", "Content")
         with open(full_path, "w", encoding="utf-8") as f:
-            f.write(arguments.get("content", ""))
-        return f"Successfully wrote {len(arguments.get('content', ''))} bytes to {rel_path}"
+            f.write(content)
+        return f"Successfully wrote {len(content)} bytes to {rel_path}"
 
     elif name == "read_file":
-        rel_path = arguments.get("path", "").lstrip("/")
+        rel_path = get_arg(arguments, "path", "Path", "file_path").lstrip("/")
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(TEST_DIR, rel_path)
         if not os.path.exists(full_path):
             return f"Error: File not found: {rel_path}"
@@ -109,14 +125,16 @@ def execute_local_tool(name: str, arguments: dict) -> str:
             return f.read()
 
     elif name == "edit_file":
-        rel_path = arguments.get("path", "").lstrip("/")
+        rel_path = get_arg(arguments, "path", "Path", "file_path").lstrip("/")
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(TEST_DIR, rel_path)
         if not os.path.exists(full_path):
             return f"Error: File not found: {rel_path}"
         with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
-        target = arguments.get("target", "")
-        replacement = arguments.get("replacement", "")
+        target = get_arg(arguments, "target", "Target")
+        replacement = get_arg(arguments, "replacement", "Replacement")
         if target not in content:
             return f"Error: Target text not found in {rel_path}"
         new_content = content.replace(target, replacement, 1)
@@ -125,7 +143,7 @@ def execute_local_tool(name: str, arguments: dict) -> str:
         return f"Successfully replaced target in {rel_path}"
 
     elif name == "bash":
-        cmd = arguments.get("command", "")
+        cmd = get_arg(arguments, "command", "Command", "cmd")
         res = subprocess.run(cmd, shell=True, cwd=TEST_DIR, capture_output=True, text=True, timeout=30)
         output = res.stdout
         if res.stderr:

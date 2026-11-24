@@ -16,14 +16,16 @@ import (
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/cli"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/mcp"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/pool"
 	"agy-gateway/internal/server"
 	"agy-gateway/internal/updater"
+	"agy-gateway/internal/version"
 )
 
 // @title           agy-gateway API
-// @version         3.5.0
+// @version         3.12.0
 // @description     An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).
 // @termsOfService  https://github.com/shukoilab/agy-gateway
 
@@ -47,8 +49,6 @@ import (
 // @name                        Authorization
 // @description                 Admin Control Plane authorization. Format: `Bearer <your-admin-api-key>` or directly `<your-admin-api-key>`. Used to access administrative endpoints (`/admin/v1/*`).
 
-var version = "3.5.0"
-
 func main() {
 	// 0. Load .env file if present in working directory (non-overwriting)
 	_, _ = config.LoadDotEnv()
@@ -71,13 +71,19 @@ func main() {
 		return
 	}
 
+	// Direct delegation if invoked as 'agy-gateway mcp-bridge [flags]'
+	if len(os.Args) > 1 && (os.Args[1] == "mcp-bridge" || os.Args[1] == "mcp_bridge") {
+		runMCPBridgeSubcommand(os.Args[2:])
+		return
+	}
+
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	healthcheck := flag.Bool("healthcheck", false, "Run local HTTP health check probe and exit")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("agy-gateway version %s\n", version)
+		fmt.Printf("agy-gateway version %s\n", version.Version)
 		os.Exit(0)
 	}
 
@@ -95,7 +101,7 @@ func main() {
 	}
 
 	// Dynamically configure Swagger UI host and version
-	docs.SwaggerInfo.Version = version
+	docs.SwaggerInfo.Version = version.Version
 	if cfg.Server.Host != "" && cfg.Server.Host != "0.0.0.0" && cfg.Server.Host != "127.0.0.1" && cfg.Server.Host != "localhost" {
 		docs.SwaggerInfo.Host = fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	} else {
@@ -113,10 +119,10 @@ func main() {
 	} else {
 		logHandler = slog.NewTextHandler(os.Stdout, logOpts)
 	}
-	logger := slog.New(logHandler).With("version", version)
+	logger := slog.New(logHandler).With("version", version.Version)
 	slog.SetDefault(logger)
 
-	logger.Info("starting agy-gateway", "version", version, "config", *configPath)
+	logger.Info("starting agy-gateway", "config", *configPath)
 
 	// 4. Create base storage directories
 	for _, dir := range []string{
@@ -170,12 +176,13 @@ func main() {
 	defer updaterSvc.Stop()
 
 	// 9. Wire HTTP handlers and server
-	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
-	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
+	loopbackServer := mcp.NewLoopbackServer()
+	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
+	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
 	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry, updaterSvc)
 	opsHandlers := server.NewOpsHandlers()
 
-	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, logger)
+	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, loopbackServer, logger)
 
 	// 10. Intercept OS shutdown signals
 	sigCh := make(chan os.Signal, 1)

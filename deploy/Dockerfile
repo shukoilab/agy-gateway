@@ -3,16 +3,16 @@
 FROM golang:1.25-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=3.5.0
+ARG VERSION=3.12.0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X agy-gateway/internal/version.Version=${VERSION}" \
     -o /out/agy-gateway ./cmd/agy-gateway && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION} -X agy-gateway/internal/version.Version=${VERSION}" \
     -o /out/agy-accounts ./cmd/agy-accounts
 
 FROM debian:bookworm-slim AS runtime

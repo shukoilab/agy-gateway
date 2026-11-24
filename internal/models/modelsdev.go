@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"agy-gateway/internal/version"
 )
 
 const (
@@ -119,7 +121,7 @@ func (c *ModelsDevClient) fetchRemote(ctx context.Context) (*ModelsDevCatalog, e
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "agy-gateway/3.5.0 (+https://github.com/shukoilab/agy-gateway)")
+	req.Header.Set("User-Agent", version.UserAgent(""))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

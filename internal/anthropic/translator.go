@@ -9,125 +9,52 @@ import (
 	"strings"
 
 	"agy-gateway/internal/acp"
-	"agy-gateway/internal/mcp"
 )
 
 // Translator converts Anthropic MessageRequest structures into ACP prompt payloads.
 //
-// @purpose Maps Anthropic system prompts, multi-turn history, tool definitions, tool results,
-// and extended thinking blocks into standardized Google Antigravity ACP PromptBlocks.
-// @rationale Guarantees zero-semantic-loss across protocols and forwards system instructions and tool schemas
-// directly to native ACP session/new via _meta.antigravity.systemPrompt.append.
-// @preconditions req must be validated; delimiter must be non-empty.
-type Translator struct {
-	virtualAdapter *mcp.VirtualAdapter
-}
+// @purpose Maps Anthropic system prompts and multi-turn conversational history into standardized ACP PromptBlocks.
+// @rationale Eliminates prompt-injected tool XML envelopes and synthetic system directives. Tools are passed natively
+// to ACP session/new via LoopbackServer mcpServers.
+// @preconditions req must be non-nil.
+// @invariants Thread-safe, pure deterministic transformation.
+type Translator struct{}
 
 // NewTranslator creates an initialized Translator.
 func NewTranslator() *Translator {
-	return &Translator{
-		virtualAdapter: mcp.NewVirtualAdapter(),
-	}
+	return &Translator{}
 }
 
 // Translate converts the Anthropic conversation into an ACP prompt payload.
-// System instructions and tool calling directives are extracted into a dedicated systemPrompt string
-// for native injection into ACP session/new via _meta.antigravity.systemPrompt.append.
-//
-// - @param: req Pointer to MessageRequest.
-// - @param: delimiter Tag name for client tool calling encapsulation (default: "tool_call").
-// @returns Extracted system prompt string and slice of acp.PromptBlock ready for transmission over ACP.
-func (t *Translator) Translate(req *MessageRequest, delimiter string) (string, []acp.PromptBlock) {
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
+// System instructions are returned separately for native injection into ACP session/new via official SystemPrompt.
+func (t *Translator) Translate(req *MessageRequest, _ string) (string, []acp.PromptBlock) {
+	systemPrompt := strings.TrimSpace(req.System.String())
 
-	// 1. Process Consumer JIT Tool Directives (Deduplicated by function name)
-	var toolsBlock string
-	if len(req.Tools) > 0 {
-		var openaiTools []mcp.OpenAIToolDefinition
-		seen := make(map[string]bool)
-
-		for _, tool := range req.Tools {
-			if tool.Name == "" || seen[tool.Name] {
-				continue
-			}
-			seen[tool.Name] = true
-
-			openaiTools = append(openaiTools, mcp.OpenAIToolDefinition{
-				Type: "function",
-				Function: mcp.FunctionSchema{
-					Name:        tool.Name,
-					Description: tool.Description,
-					Parameters:  tool.InputSchema,
+	// Fast path: single message from user
+	if len(req.Messages) == 1 && strings.ToLower(req.Messages[0].Role) == "user" {
+		msg := req.Messages[0]
+		if len(msg.Content.Blocks) == 0 && msg.Content.Text != "" {
+			return systemPrompt, []acp.PromptBlock{
+				{
+					Type: "text",
+					Text: strings.TrimSpace(msg.Content.Text),
 				},
-			})
-		}
-
-		if len(openaiTools) > 0 {
-			var toolChoiceStr string
-			switch tc := req.ToolChoice.(type) {
-			case string:
-				toolChoiceStr = tc
-			case map[string]any:
-				if typ, ok := tc["type"].(string); ok {
-					if typ == "tool" {
-						if name, ok := tc["name"].(string); ok {
-							toolChoiceStr = name
-						}
-					} else {
-						toolChoiceStr = typ
-					}
-				}
 			}
-
-			// Format JIT tools envelope
-			toolsBlock = t.virtualAdapter.BuildToolsPromptEnvelope(openaiTools, toolChoiceStr, true, delimiter)
 		}
 	}
-
-	// 2. Compose system prompt for ACP session/new _meta.antigravity.systemPrompt.append
-	var systemBlocks []string
-	systemText := strings.TrimSpace(req.System.String())
-	if systemText != "" {
-		systemBlocks = append(systemBlocks, systemText)
-	}
-	if toolsBlock != "" {
-		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
-	}
-	systemPrompt := strings.TrimSpace(strings.Join(systemBlocks, "\n\n"))
 
 	var historyBuilder strings.Builder
-
-	// 3. Reconstitute Multi-Turn Conversational History without artificial envelope wrapping
-	var lastTurnHadToolResults bool
 	for _, msg := range req.Messages {
 		role := strings.ToLower(msg.Role)
-
 		switch role {
 		case "user":
-			lastTurnHadToolResults = t.formatUserMessage(&historyBuilder, msg)
+			t.formatUserMessage(&historyBuilder, msg)
 		case "assistant":
-			t.formatAssistantMessage(&historyBuilder, msg, delimiter)
-			lastTurnHadToolResults = false
+			t.formatAssistantMessage(&historyBuilder, msg)
 		}
-	}
-
-	// 4. Append Active Continuation Cue to prevent premature agent loops from stalling
-	if len(req.Messages) > 0 {
-		lastMsg := req.Messages[len(req.Messages)-1]
-		lastRole := strings.ToLower(lastMsg.Role)
-		if lastRole == "user" {
-			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(lastTurnHadToolResults, delimiter))
-		}
-	} else {
-		historyBuilder.WriteString("Assistant: ")
 	}
 
 	finalPrompt := strings.TrimSpace(historyBuilder.String())
-	if strings.HasSuffix(finalPrompt, "Assistant:") {
-		finalPrompt += " "
-	}
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}
@@ -165,11 +92,13 @@ func cleanAnthropicToolContent(content, toolUseID string) string {
 	if strings.HasPrefix(s, "Tool Output:") {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Output:"))
 	}
+	if strings.HasPrefix(s, "Tool Error:") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Error:"))
+	}
 	return s
 }
 
 // formatUserMessage formats user turns, handling text, images, and tool_result blocks.
-// Returns true if the message contained tool_result blocks.
 func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) bool {
 	if len(msg.Content.Blocks) == 0 {
 		if msg.Content.Text != "" {
@@ -234,8 +163,8 @@ func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) bool {
 	return hasToolResults
 }
 
-// formatAssistantMessage formats assistant turns, reconstructing thinking blocks and tool_use tags.
-func (t *Translator) formatAssistantMessage(sb *strings.Builder, msg Message, delimiter string) {
+// formatAssistantMessage formats assistant turns, reconstructing thinking blocks and native tool invocation summaries.
+func (t *Translator) formatAssistantMessage(sb *strings.Builder, msg Message) {
 	if len(msg.Content.Blocks) == 0 {
 		if msg.Content.Text != "" {
 			fmt.Fprintf(sb, "Assistant: %s\n\n", msg.Content.Text)
@@ -253,7 +182,6 @@ func (t *Translator) formatAssistantMessage(sb *strings.Builder, msg Message, de
 				textParts = append(textParts, block.Text)
 			}
 		case "thinking":
-			// If previous assistant turn included thinking, preserve summary context
 			if block.Thinking != "" {
 				textParts = append(textParts, fmt.Sprintf("[Reasoning: %s]", block.Thinking))
 			}
@@ -262,12 +190,7 @@ func (t *Translator) formatAssistantMessage(sb *strings.Builder, msg Message, de
 			if rawArgs == "" || rawArgs == "null" {
 				rawArgs = "{}"
 			}
-			rawCall, _ := json.Marshal(map[string]any{
-				"id":        block.ID,
-				"name":      block.Name,
-				"arguments": json.RawMessage(rawArgs),
-			})
-			toolCalls = append(toolCalls, fmt.Sprintf("<%s>%s</%s>", delimiter, string(rawCall), delimiter))
+			toolCalls = append(toolCalls, fmt.Sprintf("[Assistant called tool %s with arguments: %s]", block.Name, rawArgs))
 		}
 	}
 

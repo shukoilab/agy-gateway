@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"agy-gateway/internal/version"
 )
 
 // GitHubReleaseAsset represents an asset attached to a GitHub release.
@@ -94,7 +96,7 @@ func (c *AgyAuthClient) DetectAssetName() (string, error) {
 }
 
 // CheckLatest queries the latest GitHub release or falls back to npm registry.
-func (c *AgyAuthClient) CheckLatest(ctx context.Context) (version string, downloadURL string, checksumsURL string, err error) {
+func (c *AgyAuthClient) CheckLatest(ctx context.Context) (latestVersion string, downloadURL string, checksumsURL string, err error) {
 	apiBase := c.apiBaseURL
 	if apiBase == "" {
 		apiBase = "https://api.github.com"
@@ -104,7 +106,7 @@ func (c *AgyAuthClient) CheckLatest(ctx context.Context) (version string, downlo
 	if err != nil {
 		return "", "", "", err
 	}
-	req.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+	req.Header.Set("User-Agent", version.UserAgent("updater"))
 	req.Header.Set("Accept", "application/vnd.github+json")
 
 	resp, err := c.httpClient.Do(req)
@@ -143,7 +145,7 @@ func (c *AgyAuthClient) CheckLatest(ctx context.Context) (version string, downlo
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to construct npm query: %w", err)
 	}
-	npmReq.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+	npmReq.Header.Set("User-Agent", version.UserAgent("updater"))
 
 	npmResp, err := c.httpClient.Do(npmReq)
 	if err != nil {
@@ -209,7 +211,7 @@ func (c *AgyAuthClient) DownloadAndInstall(ctx context.Context, downloadURL stri
 	if checksumsURL != "" {
 		chkReq, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumsURL, nil)
 		if err == nil {
-			chkReq.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+			chkReq.Header.Set("User-Agent", version.UserAgent("updater"))
 			if chkResp, err := c.httpClient.Do(chkReq); err == nil {
 				if chkResp.StatusCode == http.StatusOK {
 					scanner := bufio.NewScanner(chkResp.Body)
@@ -236,7 +238,7 @@ func (c *AgyAuthClient) DownloadAndInstall(ctx context.Context, downloadURL stri
 	if err != nil {
 		return "", fmt.Errorf("failed to create download request for %s: %w", downloadURL, err)
 	}
-	req.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+	req.Header.Set("User-Agent", version.UserAgent("updater"))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

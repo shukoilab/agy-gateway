@@ -52,7 +52,7 @@ func setupAnthropicTestEnvironment(t *testing.T) (*server.AnthropicHandlers, *co
 	}
 	failoverCoord := pool.NewFailoverCoordinator(workerPool, authMgr, nil)
 
-	handlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, nil)
+	handlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, nil, nil)
 
 	cleanup := func() {}
 	return handlers, cfg, modelRegistry, workerPool, failoverCoord, cleanup
@@ -232,7 +232,7 @@ func TestAnthropicHandlers_EndToEnd_Sync(t *testing.T) {
 	// Inject worker into pool lease channel
 	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
 	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
-	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil, nil)
 
 	payload := `{
 		"model": "claude-3-7-sonnet-20250219",
@@ -312,7 +312,7 @@ func TestAnthropicHandlers_EndToEnd_ToolCalling(t *testing.T) {
 
 	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
 	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
-	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil, nil)
 
 	payload := `{
 		"model": "claude-3-5-sonnet",
@@ -401,7 +401,7 @@ func TestAnthropicHandlers_EndToEnd_Streaming(t *testing.T) {
 
 	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
 	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
-	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil, nil)
 
 	payload := `{
 		"model": "claude-3-5-sonnet",
@@ -480,7 +480,7 @@ func TestAnthropicHandlers_EndToEnd_StreamingToolUse(t *testing.T) {
 
 	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
 	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
-	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil, nil)
 
 	payload := `{
 		"model": "claude-3-5-sonnet",

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.12.0] - 2026-11-25
+
+### Added
+- **Default Execution Protocol & Dynamic System Prompt Mode (`internal/acp`, `internal/server`)**:
+  - Engineered native ACP v1 `SystemPrompt` schema with polymorphic `mode` (`"override"` vs `"append"`).
+  - Implemented immutable `DefaultExecutionProtocol` enforcing strict language mirroring, first-principles analysis, high-signal directness, and Chain-of-Verification (CoVe) checklist when no consumer system prompt is provided.
+  - Automatically preserves consumer-provided system prompts seamlessly using `mode: "append"`.
+- **Full Canonical ACP v1 Protocol Alignment (`internal/acp`, `internal/pool`)**:
+  - Aligned JSON-RPC error codes with official ACP v1 spec (`-32700`, `-32600`, `-32601`, `-32602`, `-32603`, `-32800`, `-32000`, `-32002`).
+  - Added strongly-typed ACP structures: `EnvVariable` (`name`/`value`), multi-transport `MCPServerInfo` (`stdio`, `http`, `sse`), `UsageUpdate`, `UsageCost`, and `PermissionOutcome` (`optionId`).
+  - Refactored `Worker` client capabilities handshake: set `terminal: false` boolean, removed non-standard capabilities root.
+- **In-Memory Loopback MCP Server Engine (`internal/mcp`, `cmd/agy-gateway`)**:
+  - Engineered `LoopbackServer` providing in-memory session registration, JSON-RPC 2.0 lifecycle, and stdio bridging (`mcp-bridge`).
+  - Native ACP MCP injection via `mcpServers` parameter in `session/new`, completely eliminating simulated `<tool_call>` prompt injection.
+  - Implemented `MatchAndNormalizeToolName` for canonical tool mapping (`mcp_client-tools_write_file` -> `write_file`) and transparent filtering of internal agent scaffolding tools (`update_steps`, `update_focus`).
+- **Centralized Semantic Versioning (`internal/version`)**:
+  - Introduced `internal/version` package providing a single source of truth for runtime semver (`3.12.0`).
+  - Added build-time dynamic injection support via `-ldflags="-X agy-gateway/internal/version.Version=..."`.
+  - Harmonized all User-Agent headers, Docker configurations, ACP `initialize` handshakes, and Swagger schemas to `3.12.0`.
+
+### Fixed
+- **Graceful ACP Cancellation & Logging Disambiguation (`internal/server`, `internal/acp`)**:
+  - Aligned turn cancellation with official ACP v1 (`schema-v1.26.0`): sending `session/cancel` notification allows `session/prompt` to return its standard JSON-RPC response (`stopReason: "cancelled"`).
+  - Eliminated premature context cancellation causing misleading `"openai non-streaming turn unblocked cleanly upon early termination"` and `"unmatched response ID received"` logs.
+  - Resolved non-reentrant mutex deadlock in Anthropic streaming tool calling.
+
+---
+
 ## [3.9.4] - 2026-11-24
 
 ### Added
@@ -25,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Verifies multi-turn tool calling, disk state mutation, assertion execution, absence of turn header leakage, and clean zero-error gateway streaming.
 
 ### Fixed
+- **Autonomous Multi-Turn Hallucination Elimination & Real-Time Stop Sequence Truncation (`internal/openai`, `internal/anthropic`, `internal/mcp`)**:
+  - Eliminated autonomous multi-turn simulation loops where models simulated subsequent user turns and tool outputs (`User: [Tool Execution Results]\nTool Output (id: ...): ...`) within a single API request stream.
+  - Hardened system prompt tool envelope directives in `VirtualAdapter.BuildToolsPromptEnvelope` and `BuildActiveContinuationCue` with strict invariants: one turn per request, absolute prohibition on simulating tool execution results or user messages, and forbidden transcript labels.
+  - Implemented real-time stop sequence detection and stream truncation in `StreamParser` across both OpenAI and Anthropic adapters: as soon as the model attempts to generate `User: [Tool Execution Results]`, `Tool Output:`, or `\nUser:` after emitting tool calls, the stream is truncated cleanly at the turn boundary and `IsTerminated()` prevents further processing.
+  - Added line-level `sanitizeTextContent` filtering to strip any residual internal gateway markers from emitted text deltas.
+  - Enhanced `ParseCompleteResponse` for non-streaming mode to truncate at the first hallucinated turn marker after tool calls and sanitize output text.
+  - Added regression test suites in both adapters (`TestStreamParser_StripHallucinatedPrefix/Stop_sequence_triggers_on_simulated_turn_after_tool_call`, `TestParseCompleteResponse_TruncateSimulatedTurn`).
 - **Multi-Turn Tool Turn Deduplication & Continuation Sanitization (`internal/openai`, `internal/anthropic`, `internal/mcp`)**:
   - Implemented `cleanToolOutputContent` / `cleanAnthropicToolContent` in request translators to strip redundant `[Tool Execution Results]` and `User: [Tool Execution Results]` prefixes from incoming messages.
   - Guarded against consecutive duplicate `User: [Tool Execution Results]` turn headers, completely preventing echo loops.

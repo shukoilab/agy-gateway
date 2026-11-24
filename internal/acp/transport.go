@@ -145,6 +145,39 @@ func (t *Transport) Call(ctx context.Context, method string, params any, result 
 	}
 }
 
+// Notify sends an unsolicited JSON-RPC 2.0 notification (no ID) to the peer.
+//
+// @purpose Sends one-way asynchronous notifications such as session/cancel to the ACP agent.
+// @rationale ACP specifies notifications for client-side cancellations and state synchronization.
+// @preconditions Transport must not be closed.
+// @param method (string) - JSON-RPC method name (e.g. "session/cancel").
+// @param params (any) - Optional notification payload struct.
+// @returns error - Returns error if transport is closed or pipe write fails.
+// @throws None.
+// @invariants Safe for concurrent invocations across goroutines.
+func (t *Transport) Notify(method string, params any) error {
+	if t.closed.Load() {
+		return errors.New("acp transport is closed")
+	}
+
+	var rawParams json.RawMessage
+	if params != nil {
+		b, err := json.Marshal(params)
+		if err != nil {
+			return fmt.Errorf("failed to marshal notification params: %w", err)
+		}
+		rawParams = b
+	}
+
+	notif := Notification{
+		JSONRPC: JSONRPCVersion,
+		Method:  method,
+		Params:  rawParams,
+	}
+
+	return t.send(notif)
+}
+
 func (t *Transport) send(v any) error {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -288,6 +321,7 @@ func (t *Transport) handleIncomingRequest(req *Request) {
 }
 
 // handlePermissionRequest implements the Layer 3 YOLO auto-approval interceptor.
+// Conforms to ACP v1 specification: if cancelled, returns outcome: "cancelled".
 func (t *Transport) handlePermissionRequest(req *Request) {
 	var params RequestPermissionParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -323,11 +357,18 @@ func (t *Transport) handlePermissionRequest(req *Request) {
 		chosenOptionID = params.Options[0].OptionID
 	}
 
+	outcome := PermissionOutcome{
+		Outcome:  "selected",
+		OptionID: chosenOptionID,
+	}
+	if chosenOptionID == "" {
+		outcome = PermissionOutcome{
+			Outcome: "cancelled",
+		}
+	}
+
 	result := RequestPermissionResult{
-		Outcome: PermissionOutcome{
-			Outcome:  "selected",
-			OptionID: chosenOptionID,
-		},
+		Outcome: outcome,
 	}
 	rawResult, _ := json.Marshal(result)
 

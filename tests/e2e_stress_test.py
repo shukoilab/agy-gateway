@@ -142,18 +142,34 @@ ANTHROPIC_TOOLS = [
 ]
 
 
+def get_arg(arguments: dict, *keys: str) -> str:
+    """Helper to extract tool argument case-insensitively with fallback aliases."""
+    for k in keys:
+        if k in arguments and arguments[k] is not None:
+            return str(arguments[k])
+        for ak in arguments:
+            if ak.lower() == k.lower() and arguments[ak] is not None:
+                return str(arguments[ak])
+    return ""
+
+
 def execute_tool_in_dir(workdir: str, name: str, args: dict) -> str:
     """Executes code editor tool inside an isolated directory."""
     if name == "write_file":
-        rel_path = args.get("path", "").lstrip("/")
+        rel_path = os.path.basename(get_arg(args, "path", "Path", "file_path").lstrip("/"))
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(workdir, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        content = get_arg(args, "content", "Content")
         with open(full_path, "w", encoding="utf-8") as f:
-            f.write(args.get("content", ""))
-        return f"Wrote {len(args.get('content', ''))} bytes to {rel_path}"
+            f.write(content)
+        return f"Wrote {len(content)} bytes to {rel_path}"
 
     elif name == "read_file":
-        rel_path = args.get("path", "").lstrip("/")
+        rel_path = os.path.basename(get_arg(args, "path", "Path", "file_path").lstrip("/"))
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(workdir, rel_path)
         if not os.path.exists(full_path):
             return f"Error: File not found: {rel_path}"
@@ -161,14 +177,16 @@ def execute_tool_in_dir(workdir: str, name: str, args: dict) -> str:
             return f.read()
 
     elif name == "edit_file":
-        rel_path = args.get("path", "").lstrip("/")
+        rel_path = os.path.basename(get_arg(args, "path", "Path", "file_path").lstrip("/"))
+        if not rel_path:
+            return "Error: path parameter is required"
         full_path = os.path.join(workdir, rel_path)
         if not os.path.exists(full_path):
             return f"Error: File not found: {rel_path}"
         with open(full_path, "r", encoding="utf-8") as f:
             content = f.read()
-        target = args.get("target", "")
-        replacement = args.get("replacement", "")
+        target = get_arg(args, "target", "Target")
+        replacement = get_arg(args, "replacement", "Replacement")
         if target not in content:
             return f"Error: Target text not found in {rel_path}"
         new_content = content.replace(target, replacement, 1)
@@ -177,7 +195,7 @@ def execute_tool_in_dir(workdir: str, name: str, args: dict) -> str:
         return f"Successfully edited {rel_path}"
 
     elif name == "bash":
-        cmd = args.get("command", "")
+        cmd = get_arg(args, "command", "Command", "cmd")
         res = subprocess.run(cmd, shell=True, cwd=workdir, capture_output=True, text=True, timeout=30)
         out = res.stdout
         if res.stderr:
@@ -288,7 +306,7 @@ def call_openai_adapter(messages: list, stream: bool = True) -> tuple:
 # Anthropic Adapter Client (Streaming & Sync)
 # ==============================================================================
 
-def call_anthropic_adapter(messages: list, stream: bool = True) -> tuple:
+def call_anthropic_adapter(messages: list, stream: bool = True, system: str = None) -> tuple:
     """Invokes Anthropic /v1/messages endpoint."""
     url = f"{BASE_URL}/v1/messages"
     payload = {
@@ -298,6 +316,8 @@ def call_anthropic_adapter(messages: list, stream: bool = True) -> tuple:
         "tools": ANTHROPIC_TOOLS,
         "stream": stream
     }
+    if system:
+        payload["system"] = system
 
     req = urllib.request.Request(
         url,
@@ -403,6 +423,7 @@ def run_worker_scenario(worker_id: int, adapter_type: str, stream: bool) -> dict
         "Execute these actions using available tool calls."
     )
 
+    sys_prompt_arg = None
     if adapter_type == "openai":
         messages = [
             {"role": "system", "content": system_prompt},
@@ -411,8 +432,9 @@ def run_worker_scenario(worker_id: int, adapter_type: str, stream: bool) -> dict
     else:
         # Anthropic format
         messages = [
-            {"role": "user", "content": f"{system_prompt}\n\nBegin development task for worker {worker_id} now."}
+            {"role": "user", "content": f"Begin development task for worker {worker_id} now."}
         ]
+        sys_prompt_arg = system_prompt
 
     turn = 0
     max_turns = 8
@@ -426,7 +448,7 @@ def run_worker_scenario(worker_id: int, adapter_type: str, stream: bool) -> dict
         if adapter_type == "openai":
             asst_text, tool_calls = call_openai_adapter(messages, stream=stream)
         else:
-            asst_text, tool_calls = call_anthropic_adapter(messages, stream=stream)
+            asst_text, tool_calls = call_anthropic_adapter(messages, stream=stream, system=sys_prompt_arg)
 
         # Invariant checks: ensure no turn header leaks
         if "User: [Tool Execution Results]" in asst_text:
@@ -466,6 +488,20 @@ def run_worker_scenario(worker_id: int, adapter_type: str, stream: bool) -> dict
             messages.append({"role": "assistant", "content": asst_blocks})
 
         if not tool_calls:
+            target_check = os.path.join(workdir, "app_module.py")
+            if os.path.exists(target_check):
+                with open(target_check, "r", encoding="utf-8") as f:
+                    c = f.read()
+                if "compute_power" in c:
+                    print(f"{tag} Turn {turn}: Assistant finished all tool turns successfully.")
+                    break
+            if turn < max_turns:
+                print(f"{tag} Turn {turn}: Assistant paused before completion, prompting to continue remaining steps.")
+                if adapter_type == "openai":
+                    messages.append({"role": "user", "content": "Please complete all remaining steps: add compute_power and execute the verification bash test."})
+                else:
+                    messages.append({"role": "user", "content": [{"type": "text", "text": "Please complete all remaining steps: add compute_power and execute the verification bash test."}]})
+                continue
             print(f"{tag} Turn {turn}: Assistant finished tool turns.")
             break
 

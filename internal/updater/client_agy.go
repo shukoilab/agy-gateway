@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+
+	"agy-gateway/internal/version"
 )
 
 var semverRegex = regexp.MustCompile(`\b(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b`)
@@ -87,7 +89,7 @@ func (c *AgyClient) CheckLatest(ctx context.Context) (*AgyManifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create manifest request: %w", err)
 	}
-	req.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+	req.Header.Set("User-Agent", version.UserAgent("updater"))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -148,7 +150,7 @@ func (c *AgyClient) DownloadAndInstall(ctx context.Context, manifest *AgyManifes
 	if err != nil {
 		return "", fmt.Errorf("failed to construct download request for %s: %w", manifest.URL, err)
 	}
-	req.Header.Set("User-Agent", "agy-gateway-updater/3.5.0")
+	req.Header.Set("User-Agent", version.UserAgent("updater"))
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -21,7 +21,7 @@ func TestAdminUpdaterEndpoints(t *testing.T) {
 	updaterSvc := updater.NewService(cfg, nil, nil)
 	adminHandlers := NewAdminHandlers(cfg, nil, nil, nil, updaterSvc)
 	opsHandlers := NewOpsHandlers()
-	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil)
+	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil, nil)
 
 	// 1. GET /admin/v1/updater/status without auth -> 401
 	req1 := httptest.NewRequest(http.MethodGet, "/admin/v1/updater/status", nil)
@@ -58,7 +58,7 @@ func TestAdminUpdaterEndpoints(t *testing.T) {
 
 	// 4. Test uninitialized updater -> 503
 	handlersNoSvc := NewAdminHandlers(cfg, nil, nil, nil, nil)
-	srvNoSvc := NewServer(cfg, nil, nil, handlersNoSvc, opsHandlers, nil)
+	srvNoSvc := NewServer(cfg, nil, nil, handlersNoSvc, opsHandlers, nil, nil)
 
 	req4 := httptest.NewRequest(http.MethodGet, "/admin/v1/updater/status", nil)
 	req4.Header.Set("Authorization", "Bearer test-admin-secret")

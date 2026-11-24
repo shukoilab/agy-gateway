@@ -56,7 +56,7 @@ func setupTestServerWithAdminModels(t *testing.T) (*Server, *models.ModelRegistr
 	adminHandlers := NewAdminHandlers(cfg, authMgr, onboard, mr, nil)
 	opsHandlers := NewOpsHandlers()
 
-	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil)
+	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil, nil)
 	return srv, mr, tempDir
 }
 

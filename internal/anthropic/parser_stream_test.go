@@ -218,4 +218,97 @@ func TestStreamParser_StripHallucinatedPrefix(t *testing.T) {
 			t.Fatalf("expected 'Hello world!', got %q", total)
 		}
 	})
+
+	t.Run("Stop sequence triggers on simulated turn after tool call", func(t *testing.T) {
+		parser := anthropic.NewStreamParser("tool_call")
+		d1, tc1 := parser.ParseChunk(`<tool_call>{"id":"toolu_chk_git_01","name":"bash","arguments":{"command":"git status"}}</tool_call>`)
+		if len(tc1) != 1 || tc1[0].ID != "toolu_chk_git_01" {
+			t.Fatalf("expected toolu_chk_git_01, got %+v", tc1)
+		}
+
+		// Model attempts to hallucinate next user turn and subsequent fake tool call
+		d2, tc2 := parser.ParseChunk("\nUser: [Tool Execution Results]\nTool Output (id: toolu_chk_git_01): M src/file.js\n<tool_call>{\"id\":\"toolu_fake_2\",\"name\":\"bash\",\"arguments\":{\"command\":\"yarn test\"}}</tool_call>")
+		fd, ftc := parser.Flush()
+
+		totalText := d1 + d2 + fd
+		allTools := append(append(tc1, tc2...), ftc...)
+
+		if !parser.IsTerminated() {
+			t.Fatalf("expected parser to be terminated after encountering hallucinated turn")
+		}
+		if len(allTools) != 1 {
+			t.Fatalf("expected strictly 1 tool call (fake call should be dropped), got %d: %+v", len(allTools), allTools)
+		}
+		if totalText != "" {
+			t.Fatalf("expected zero leaked text, got %q", totalText)
+		}
+	})
+
+	t.Run("Strip leading Tool Output lines without tool call", func(t *testing.T) {
+		parser := anthropic.NewStreamParser("tool_call")
+		d, tc := parser.ParseChunk("Tool Output (id: toolu_rd_01): Read file lines 1-100\nHello, task is complete.")
+		fd, _ := parser.Flush()
+		total := d + fd
+		if total != "Hello, task is complete." {
+			t.Fatalf("expected 'Hello, task is complete.', got %q", total)
+		}
+		if len(tc) != 0 {
+			t.Fatalf("expected 0 tool calls, got %d", len(tc))
+		}
+	})
+}
+
+func TestParseCompleteResponse_TruncateSimulatedTurn(t *testing.T) {
+	raw := `<tool_call>{"id":"toolu_chk_git_01","name":"bash","arguments":{"command":"git status"}}</tool_call>
+User: [Tool Execution Results]
+Tool Output (id: toolu_chk_git_01): M src/modules/free/utils/rate-limit-detector.js
+<tool_call>{"id":"toolu_yarn_test_base","name":"bash","arguments":{"command":"yarn test"}}</tool_call>
+User: [Tool Execution Results]
+Tool Output (id: toolu_yarn_test_base): 95 passed`
+
+	text, tools, hasTools := anthropic.ParseCompleteResponse(raw, "tool_call")
+	if !hasTools {
+		t.Fatalf("expected hasTools to be true")
+	}
+	if len(tools) != 1 {
+		t.Fatalf("expected exactly 1 tool call, got %d: %+v", len(tools), tools)
+	}
+	if tools[0].ID != "toolu_chk_git_01" {
+		t.Fatalf("expected toolu_chk_git_01, got %q", tools[0].ID)
+	}
+	if text != "" {
+		t.Fatalf("expected clean text to be empty, got %q", text)
+	}
+}
+
+func TestStreamParser_MarkdownCodeFencesAndFallbackKeys(t *testing.T) {
+	parser := anthropic.NewStreamParser("tool_call")
+	chunk := "<tool_call>```json\n{\n  \"call_id\": \"toolu_fenced_1\",\n  \"action\": \"glob\",\n  \"parameters\": {\"pattern\": \"*.go\"}\n}\n```</tool_call>"
+	d, tools := parser.ParseChunk(chunk)
+	fd, ftools := parser.Flush()
+	allTools := append(tools, ftools...)
+	if len(allTools) != 1 {
+		t.Fatalf("expected 1 tool call, got %d (text: %q)", len(allTools), d+fd)
+	}
+	if allTools[0].Name != "glob" {
+		t.Fatalf("expected tool name 'glob', got %q", allTools[0].Name)
+	}
+	if allTools[0].ID != "toolu_fenced_1" {
+		t.Fatalf("expected toolu_fenced_1, got %q", allTools[0].ID)
+	}
+}
+
+func TestStreamParser_MalformedToolCallEmittedAsText(t *testing.T) {
+	parser := anthropic.NewStreamParser("tool_call")
+	chunk := "Looking into this:\n<tool_call>\nAssistant:\nBroken JSON\n</tool_call>\nNext line"
+	d, tools := parser.ParseChunk(chunk)
+	fd, ftools := parser.Flush()
+	allText := d + fd
+	allTools := append(tools, ftools...)
+	if len(allTools) != 0 {
+		t.Fatalf("expected 0 tool calls, got %d", len(allTools))
+	}
+	if !strings.Contains(allText, "Looking into this:") || !strings.Contains(allText, "Broken JSON") || !strings.Contains(allText, "Next line") {
+		t.Fatalf("expected malformed payload to be preserved as text, got %q", allText)
+	}
 }

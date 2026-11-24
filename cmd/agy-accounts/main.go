@@ -14,9 +14,8 @@ import (
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/cli"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/version"
 )
-
-var version = "3.5.0"
 
 func main() {
 	// 0. Load .env file if present in working directory (non-overwriting)
@@ -38,7 +37,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("agy-accounts version %s\n", version)
+		fmt.Printf("agy-accounts version %s\n", version.Version)
 		os.Exit(0)
 	}
 

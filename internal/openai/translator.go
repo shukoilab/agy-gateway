@@ -1,27 +1,27 @@
 package openai
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"agy-gateway/internal/acp"
-	"agy-gateway/internal/mcp"
 )
 
-// Translator converts OpenAI request messages and tool declarations into ACP prompt payloads.
-type Translator struct {
-	virtualAdapter *mcp.VirtualAdapter
-}
+// Translator converts OpenAI request messages into ACP prompt payloads.
+//
+// @purpose Maps OpenAI system prompts and multi-turn conversational history into standard ACP PromptBlocks.
+// @rationale Eliminates all brittle prompt injection, XML <tool_call> tags, and synthetic system directives.
+// All tool capabilities are registered natively in ACP session/new via LoopbackServer and mcpServers.
+// @preconditions req must be non-nil.
+// @invariants Thread-safe, pure deterministic transformation.
+type Translator struct{}
 
 // NewTranslator creates an initialized Translator.
 func NewTranslator() *Translator {
-	return &Translator{
-		virtualAdapter: mcp.NewVirtualAdapter(),
-	}
+	return &Translator{}
 }
 
-// cleanToolOutputContent sanitizes tool execution result text and strips duplicate turn headers.
+// cleanToolOutputContent strips any legacy duplicate turn headers or wrapper markers from tool result text.
 func cleanToolOutputContent(content, toolCallID string) string {
 	s := strings.TrimSpace(content)
 	for {
@@ -38,23 +38,24 @@ func cleanToolOutputContent(content, toolCallID string) string {
 		if strings.HasPrefix(s, expectedPrefix) {
 			s = strings.TrimSpace(strings.TrimPrefix(s, expectedPrefix))
 		}
+		expectedErrPrefix := fmt.Sprintf("Tool Error (id: %s):", toolCallID)
+		if strings.HasPrefix(s, expectedErrPrefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, expectedErrPrefix))
+		}
 	}
 	if strings.HasPrefix(s, "Tool Output:") {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Output:"))
 	}
+	if strings.HasPrefix(s, "Tool Error:") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Error:"))
+	}
 	return s
 }
 
-// Translate extracts system instructions and formats the multi-turn conversational history.
-// Consumer system instructions and tool calling directives are extracted into a dedicated systemPrompt
-// string for native injection into ACP session/new via _meta.antigravity.systemPrompt.append.
-// Conversational turns (user, assistant, tool execution results) are cleanly formatted into ACP prompt blocks.
-// An active execution loop cue primes assistant continuation when turns end on tool outputs.
-func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (string, []acp.PromptBlock) {
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
-
+// Translate extracts pure system instructions and formats conversational history into standard ACP prompt blocks.
+// System instructions are returned separately for native injection into ACP session/new via official SystemPrompt.
+// Tool declarations are NOT injected into prompt text; they are provided natively via LoopbackServer mcpServers.
+func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []acp.PromptBlock) {
 	var sysMessages []string
 	var nonSysMessages []ChatMessage
 
@@ -70,52 +71,24 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (st
 		}
 	}
 
-	// 2. Format Consumer JIT Tool Directives (Deduplicated by function name)
-	var toolsBlock string
-	if len(req.Tools) > 0 {
-		var uniqueTools []mcp.OpenAIToolDefinition
-		seen := make(map[string]bool)
-		for _, tool := range req.Tools {
-			if tool.Type != "function" || tool.Function.Name == "" {
-				continue
-			}
-			if seen[tool.Function.Name] {
-				continue
-			}
-			seen[tool.Function.Name] = true
-			uniqueTools = append(uniqueTools, tool)
-		}
+	systemPrompt := strings.TrimSpace(strings.Join(sysMessages, "\n\n"))
 
-		if len(uniqueTools) > 0 {
-			parallel := true
-			if req.ParallelToolCalls != nil {
-				parallel = *req.ParallelToolCalls
-			}
-			var toolChoiceStr string
-			switch tc := req.ToolChoice.(type) {
-			case string:
-				toolChoiceStr = tc
-			}
-			toolsBlock = t.virtualAdapter.BuildToolsPromptEnvelope(uniqueTools, toolChoiceStr, parallel, delimiter)
+	// 2. Fast-path: single user message turn
+	if len(nonSysMessages) == 1 && strings.ToLower(nonSysMessages[0].Role) == "user" {
+		userText := strings.TrimSpace(nonSysMessages[0].ContentString())
+		if userText == "" {
+			userText = "Hello"
+		}
+		return systemPrompt, []acp.PromptBlock{
+			{
+				Type: "text",
+				Text: userText,
+			},
 		}
 	}
 
-	// 3. Compose system prompt for ACP session/new _meta.antigravity.systemPrompt.append
-	var systemBlocks []string
-	if len(sysMessages) > 0 {
-		sysBody := strings.TrimSpace(strings.Join(sysMessages, "\n\n"))
-		if sysBody != "" {
-			systemBlocks = append(systemBlocks, sysBody)
-		}
-	}
-	if toolsBlock != "" {
-		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
-	}
-	systemPrompt := strings.TrimSpace(strings.Join(systemBlocks, "\n\n"))
-
+	// 3. Multi-turn conversational history
 	var historyBuilder strings.Builder
-
-	// 4. Reconstitute multi-turn conversation history without artificial envelope wrapping
 	for i := 0; i < len(nonSysMessages); i++ {
 		msg := nonSysMessages[i]
 		role := strings.ToLower(msg.Role)
@@ -139,12 +112,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (st
 			if len(msg.ToolCalls) > 0 {
 				var calls []string
 				for _, tc := range msg.ToolCalls {
-					raw, _ := json.Marshal(map[string]any{
-						"id":        tc.ID,
-						"name":      tc.Function.Name,
-						"arguments": json.RawMessage(tc.Function.Arguments),
-					})
-					calls = append(calls, fmt.Sprintf("<%s>%s</%s>", delimiter, string(raw), delimiter))
+					calls = append(calls, fmt.Sprintf("[Assistant called tool %s with arguments: %s]", tc.Function.Name, tc.Function.Arguments))
 				}
 				if content != "" {
 					fmt.Fprintf(&historyBuilder, "Assistant: %s\n%s\n\n", content, strings.Join(calls, "\n"))
@@ -173,22 +141,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (st
 		}
 	}
 
-	// 5. Append Active Continuation Cue to prevent premature agent loops from stalling
-	if len(nonSysMessages) > 0 {
-		lastRole := strings.ToLower(nonSysMessages[len(nonSysMessages)-1].Role)
-		if lastRole == "tool" {
-			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(true, delimiter))
-		} else if lastRole == "user" {
-			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(false, delimiter))
-		}
-	} else {
-		historyBuilder.WriteString("Assistant: ")
-	}
-
 	finalPrompt := strings.TrimSpace(historyBuilder.String())
-	if strings.HasSuffix(finalPrompt, "Assistant:") {
-		finalPrompt += " "
-	}
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}

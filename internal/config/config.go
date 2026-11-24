@@ -256,6 +256,8 @@ type MCPClientToolCallingConfig struct {
 	DefaultParallel        bool   `yaml:"default_parallel"`
 	StrictSchemaValidation bool   `yaml:"strict_schema_validation"`
 	MaxToolArgumentBytes   int64  `yaml:"max_tool_argument_bytes"`
+	// DelimiterTag is retained for configuration backwards-compatibility.
+	// All tools are natively handled via ACP and the in-memory MCP loopback server.
 	DelimiterTag           string `yaml:"delimiter_tag"`
 }
 

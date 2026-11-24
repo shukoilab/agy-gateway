@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 
 	"agy-gateway/internal/acp"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/mcp"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/openai"
 	"agy-gateway/internal/pool"
@@ -24,12 +26,13 @@ import (
 
 // OpenAIHandlers handles public OpenAI-compatible endpoints.
 type OpenAIHandlers struct {
-	cfg           *config.Config
-	pool          *pool.Pool
-	failover      *pool.FailoverCoordinator
-	modelRegistry *models.ModelRegistry
-	translator    *openai.Translator
-	logger        *slog.Logger
+	cfg            *config.Config
+	pool           *pool.Pool
+	failover       *pool.FailoverCoordinator
+	modelRegistry  *models.ModelRegistry
+	loopbackServer *mcp.LoopbackServer
+	translator     *openai.Translator
+	logger         *slog.Logger
 }
 
 // NewOpenAIHandlers creates an initialized handler suite.
@@ -38,18 +41,23 @@ func NewOpenAIHandlers(
 	p *pool.Pool,
 	failover *pool.FailoverCoordinator,
 	modelRegistry *models.ModelRegistry,
+	loopbackServer *mcp.LoopbackServer,
 	logger *slog.Logger,
 ) *OpenAIHandlers {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if loopbackServer == nil {
+		loopbackServer = mcp.NewLoopbackServer()
+	}
 	return &OpenAIHandlers{
-		cfg:           cfg,
-		pool:          p,
-		failover:      failover,
-		modelRegistry: modelRegistry,
-		translator:    openai.NewTranslator(),
-		logger:        logger,
+		cfg:            cfg,
+		pool:           p,
+		failover:       failover,
+		modelRegistry:  modelRegistry,
+		loopbackServer: loopbackServer,
+		translator:     openai.NewTranslator(),
+		logger:         logger,
 	}
 }
 
@@ -153,10 +161,13 @@ func (h *OpenAIHandlers) handleSync(
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
+	var interceptedTools []openai.ToolCall
+	var actualPromptTokens atomic.Int64
 	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		turnMu.Lock()
 		fullText.Reset()
 		fullThoughts.Reset()
+		interceptedTools = nil
 		turnMu.Unlock()
 
 		// A. Call session/new (pure editor cwd boundary, 100% compliant with standard ACP)
@@ -166,14 +177,46 @@ func (h *OpenAIHandlers) handleSync(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
-		if systemPrompt != "" {
-			newParams.Meta = map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{
-						"append": systemPrompt,
-					},
+		var loopbackSessionID string
+		var loopbackState *mcp.SessionState
+		if len(req.Tools) > 0 {
+			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+			loopbackState = h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
+			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+
+			execPath, err := os.Executable()
+			if err != nil || execPath == "" {
+				execPath = "agy-gateway"
+			}
+			newParams.MCPServers = []acp.MCPServerInfo{
+				{
+					Name:    "client-tools",
+					Command: execPath,
+					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
 				},
 			}
+		}
+		effectiveSystemPrompt := systemPrompt
+		systemPromptMode := "append"
+		if effectiveSystemPrompt == "" {
+			effectiveSystemPrompt = acp.DefaultExecutionProtocol
+			systemPromptMode = "override"
+		}
+		newParams.SystemPrompt = &acp.SystemPrompt{
+			Mode: systemPromptMode,
+			Content: []acp.PromptBlock{
+				{
+					Type: "text",
+					Text: effectiveSystemPrompt,
+				},
+			},
+		}
+		newParams.Meta = map[string]any{
+			"antigravity": map[string]any{
+				"systemPrompt": map[string]any{
+					systemPromptMode: effectiveSystemPrompt,
+				},
+			},
 		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
@@ -236,7 +279,12 @@ func (h *OpenAIHandlers) handleSync(
 			}
 		}()
 
-		// C. Register listener for turn updates
+		// C. Register listener for turn updates with early stop-sequence detection
+		delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+		if delimiter == "" {
+			delimiter = "tool_call"
+		}
+		streamParser := openai.NewStreamParser(delimiter)
 		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
 			if !ttftDisarmed.Load() {
 				ttftDisarmed.Store(true)
@@ -246,14 +294,121 @@ func (h *OpenAIHandlers) handleSync(
 			defer turnMu.Unlock()
 
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				fullText.WriteString(update.Update.Content.Text)
+				if streamParser.IsTerminated() {
+					cancelPrompt()
+					return
+				}
+				textChunk := update.Update.Content.Text
+				_, _ = streamParser.ParseChunk(textChunk)
+				fullText.WriteString(textChunk)
+				if streamParser.IsTerminated() {
+					h.logger.Debug("openai non-streaming turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
+					cancelPrompt()
+				}
 			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
 				fullThoughts.WriteString(update.Update.Content.Text)
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+			} else if update.Update.SessionUpdate == acp.UpdateUsage {
+				if update.Update.Used != nil && *update.Update.Used > 0 {
+					actualPromptTokens.Store(*update.Update.Used)
+				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
+					actualPromptTokens.Store(update.Update.Usage.Used)
+				}
+			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
+				if loopbackState == nil {
+					return
+				}
+				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
+				if !matched {
+					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
+					return
+				}
+				if len(interceptedTools) > 0 {
+					return
+				}
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+				callID := update.Update.ToolCallID
+				if callID == "" {
+					callID = fmt.Sprintf("call_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+				}
+				args := string(update.Update.RawInput)
+				if args == "" || args == "null" {
+					args = "{}"
+				}
+
+				already := false
+				for _, tc := range interceptedTools {
+					if tc.ID == callID || tc.Function.Name == normalizedName {
+						already = true
+						break
+					}
+				}
+				if !already {
+					interceptedTools = append(interceptedTools, openai.ToolCall{
+						ID:   callID,
+						Type: "function",
+						Function: openai.FunctionCallData{
+							Name:      normalizedName,
+							Arguments: args,
+						},
+					})
+				}
+
+				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+					SessionID: newResult.SessionID,
+				})
+				time.AfterFunc(2500*time.Millisecond, func() {
+					cancelPrompt()
+				})
+				return
+			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
 				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
 			}
 		})
 		defer worker.Transport.SetUpdateListener(nil)
+
+		if loopbackState != nil {
+			go func() {
+				select {
+				case call, ok := <-loopbackState.Calls:
+					if !ok {
+						return
+					}
+					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
+					if !matched {
+						return
+					}
+					turnMu.Lock()
+					already := false
+					for _, tc := range interceptedTools {
+						if tc.ID == call.ID || tc.Function.Name == normalizedName {
+							already = true
+							break
+						}
+					}
+					if !already {
+						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+						interceptedTools = append(interceptedTools, openai.ToolCall{
+							ID:   call.ID,
+							Type: "function",
+							Function: openai.FunctionCallData{
+								Name:      normalizedName,
+								Arguments: string(call.Arguments),
+							},
+						})
+					}
+					turnMu.Unlock()
+
+					_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+						SessionID: newResult.SessionID,
+					})
+					time.AfterFunc(2500*time.Millisecond, func() {
+						cancelPrompt()
+					})
+				case <-promptCtx.Done():
+					return
+				}
+			}()
+		}
 
 		// D. Send session/prompt turn
 		var promptResult acp.PromptResult
@@ -261,7 +416,18 @@ func (h *OpenAIHandlers) handleSync(
 			SessionID: newResult.SessionID,
 			Prompt:    promptBlocks,
 		}, &promptResult); err != nil {
-			return err
+			if (streamParser.IsTerminated() || len(interceptedTools) > 0) && errors.Is(err, context.Canceled) {
+				// Turn was gracefully aborted via session/cancel or watchdog
+				err = nil
+			} else {
+				return err
+			}
+		}
+
+		if len(interceptedTools) > 0 {
+			h.logger.Debug("openai non-streaming turn completed: tool call intercepted", "workerId", worker.ID, "toolCount", len(interceptedTools))
+		} else if streamParser.IsTerminated() {
+			h.logger.Debug("openai non-streaming turn completed: early stop sequence detected", "workerId", worker.ID)
 		}
 
 		return nil
@@ -290,9 +456,16 @@ func (h *OpenAIHandlers) handleSync(
 	}
 	cleanContent, toolCalls, hasTools := openai.ParseCompleteResponse(fullText.String(), delimiter)
 
+	var finalTools []openai.ToolCall
+	if len(interceptedTools) > 0 {
+		finalTools = interceptedTools
+	} else if hasTools {
+		finalTools = toolCalls
+	}
+
 	finishReason := "stop"
 	var message openai.ChatMessage
-	if hasTools {
+	if len(finalTools) > 0 {
 		finishReason = "tool_calls"
 		var contentVal any
 		if cleanContent != "" {
@@ -301,9 +474,12 @@ func (h *OpenAIHandlers) handleSync(
 		message = openai.ChatMessage{
 			Role:      "assistant",
 			Content:   contentVal,
-			ToolCalls: toolCalls,
+			ToolCalls: finalTools,
 		}
 	} else {
+		if cleanContent == "" {
+			cleanContent = "I have completed the analysis."
+		}
 		message = openai.ChatMessage{
 			Role:    "assistant",
 			Content: cleanContent,
@@ -315,6 +491,9 @@ func (h *OpenAIHandlers) handleSync(
 	}
 
 	promptTokens := openai.CountTokens(promptBlocks[0].Text)
+	if actual := actualPromptTokens.Load(); actual > 0 {
+		promptTokens = int(actual)
+	}
 	compTokens := openai.CountTokens(cleanContent)
 	reasoningTokens := openai.CountTokens(fullThoughts.String())
 
@@ -407,6 +586,7 @@ func (h *OpenAIHandlers) handleStreaming(
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
+	var actualPromptTokens atomic.Int64
 	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		turnStartTime := time.Now()
 		totalText.Reset()
@@ -421,14 +601,46 @@ func (h *OpenAIHandlers) handleStreaming(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
-		if systemPrompt != "" {
-			newParams.Meta = map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{
-						"append": systemPrompt,
-					},
+		var loopbackSessionID string
+		var loopbackState *mcp.SessionState
+		if len(req.Tools) > 0 {
+			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+			loopbackState = h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
+			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+
+			execPath, err := os.Executable()
+			if err != nil || execPath == "" {
+				execPath = "agy-gateway"
+			}
+			newParams.MCPServers = []acp.MCPServerInfo{
+				{
+					Name:    "client-tools",
+					Command: execPath,
+					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
 				},
 			}
+		}
+		effectiveSystemPrompt := systemPrompt
+		systemPromptMode := "append"
+		if effectiveSystemPrompt == "" {
+			effectiveSystemPrompt = acp.DefaultExecutionProtocol
+			systemPromptMode = "override"
+		}
+		newParams.SystemPrompt = &acp.SystemPrompt{
+			Mode: systemPromptMode,
+			Content: []acp.PromptBlock{
+				{
+					Type: "text",
+					Text: effectiveSystemPrompt,
+				},
+			},
+		}
+		newParams.Meta = map[string]any{
+			"antigravity": map[string]any{
+				"systemPrompt": map[string]any{
+					systemPromptMode: effectiveSystemPrompt,
+				},
+			},
 		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
@@ -497,10 +709,19 @@ func (h *OpenAIHandlers) handleStreaming(
 				h.logger.Debug("openai stream first token received", "workerId", worker.ID, "ttft", time.Since(turnStartTime))
 			}
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
+				if streamParser.IsTerminated() {
+					cancelPrompt()
+					return
+				}
 				textChunk := update.Update.Content.Text
-				totalText.WriteString(textChunk)
-
 				textDelta, toolCalls := streamParser.ParseChunk(textChunk)
+				if streamParser.IsTerminated() {
+					h.logger.Debug("openai stream turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
+					cancelPrompt()
+				}
+				if textDelta != "" {
+					totalText.WriteString(textDelta)
+				}
 
 				if len(toolCalls) > 0 {
 					hasToolCalls = true
@@ -557,21 +778,159 @@ func (h *OpenAIHandlers) handleStreaming(
 					}
 					_ = sseWriter.WriteChunk(&chunk)
 				}
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+			} else if update.Update.SessionUpdate == acp.UpdateUsage {
+				if update.Update.Used != nil && *update.Update.Used > 0 {
+					actualPromptTokens.Store(*update.Update.Used)
+				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
+					actualPromptTokens.Store(update.Update.Usage.Used)
+				}
+			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
+				if loopbackState == nil {
+					return
+				}
+				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
+				if !matched {
+					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
+					return
+				}
+				if hasToolCalls {
+					return
+				}
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+				callID := update.Update.ToolCallID
+				if callID == "" {
+					callID = fmt.Sprintf("call_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+				}
+				args := string(update.Update.RawInput)
+				if args == "" || args == "null" {
+					args = "{}"
+				}
+
+				hasToolCalls = true
+				toolIdx := 0
+				tc := openai.ToolCall{
+					Index: &toolIdx,
+					ID:    callID,
+					Type:  "function",
+					Function: openai.FunctionCallData{
+						Name:      normalizedName,
+						Arguments: args,
+					},
+				}
+
+				var delta openai.ChatCompletionChunkDelta
+				if !firstChunkSent {
+					delta.Role = "assistant"
+					firstChunkSent = true
+				}
+				delta.ToolCalls = []openai.ToolCall{tc}
+
+				chunk := openai.ChatCompletionChunk{
+					ID:      completionID,
+					Object:  "chat.completion.chunk",
+					Created: createdTime,
+					Model:   req.Model,
+					Choices: []openai.ChatCompletionChunkChoice{
+						{
+							Index: 0,
+							Delta: delta,
+						},
+					},
+				}
+				_ = sseWriter.WriteChunk(&chunk)
+
+				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+					SessionID: newResult.SessionID,
+				})
+				time.AfterFunc(2500*time.Millisecond, func() {
+					cancelPrompt()
+				})
+				return
+			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
 				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
 			}
 		})
 		defer worker.Transport.SetUpdateListener(nil)
+
+		if loopbackState != nil {
+			go func() {
+				select {
+				case call, ok := <-loopbackState.Calls:
+					if !ok {
+						return
+					}
+					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
+					if !matched {
+						return
+					}
+					if !hasToolCalls {
+						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+						hasToolCalls = true
+						toolIdx := 0
+						tc := openai.ToolCall{
+							Index: &toolIdx,
+							ID:    call.ID,
+							Type:  "function",
+							Function: openai.FunctionCallData{
+								Name:      normalizedName,
+								Arguments: string(call.Arguments),
+							},
+						}
+
+						var delta openai.ChatCompletionChunkDelta
+						if !firstChunkSent {
+							delta.Role = "assistant"
+							firstChunkSent = true
+						}
+						delta.ToolCalls = []openai.ToolCall{tc}
+
+						chunk := openai.ChatCompletionChunk{
+							ID:      completionID,
+							Object:  "chat.completion.chunk",
+							Created: createdTime,
+							Model:   req.Model,
+							Choices: []openai.ChatCompletionChunkChoice{
+								{
+									Index: 0,
+									Delta: delta,
+								},
+							},
+						}
+						_ = sseWriter.WriteChunk(&chunk)
+
+						_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+							SessionID: newResult.SessionID,
+						})
+						time.AfterFunc(2500*time.Millisecond, func() {
+							cancelPrompt()
+						})
+					}
+				case <-promptCtx.Done():
+					return
+				}
+			}()
+		}
 
 		var promptResult acp.PromptResult
 		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
 			SessionID: newResult.SessionID,
 			Prompt:    promptBlocks,
 		}, &promptResult); err != nil {
-			if firstChunkSent {
-				return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, err)
+			if (streamParser.IsTerminated() || hasToolCalls) && errors.Is(err, context.Canceled) {
+				// Turn was gracefully aborted via session/cancel or watchdog
+				err = nil
+			} else {
+				if firstChunkSent {
+					return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, err)
+				}
+				return err
 			}
-			return err
+		}
+
+		if hasToolCalls {
+			h.logger.Debug("openai stream turn completed: tool call intercepted", "workerId", worker.ID)
+		} else if streamParser.IsTerminated() {
+			h.logger.Debug("openai stream turn completed: early stop sequence detected", "workerId", worker.ID)
 		}
 
 		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
@@ -634,6 +993,31 @@ func (h *OpenAIHandlers) handleStreaming(
 		}
 	}
 
+	// Guard against empty assistant response (e.g. only thoughts produced, or tool call dropped)
+	if !hasToolCalls && totalText.Len() == 0 {
+		fallbackText := "I have completed the analysis."
+		totalText.WriteString(fallbackText)
+		var delta openai.ChatCompletionChunkDelta
+		if !firstChunkSent {
+			delta.Role = "assistant"
+			firstChunkSent = true
+		}
+		delta.Content = &fallbackText
+		chunk := openai.ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: createdTime,
+			Model:   req.Model,
+			Choices: []openai.ChatCompletionChunkChoice{
+				{
+					Index: 0,
+					Delta: delta,
+				},
+			},
+		}
+		_ = sseWriter.WriteChunk(&chunk)
+	}
+
 	// Emit finish reason chunk
 	finishReason := "stop"
 	if hasToolCalls {
@@ -658,6 +1042,9 @@ func (h *OpenAIHandlers) handleStreaming(
 	// Emit usage chunk if requested
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		promptTokens := openai.CountTokens(promptBlocks[0].Text)
+		if actual := actualPromptTokens.Load(); actual > 0 {
+			promptTokens = int(actual)
+		}
 		compTokens := openai.CountTokens(totalText.String())
 		reasoningTokens := openai.CountTokens(totalThoughts.String())
 

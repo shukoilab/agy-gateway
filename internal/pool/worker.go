@@ -14,6 +14,7 @@ import (
 	"agy-gateway/internal/acp"
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/version"
 )
 
 // Worker represents a warm, isolated agy acp process instance.
@@ -89,33 +90,31 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.Process = proc
 	w.Transport = transport
 
-	// Perform initialize handshake mimicking standard ACP editor (Zed)
+	// Perform initialize handshake as a pure AI gateway client
+	// Note: We deliberately do NOT advertise filesystem ('fs') or terminal execution ('terminal')
+	// capabilities because agy-gateway delegates all tool execution to the external client (e.g. OpenCode)
+	// on the host. Advertising phantom capabilities causes Antigravity ACP to declare native container
+	// tools (run_command) to the LLM, leading to environment confusion and container tool failures.
 	initCtx, cancel := context.WithTimeout(ctx, w.cfg.Pool.HandshakeTimeout)
 	defer cancel()
 
 	initParams := map[string]any{
 		"protocolVersion": 1,
 		"clientInfo": map[string]any{
-			"name":    "zed",
-			"title":   "Zed",
-			"version": "0.214.7",
+			"name":    "agy-gateway",
+			"title":   "Antigravity Gateway",
+			"version": version.Version,
 		},
 		"clientCapabilities": map[string]any{
 			"fs": map[string]any{
-				"readTextFile":  true,
-				"writeTextFile": true,
+				"readTextFile":  false,
+				"writeTextFile": false,
 			},
-			"terminal": map[string]any{
-				"create": true,
-			},
-		},
-		"capabilities": map[string]any{
-			"fs":       true,
-			"terminal": true,
+			"terminal": false, // Canonical ACP v1 boolean capability
 		},
 	}
 
-	var initResult any
+	var initResult map[string]any
 	if err := transport.Call(initCtx, "initialize", initParams, &initResult); err != nil {
 		w.Close()
 		return fmt.Errorf("acp initialize failed: %w", err)

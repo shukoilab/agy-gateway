@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"agy-gateway/internal/acp"
 	"agy-gateway/internal/anthropic"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/mcp"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/pool"
 	"agy-gateway/internal/telemetry"
@@ -28,12 +30,13 @@ import (
 // @rationale Provides full protocol parity with Anthropic Claude clients using the agy backend.
 // @preconditions Dependencies must be non-nil.
 type AnthropicHandlers struct {
-	cfg           *config.Config
-	pool          *pool.Pool
-	failover      *pool.FailoverCoordinator
-	modelRegistry *models.ModelRegistry
-	translator    *anthropic.Translator
-	logger        *slog.Logger
+	cfg            *config.Config
+	pool           *pool.Pool
+	failover       *pool.FailoverCoordinator
+	modelRegistry  *models.ModelRegistry
+	loopbackServer *mcp.LoopbackServer
+	translator     *anthropic.Translator
+	logger         *slog.Logger
 }
 
 // NewAnthropicHandlers creates an initialized handler suite.
@@ -42,18 +45,23 @@ func NewAnthropicHandlers(
 	p *pool.Pool,
 	failover *pool.FailoverCoordinator,
 	modelRegistry *models.ModelRegistry,
+	loopbackServer *mcp.LoopbackServer,
 	logger *slog.Logger,
 ) *AnthropicHandlers {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if loopbackServer == nil {
+		loopbackServer = mcp.NewLoopbackServer()
+	}
 	return &AnthropicHandlers{
-		cfg:           cfg,
-		pool:          p,
-		failover:      failover,
-		modelRegistry: modelRegistry,
-		translator:    anthropic.NewTranslator(),
-		logger:        logger.With("component", "anthropic-handlers"),
+		cfg:            cfg,
+		pool:           p,
+		failover:       failover,
+		modelRegistry:  modelRegistry,
+		loopbackServer: loopbackServer,
+		translator:     anthropic.NewTranslator(),
+		logger:         logger.With("component", "anthropic-handlers"),
 	}
 }
 
@@ -183,10 +191,13 @@ func (h *AnthropicHandlers) handleSync(
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
+	var interceptedToolBlocks []anthropic.ContentBlock
+	var actualPromptTokens atomic.Int64
 	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		turnMu.Lock()
 		fullText.Reset()
 		fullThoughts.Reset()
+		interceptedToolBlocks = nil
 		turnMu.Unlock()
 
 		// A. Negotiate ACP session
@@ -196,14 +207,54 @@ func (h *AnthropicHandlers) handleSync(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
-		if systemPrompt != "" {
-			newParams.Meta = map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{
-						"append": systemPrompt,
-					},
+		var loopbackSessionID string
+		var loopbackState *mcp.SessionState
+		if len(req.Tools) > 0 {
+			var anthropicTools []mcp.AnthropicToolDefinition
+			for _, t := range req.Tools {
+				anthropicTools = append(anthropicTools, mcp.AnthropicToolDefinition{
+					Name:        t.Name,
+					Description: t.Description,
+					InputSchema: t.InputSchema,
+				})
+			}
+			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+			loopbackState = h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
+			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+
+			execPath, err := os.Executable()
+			if err != nil || execPath == "" {
+				execPath = "agy-gateway"
+			}
+			newParams.MCPServers = []acp.MCPServerInfo{
+				{
+					Name:    "client-tools",
+					Command: execPath,
+					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
 				},
 			}
+		}
+		effectiveSystemPrompt := systemPrompt
+		systemPromptMode := "append"
+		if effectiveSystemPrompt == "" {
+			effectiveSystemPrompt = acp.DefaultExecutionProtocol
+			systemPromptMode = "override"
+		}
+		newParams.SystemPrompt = &acp.SystemPrompt{
+			Mode: systemPromptMode,
+			Content: []acp.PromptBlock{
+				{
+					Type: "text",
+					Text: effectiveSystemPrompt,
+				},
+			},
+		}
+		newParams.Meta = map[string]any{
+			"antigravity": map[string]any{
+				"systemPrompt": map[string]any{
+					systemPromptMode: effectiveSystemPrompt,
+				},
+			},
 		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
@@ -265,7 +316,12 @@ func (h *AnthropicHandlers) handleSync(
 			}
 		}()
 
-		// C. Register listener for turn updates
+		// C. Register listener for turn updates with early stop-sequence detection
+		delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+		if delimiter == "" {
+			delimiter = "tool_call"
+		}
+		streamParser := anthropic.NewStreamParser(delimiter)
 		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
 			if !ttftDisarmed.Load() {
 				ttftDisarmed.Store(true)
@@ -275,14 +331,117 @@ func (h *AnthropicHandlers) handleSync(
 			defer turnMu.Unlock()
 
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				fullText.WriteString(update.Update.Content.Text)
+				if streamParser.IsTerminated() {
+					cancelPrompt()
+					return
+				}
+				textChunk := update.Update.Content.Text
+				_, _ = streamParser.ParseChunk(textChunk)
+				fullText.WriteString(textChunk)
+				if streamParser.IsTerminated() {
+					h.logger.Debug("anthropic non-streaming turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
+					cancelPrompt()
+				}
 			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
 				fullThoughts.WriteString(update.Update.Content.Text)
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+			} else if update.Update.SessionUpdate == acp.UpdateUsage {
+				if update.Update.Used != nil && *update.Update.Used > 0 {
+					actualPromptTokens.Store(*update.Update.Used)
+				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
+					actualPromptTokens.Store(update.Update.Usage.Used)
+				}
+			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
+				if loopbackState == nil {
+					h.logger.Warn("tool_call update ignored: loopbackState is nil", "name", update.Update.Name)
+					return
+				}
+				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
+				h.logger.Info("anthropic sync tool_call check", "rawName", update.Update.Name, "normalized", normalizedName, "matched", matched)
+				if !matched {
+					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
+					return
+				}
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+				callID := update.Update.ToolCallID
+				if callID == "" {
+					callID = fmt.Sprintf("toolu_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+				}
+				args := string(update.Update.RawInput)
+				if args == "" || args == "null" {
+					args = "{}"
+				}
+
+				already := false
+				for _, tb := range interceptedToolBlocks {
+					if tb.ID == callID || tb.Name == normalizedName {
+						already = true
+						break
+					}
+				}
+				if !already {
+					interceptedToolBlocks = append(interceptedToolBlocks, anthropic.ContentBlock{
+						Type:  "tool_use",
+						ID:    callID,
+						Name:  normalizedName,
+						Input: json.RawMessage(args),
+					})
+				}
+
+				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+					SessionID: newResult.SessionID,
+				})
+				time.AfterFunc(2500*time.Millisecond, func() {
+					cancelPrompt()
+				})
+				return
+			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
 				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
 			}
 		})
 		defer worker.Transport.SetUpdateListener(nil)
+
+		if loopbackState != nil {
+			go func() {
+				select {
+				case call, ok := <-loopbackState.Calls:
+					if !ok {
+						return
+					}
+					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
+					h.logger.Info("anthropic stream loopbackState.Calls received", "callName", call.Name, "normalized", normalizedName, "matched", matched)
+					if !matched {
+						return
+					}
+					turnMu.Lock()
+					already := false
+					for _, tb := range interceptedToolBlocks {
+						if tb.ID == call.ID || tb.Name == normalizedName {
+							already = true
+							break
+						}
+					}
+					if !already {
+						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+						interceptedToolBlocks = append(interceptedToolBlocks, anthropic.ContentBlock{
+							Type:  "tool_use",
+							ID:    call.ID,
+							Name:  normalizedName,
+							Input: call.Arguments,
+						})
+					}
+					turnMu.Unlock()
+
+					_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+						SessionID: newResult.SessionID,
+					})
+					time.AfterFunc(2500*time.Millisecond, func() {
+						cancelPrompt()
+					})
+				case <-promptCtx.Done():
+					return
+				}
+			}()
+		}
 
 		// D. Send session/prompt turn
 		var promptResult acp.PromptResult
@@ -290,7 +449,18 @@ func (h *AnthropicHandlers) handleSync(
 			SessionID: newResult.SessionID,
 			Prompt:    promptBlocks,
 		}, &promptResult); err != nil {
-			return err
+			if (streamParser.IsTerminated() || len(interceptedToolBlocks) > 0) && errors.Is(err, context.Canceled) {
+				// Turn was gracefully aborted via session/cancel or watchdog
+				err = nil
+			} else {
+				return err
+			}
+		}
+
+		if len(interceptedToolBlocks) > 0 {
+			h.logger.Debug("anthropic non-streaming turn completed: tool call intercepted", "workerId", worker.ID, "toolCount", len(interceptedToolBlocks))
+		} else if streamParser.IsTerminated() {
+			h.logger.Debug("anthropic non-streaming turn completed: early stop sequence detected", "workerId", worker.ID)
 		}
 
 		return nil
@@ -338,17 +508,42 @@ func (h *AnthropicHandlers) handleSync(
 		})
 	}
 
+	var finalToolBlocks []anthropic.ContentBlock
+	if len(interceptedToolBlocks) > 0 {
+		finalToolBlocks = interceptedToolBlocks
+	} else if hasTools {
+		finalToolBlocks = toolBlocks
+	}
+
 	// Append tool calls
-	if hasTools {
-		contentBlocks = append(contentBlocks, toolBlocks...)
+	if len(finalToolBlocks) > 0 {
+		contentBlocks = append(contentBlocks, finalToolBlocks...)
+	}
+
+	// Guard against empty content blocks (e.g. only thinking block produced, no tools, no text)
+	hasRealContent := false
+	for _, b := range contentBlocks {
+		if b.Type == "text" || b.Type == "tool_use" {
+			hasRealContent = true
+			break
+		}
+	}
+	if !hasRealContent {
+		contentBlocks = append(contentBlocks, anthropic.ContentBlock{
+			Type: "text",
+			Text: "I have completed the analysis.",
+		})
 	}
 
 	stopReason := "end_turn"
-	if hasTools {
+	if len(finalToolBlocks) > 0 {
 		stopReason = "tool_use"
 	}
 
 	promptTokens := anthropic.CountTokens(promptBlocks[0].Text)
+	if actual := actualPromptTokens.Load(); actual > 0 {
+		promptTokens = int(actual)
+	}
 	outputTokens := anthropic.CountTokens(cleanContent) + anthropic.CountTokens(fullThoughts.String())
 
 	resp := anthropic.MessageResponse{
@@ -437,6 +632,8 @@ func (h *AnthropicHandlers) handleStreaming(
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
+	var hasToolCalls bool
+	var actualPromptTokens atomic.Int64
 	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		streamMu.Lock()
 		totalText.Reset()
@@ -444,6 +641,7 @@ func (h *AnthropicHandlers) handleStreaming(
 		streamParser = anthropic.NewStreamParser(delimiter)
 		thinkingStarted = false
 		textStarted = false
+		hasToolCalls = false
 		blockIndex = 0
 		streamMu.Unlock()
 
@@ -453,14 +651,54 @@ func (h *AnthropicHandlers) handleStreaming(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
-		if systemPrompt != "" {
-			newParams.Meta = map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{
-						"append": systemPrompt,
-					},
+		var loopbackSessionID string
+		var loopbackState *mcp.SessionState
+		if len(req.Tools) > 0 {
+			var anthropicTools []mcp.AnthropicToolDefinition
+			for _, t := range req.Tools {
+				anthropicTools = append(anthropicTools, mcp.AnthropicToolDefinition{
+					Name:        t.Name,
+					Description: t.Description,
+					InputSchema: t.InputSchema,
+				})
+			}
+			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+			loopbackState = h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
+			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+
+			execPath, err := os.Executable()
+			if err != nil || execPath == "" {
+				execPath = "agy-gateway"
+			}
+			newParams.MCPServers = []acp.MCPServerInfo{
+				{
+					Name:    "client-tools",
+					Command: execPath,
+					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
 				},
 			}
+		}
+		effectiveSystemPrompt := systemPrompt
+		systemPromptMode := "append"
+		if effectiveSystemPrompt == "" {
+			effectiveSystemPrompt = acp.DefaultExecutionProtocol
+			systemPromptMode = "override"
+		}
+		newParams.SystemPrompt = &acp.SystemPrompt{
+			Mode: systemPromptMode,
+			Content: []acp.PromptBlock{
+				{
+					Type: "text",
+					Text: effectiveSystemPrompt,
+				},
+			},
+		}
+		newParams.Meta = map[string]any{
+			"antigravity": map[string]any{
+				"systemPrompt": map[string]any{
+					systemPromptMode: effectiveSystemPrompt,
+				},
+			},
 		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
@@ -559,8 +797,11 @@ func (h *AnthropicHandlers) handleStreaming(
 
 			// 2. Handle Message Text Chunk
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
+				if streamParser.IsTerminated() {
+					cancelPrompt()
+					return
+				}
 				textChunk := update.Update.Content.Text
-				totalText.WriteString(textChunk)
 
 				// If thinking was active, close it out before emitting text
 				if thinkingStarted {
@@ -579,6 +820,13 @@ func (h *AnthropicHandlers) handleStreaming(
 				}
 
 				textDelta, toolCalls := streamParser.ParseChunk(textChunk)
+				if streamParser.IsTerminated() {
+					h.logger.Debug("anthropic stream turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
+					cancelPrompt()
+				}
+				if textDelta != "" {
+					totalText.WriteString(textDelta)
+				}
 
 				if textDelta != "" {
 					if !textStarted {
@@ -620,21 +868,173 @@ func (h *AnthropicHandlers) handleStreaming(
 				return
 			}
 
-			if update.Update.SessionUpdate == acp.UpdateToolCall || update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
+			if update.Update.SessionUpdate == acp.UpdateUsage {
+				if update.Update.Used != nil && *update.Update.Used > 0 {
+					actualPromptTokens.Store(*update.Update.Used)
+					promptTokens = int(*update.Update.Used)
+				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
+					actualPromptTokens.Store(update.Update.Usage.Used)
+					promptTokens = int(update.Update.Usage.Used)
+				}
+				return
+			}
+
+			if update.Update.SessionUpdate == acp.UpdateToolCall {
+				if loopbackState == nil {
+					h.logger.Warn("tool_call update ignored: loopbackState is nil", "name", update.Update.Name)
+					return
+				}
+				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
+				h.logger.Info("anthropic stream tool_call check", "rawName", update.Update.Name, "normalized", normalizedName, "matched", matched)
+				if !matched {
+					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
+					return
+				}
+				if hasToolCalls {
+					return
+				}
+				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+				callID := update.Update.ToolCallID
+				if callID == "" {
+					callID = fmt.Sprintf("toolu_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
+				}
+				args := string(update.Update.RawInput)
+				if args == "" || args == "null" {
+					args = "{}"
+				}
+
+				hasToolCalls = true
+				if !firstTokenSent.Load() {
+					firstTokenSent.Store(true)
+					_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
+				}
+				if thinkingStarted {
+					sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
+					_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
+						Type:      "signature_delta",
+						Signature: sig,
+					})
+					_ = sseWriter.WriteContentBlockStop(thinkingIndex)
+					thinkingStarted = false
+				}
+				if textStarted {
+					_ = sseWriter.WriteContentBlockStop(textIndex)
+					textStarted = false
+				}
+
+				toolIdx := blockIndex
+				blockIndex++
+				startBlock := anthropic.ContentBlock{
+					Type:  "tool_use",
+					ID:    callID,
+					Name:  normalizedName,
+					Input: json.RawMessage("{}"),
+				}
+				_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
+				_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
+					Type:        "input_json_delta",
+					PartialJSON: args,
+				})
+				_ = sseWriter.WriteContentBlockStop(toolIdx)
+
+				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+					SessionID: newResult.SessionID,
+				})
+				time.AfterFunc(2500*time.Millisecond, func() {
+					cancelPrompt()
+				})
+				return
+			}
+
+			if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
 				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
 			}
 		})
 		defer worker.Transport.SetUpdateListener(nil)
+
+		if loopbackState != nil {
+			go func() {
+				select {
+				case call, ok := <-loopbackState.Calls:
+					if !ok {
+						return
+					}
+					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
+					h.logger.Info("anthropic stream loopbackState.Calls received", "callName", call.Name, "normalized", normalizedName, "matched", matched)
+					if !matched {
+						return
+					}
+					streamMu.Lock()
+					if !hasToolCalls {
+						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
+						hasToolCalls = true
+						if !firstTokenSent.Load() {
+							firstTokenSent.Store(true)
+							_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
+						}
+						if thinkingStarted {
+							sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
+							_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
+								Type:      "signature_delta",
+								Signature: sig,
+							})
+							_ = sseWriter.WriteContentBlockStop(thinkingIndex)
+							thinkingStarted = false
+						}
+						if textStarted {
+							_ = sseWriter.WriteContentBlockStop(textIndex)
+							textStarted = false
+						}
+
+						toolIdx := blockIndex
+						blockIndex++
+						startBlock := anthropic.ContentBlock{
+							Type:  "tool_use",
+							ID:    call.ID,
+							Name:  normalizedName,
+							Input: json.RawMessage("{}"),
+						}
+						_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
+						_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
+							Type:        "input_json_delta",
+							PartialJSON: string(call.Arguments),
+						})
+						_ = sseWriter.WriteContentBlockStop(toolIdx)
+
+						_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
+							SessionID: newResult.SessionID,
+						})
+						time.AfterFunc(2500*time.Millisecond, func() {
+							cancelPrompt()
+						})
+					}
+					streamMu.Unlock()
+				case <-promptCtx.Done():
+					return
+				}
+			}()
+		}
 
 		var promptResult acp.PromptResult
 		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
 			SessionID: newResult.SessionID,
 			Prompt:    promptBlocks,
 		}, &promptResult); err != nil {
-			if firstTokenSent.Load() {
-				return pool.ErrNonRetryableStream
+			if (streamParser.IsTerminated() || hasToolCalls) && errors.Is(err, context.Canceled) {
+				// Turn was gracefully aborted via session/cancel or watchdog
+				err = nil
+			} else {
+				if firstTokenSent.Load() {
+					return pool.ErrNonRetryableStream
+				}
+				return err
 			}
-			return err
+		}
+
+		if hasToolCalls {
+			h.logger.Debug("anthropic stream turn completed: tool call intercepted", "workerId", worker.ID)
+		} else if streamParser.IsTerminated() {
+			h.logger.Debug("anthropic stream turn completed: early stop sequence detected", "workerId", worker.ID)
 		}
 
 		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
@@ -708,9 +1108,33 @@ func (h *AnthropicHandlers) handleStreaming(
 	}
 
 	stopReason := "end_turn"
+	if hasToolCalls {
+		stopReason = "tool_use"
+	}
 	_, toolBlocks, hasTools := anthropic.ParseCompleteResponse(totalText.String(), delimiter)
 	if hasTools || len(toolBlocks) > 0 {
 		stopReason = "tool_use"
+	}
+
+	// Guard against empty assistant response (e.g. only thinking block produced, no tools, no text)
+	if !hasToolCalls && !hasTools && len(toolBlocks) == 0 && totalText.Len() == 0 {
+		if !firstTokenSent.Load() {
+			firstTokenSent.Store(true)
+			_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
+		}
+		fallbackText := "I have completed the analysis."
+		totalText.WriteString(fallbackText)
+		textIdx := blockIndex
+		blockIndex++
+		_ = sseWriter.WriteContentBlockStart(textIdx, anthropic.ContentBlock{
+			Type: "text",
+			Text: "",
+		})
+		_ = sseWriter.WriteContentBlockDelta(textIdx, anthropic.ContentBlockDelta{
+			Type: "text_delta",
+			Text: fallbackText,
+		})
+		_ = sseWriter.WriteContentBlockStop(textIdx)
 	}
 
 	outputTokens := anthropic.CountTokens(totalText.String()) + anthropic.CountTokens(totalThoughts.String())
