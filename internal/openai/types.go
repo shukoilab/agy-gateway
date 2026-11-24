@@ -10,129 +10,129 @@ import (
 
 // ChatCompletionRequest represents an incoming OpenAI /v1/chat/completions payload.
 type ChatCompletionRequest struct {
-	Model               string                     `json:"model"`
+	Model               string                     `json:"model" example:"gemini-3.8-flash"`
 	Messages            []ChatMessage              `json:"messages"`
 	Tools               []mcp.OpenAIToolDefinition `json:"tools,omitempty"`
-	ToolChoice          any                        `json:"tool_choice,omitempty"`
+	ToolChoice          any                        `json:"tool_choice,omitempty" swaggertype:"primitive,string" example:"auto"`
 	ParallelToolCalls   *bool                      `json:"parallel_tool_calls,omitempty"`
-	Temperature         *float64                   `json:"temperature,omitempty"`
-	TopP                *float64                   `json:"top_p,omitempty"`
-	N                   *int                       `json:"n,omitempty"`
-	Stream              bool                       `json:"stream,omitempty"`
+	Temperature         *float64                   `json:"temperature,omitempty" example:"0.7"`
+	TopP                *float64                   `json:"top_p,omitempty" example:"0.95"`
+	N                   *int                       `json:"n,omitempty" example:"1"`
+	Stream              bool                       `json:"stream,omitempty" example:"false"`
 	StreamOptions       *StreamOptions             `json:"stream_options,omitempty"`
-	Stop                any                        `json:"stop,omitempty"`
-	MaxTokens           *int                       `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int                       `json:"max_completion_tokens,omitempty"`
-	PresencePenalty     *float64                   `json:"presence_penalty,omitempty"`
-	FrequencyPenalty    *float64                   `json:"frequency_penalty,omitempty"`
-	ReasoningEffort     string                     `json:"reasoning_effort,omitempty"`
-	ResponseFormat      any                        `json:"response_format,omitempty"`
-	User                string                     `json:"user,omitempty"`
+	Stop                any                        `json:"stop,omitempty" swaggertype:"primitive,string" example:"\n"`
+	MaxTokens           *int                       `json:"max_tokens,omitempty" example:"2048"`
+	MaxCompletionTokens *int                       `json:"max_completion_tokens,omitempty" example:"2048"`
+	PresencePenalty     *float64                   `json:"presence_penalty,omitempty" example:"0.0"`
+	FrequencyPenalty    *float64                   `json:"frequency_penalty,omitempty" example:"0.0"`
+	ReasoningEffort     string                     `json:"reasoning_effort,omitempty" enums:"low,medium,high" example:"medium"`
+	ResponseFormat      any                        `json:"response_format,omitempty" swaggertype:"object"`
+	User                string                     `json:"user,omitempty" example:"client_user_123"`
 }
 
 type StreamOptions struct {
-	IncludeUsage bool `json:"include_usage,omitempty"`
+	IncludeUsage bool `json:"include_usage,omitempty" example:"true"`
 }
 
 // ChatMessage represents a single message in the conversation.
 type ChatMessage struct {
-	Role             string     `json:"role"` // "developer", "system", "user", "assistant", "tool"
-	Content          any        `json:"content"` // string or []ContentPart
-	Name             string     `json:"name,omitempty"`
+	Role             string     `json:"role" enums:"developer,system,user,assistant,tool" example:"user"`                                        // "developer", "system", "user", "assistant", "tool"
+	Content          any        `json:"content" swaggertype:"primitive,string" example:"Explain the architecture of distributed actor systems."` // string or []ContentPart
+	Name             string     `json:"name,omitempty" example:"analyst"`
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID       string     `json:"tool_call_id,omitempty"`
-	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCallID       string     `json:"tool_call_id,omitempty" example:"call_9f3b18e2"`
+	ReasoningContent string     `json:"reasoning_content,omitempty" example:"Let's examine actor isolation, message mailboxes, and supervision trees..."`
 }
 
 type ContentPart struct {
-	Type     string    `json:"type"` // "text", "image_url"
-	Text     string    `json:"text,omitempty"`
+	Type     string    `json:"type" example:"text"` // "text", "image_url"
+	Text     string    `json:"text,omitempty" example:"Describe this architecture diagram"`
 	ImageURL *ImageURL `json:"image_url,omitempty"`
 }
 
 type ImageURL struct {
-	URL string `json:"url"`
+	URL string `json:"url" example:"https://example.com/diagram.png"`
 }
 
 // ToolCall represents a model function call.
 type ToolCall struct {
-	Index    *int             `json:"index,omitempty"`
-	ID       string           `json:"id,omitempty"`
-	Type     string           `json:"type,omitempty"` // "function"
+	Index    *int             `json:"index,omitempty" example:"0"`
+	ID       string           `json:"id,omitempty" example:"call_abc123"`
+	Type     string           `json:"type,omitempty" example:"function"` // "function"
 	Function FunctionCallData `json:"function"`
 }
 
 type FunctionCallData struct {
-	Name      string `json:"name,omitempty"`
-	Arguments string `json:"arguments"`
+	Name      string `json:"name,omitempty" example:"get_weather"`
+	Arguments string `json:"arguments" example:"{\"location\":\"Tokyo\"}"`
 }
 
 // ChatCompletionResponse represents the synchronous JSON completion payload.
 type ChatCompletionResponse struct {
-	ID                string                 `json:"id"`
-	Object            string                 `json:"object"`
-	Created           int64                  `json:"created"`
-	Model             string                 `json:"model"`
-	SystemFingerprint string                 `json:"system_fingerprint,omitempty"`
+	ID                string                 `json:"id" example:"chatcmpl-9f3b18e2a1b2c3"`
+	Object            string                 `json:"object" example:"chat.completion"`
+	Created           int64                  `json:"created" example:"1774350000"`
+	Model             string                 `json:"model" example:"gemini-3.8-flash"`
+	SystemFingerprint string                 `json:"system_fingerprint,omitempty" example:"fp_agy_v34"`
 	Choices           []ChatCompletionChoice `json:"choices"`
 	Usage             UsageDetails           `json:"usage"`
 }
 
 type ChatCompletionChoice struct {
-	Index        int         `json:"index"`
+	Index        int         `json:"index" example:"0"`
 	Message      ChatMessage `json:"message"`
-	FinishReason string      `json:"finish_reason"`
+	FinishReason string      `json:"finish_reason" example:"stop"`
 }
 
 // ChatCompletionChunk represents an individual streaming SSE event.
 type ChatCompletionChunk struct {
-	ID                string                      `json:"id"`
-	Object            string                      `json:"object"`
-	Created           int64                       `json:"created"`
-	Model             string                      `json:"model"`
-	SystemFingerprint string                      `json:"system_fingerprint,omitempty"`
+	ID                string                      `json:"id" example:"chatcmpl-9f3b18e2a1b2c3"`
+	Object            string                      `json:"object" example:"chat.completion.chunk"`
+	Created           int64                       `json:"created" example:"1774350000"`
+	Model             string                      `json:"model" example:"gemini-3.8-flash"`
+	SystemFingerprint string                      `json:"system_fingerprint,omitempty" example:"fp_agy_v34"`
 	Choices           []ChatCompletionChunkChoice `json:"choices"`
 	Usage             *UsageDetails               `json:"usage,omitempty"`
 }
 
 type ChatCompletionChunkChoice struct {
-	Index        int                      `json:"index"`
+	Index        int                      `json:"index" example:"0"`
 	Delta        ChatCompletionChunkDelta `json:"delta"`
-	FinishReason *string                  `json:"finish_reason"`
+	FinishReason *string                  `json:"finish_reason" example:"stop"`
 }
 
 type ChatCompletionChunkDelta struct {
-	Role             string     `json:"role,omitempty"`
+	Role             string     `json:"role,omitempty" example:"assistant"`
 	Content          *string    `json:"content"`
 	ReasoningContent *string    `json:"reasoning_content,omitempty"`
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type UsageDetails struct {
-	PromptTokens            int                      `json:"prompt_tokens"`
-	CompletionTokens        int                      `json:"completion_tokens"`
-	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens" example:"35"`
+	CompletionTokens        int                      `json:"completion_tokens" example:"180"`
+	TotalTokens             int                      `json:"total_tokens" example:"215"`
 	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
 	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
 type PromptTokensDetails struct {
-	CachedTokens int `json:"cached_tokens"`
+	CachedTokens int `json:"cached_tokens" example:"0"`
 }
 
 type CompletionTokensDetails struct {
-	ReasoningTokens int `json:"reasoning_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens" example:"120"`
 }
 
 type ModelObject struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID      string `json:"id" example:"gemini-3.8-flash"`
+	Object  string `json:"object" example:"model"`
+	Created int64  `json:"created" example:"1774350000"`
+	OwnedBy string `json:"owned_by" example:"google"`
 }
 
 type ModelListResponse struct {
-	Object string        `json:"object"`
+	Object string        `json:"object" example:"list"`
 	Data   []ModelObject `json:"data"`
 }
 
@@ -141,10 +141,10 @@ type ErrorResponse struct {
 }
 
 type ErrorDetails struct {
-	Message string  `json:"message"`
-	Type    string  `json:"type"`
-	Param   *string `json:"param,omitempty"`
-	Code    *string `json:"code,omitempty"`
+	Message string  `json:"message" example:"Missing or invalid Bearer token"`
+	Type    string  `json:"type" example:"invalid_request_error"`
+	Param   *string `json:"param,omitempty" example:"authorization"`
+	Code    *string `json:"code,omitempty" example:"invalid_api_key"`
 }
 
 func (m *ChatMessage) ContentString() string {

@@ -197,6 +197,29 @@ observability:
 
 ## 📡 API Usage & Examples
 
+### 📖 Interactive Swagger UI & OpenAPI Specification
+
+`agy-gateway` provides an enterprise-grade, fully interactive OpenAPI 2.0 / Swagger documentation UI with built-in client and administrator authentication support:
+
+- **Swagger UI Interactive Interface**: [http://localhost:8080/swagger/index.html](http://localhost:8080/swagger/index.html) (shortcut: [http://localhost:8080/docs](http://localhost:8080/docs))
+- **Raw OpenAPI Specification (JSON)**: [http://localhost:8080/swagger/doc.json](http://localhost:8080/swagger/doc.json)
+
+#### 🔐 Interactive Authentication in Swagger UI
+Click the **Authorize 🔓** button in the upper-right corner of Swagger UI:
+1. **Client Endpoints (`/v1/*`)**: In **`ClientBearerAuth`**, enter `Bearer <your-client-api-key>` (e.g. `Bearer sk-antigravity-dev-test`).
+2. **Admin Control Plane (`/admin/v1/*`)**: In **`AdminBearerAuth`**, enter `Bearer <your-admin-api-key>` (e.g. `Bearer agy-admin-secret-key-12345`).
+3. Session tokens persist across browser refreshes automatically (`persistAuthorization: true`).
+
+#### 🏷️ Organized Endpoint Categories
+- **`OpenAI - Chat Completions`**: Chat completions with streaming SSE, reasoning thoughts (`reasoning_effort` / `reasoning_content`), and function tool calling.
+- **`OpenAI - Models`**: Dynamic model cataloging and detailed metadata queries.
+- **`Admin - Accounts`**: Credential management, live quota tracking (`agy /usage`), manual switching, and rotation.
+- **`Admin - OAuth Onboarding`**: Out-of-band headless Google OAuth2 flow initialization and loopback completion.
+- **`Admin - Vault`**: Credential vault status inspection and hygiene / cleanup.
+- **`Operations & Telemetry`**: Liveness probe (`/healthz`), readiness probe (`/readyz`), and Prometheus metrics (`/metrics`).
+
+---
+
 ### 1. List Available Models (`GET /v1/models`)
 
 ```bash
@@ -499,16 +522,29 @@ go fmt ./...
 go vet ./...
 ```
 
-### 4. Running Locally
+### 4. Generating & Updating Swagger Documentation
+Install the `swag` CLI tool:
+
+```bash
+go install github.com/swaggo/swag/cmd/swag@latest
+```
+
+Whenever you modify route definitions, handler signatures, or request/response structs, regenerate the OpenAPI assets:
+
+```bash
+swag init -d cmd/agy-gateway,internal/server,internal/openai,internal/auth,internal/models,internal/telemetry,internal/mcp -g main.go --parseInternal
+```
+
+### 5. Running Locally
 Run the gateway service directly on your host machine:
 
 ```bash
 go run ./cmd/agy-gateway
 ```
 
-The gateway starts on `http://localhost:8080`.
+The gateway starts on `http://localhost:8080`, and the interactive Swagger UI is available at `http://localhost:8080/swagger/index.html` or `http://localhost:8080/docs`.
 
-### 5. Running with Docker Compose
+### 6. Running with Docker Compose
 To run in the production-mode container environment with non-root security and log rotation:
 
 ```bash

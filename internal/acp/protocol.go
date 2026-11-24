@@ -9,7 +9,7 @@ const (
 	JSONRPCVersion = "2.0"
 
 	// ACP Error Codes
-	ErrCodeAuthRequired = -32000
+	ErrCodeAuthRequired   = -32000
 	ErrCodeMethodNotFound = -32601
 	ErrCodeInvalidParams  = -32602
 	ErrCodeInternalError  = -32603

@@ -18,7 +18,33 @@ import (
 	"agy-gateway/internal/server"
 )
 
-var version = "3.3.0"
+// @title           agy-gateway API
+// @version         3.4.0
+// @description     Enterprise-grade OpenAI-compatible reverse proxy gateway bridging OpenAI client applications to Google Antigravity CLI (`agy acp`).
+// @description     Features multi-account quota rotation, live quota tracking (`agy /usage`), streaming reasoning tokens (`reasoning_effort` / `reasoning_content`), client-side tool calling with JIT prompt envelope translation, and headless OAuth onboarding.
+// @termsOfService  https://github.com/shukoilab/agy-gateway
+
+// @contact.name   ShukoiLab
+// @contact.url    https://github.com/shukoilab/agy-gateway
+// @contact.email  support@shukoilab.com
+
+// @license.name  MIT
+// @license.url   https://github.com/shukoilab/agy-gateway/blob/main/LICENSE
+
+// @host      localhost:8080
+// @BasePath  /
+
+// @securityDefinitions.apikey  ClientBearerAuth
+// @in                          header
+// @name                        Authorization
+// @description                 Client API authorization. Format: `Bearer <your-client-api-key>`. Used to access OpenAI-compatible endpoints (`/v1/*`).
+
+// @securityDefinitions.apikey  AdminBearerAuth
+// @in                          header
+// @name                        Authorization
+// @description                 Admin Control Plane authorization. Format: `Bearer <your-admin-api-key>`. Used to access administrative endpoints (`/admin/v1/*`).
+
+var version = "3.4.0"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")

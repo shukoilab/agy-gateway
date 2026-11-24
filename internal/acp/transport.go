@@ -15,8 +15,8 @@ import (
 
 // Transport manages thread-safe JSON-RPC 2.0 communication over standard I/O pipes.
 type Transport struct {
-	in  io.WriteCloser
-	out io.ReadCloser
+	in     io.WriteCloser
+	out    io.ReadCloser
 	logger *slog.Logger
 
 	writeMu sync.Mutex

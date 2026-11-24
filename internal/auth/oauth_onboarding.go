@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,19 +32,33 @@ var (
 
 // OAuthSession represents an in-flight headless login interaction.
 type OAuthSession struct {
-	ID         string
-	Alias      string
-	AuthURL    string
-	PinnedPort string
-	CreatedAt  time.Time
-	Cmd        *exec.Cmd
-	Stdin      io.WriteCloser
-	ErrBuf     *bytes.Buffer
-	PGID       int
-	DoneCh     chan struct{}
-	Consumed   atomic.Bool
-	Completed  atomic.Bool
-	Failed     atomic.Bool
+	ID         string         `json:"id"`
+	Alias      string         `json:"alias,omitempty"`
+	AuthURL    string         `json:"auth_url"`
+	PinnedPort string         `json:"pinned_port,omitempty"`
+	CreatedAt  time.Time      `json:"created_at"`
+	Cmd        *exec.Cmd      `json:"-"`
+	Stdin      io.WriteCloser `json:"-"`
+	ErrBuf     *bytes.Buffer  `json:"-"`
+	PGID       int            `json:"pgid,omitempty"`
+	DoneCh     chan struct{}  `json:"-"`
+	Consumed   atomic.Bool    `json:"-"`
+	Completed  atomic.Bool    `json:"-"`
+	Failed     atomic.Bool    `json:"-"`
+}
+
+// MarshalJSON provides safe JSON serialization without exposing process handles or channels.
+func (s *OAuthSession) MarshalJSON() ([]byte, error) {
+	type Alias OAuthSession
+	return json.Marshal(&struct {
+		*Alias
+		Completed bool `json:"completed"`
+		Failed    bool `json:"failed"`
+	}{
+		Alias:     (*Alias)(s),
+		Completed: s.Completed.Load(),
+		Failed:    s.Failed.Load(),
+	})
 }
 
 // OAuthOnboardingManager manages out-of-band interactive login flows.

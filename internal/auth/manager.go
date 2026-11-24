@@ -23,72 +23,72 @@ var ErrAccountNotFound = errors.New("account not found")
 
 // AgyUsageEnvelope mirrors the stdout from agy -p "/usage" --output-format json.
 type AgyUsageEnvelope struct {
-	ConversationID string `json:"conversation_id"`
-	Status         string `json:"status"`
-	Response       string `json:"response"`
+	ConversationID string `json:"conversation_id" example:"conv-1234"`
+	Status         string `json:"status" example:"SUCCESS"`
+	Response       string `json:"response" example:"Gemini Models\tWeekly Limit Remaining\t44%\t2026-11-28T08:57:41Z"`
 	Command        struct {
-		Name string `json:"name"`
+		Name string `json:"name" example:"usage"`
 		Data struct {
-			Description string          `json:"description"`
+			Description string          `json:"description" example:"Within each group, models share a weekly limit and a 5-hour limit."`
 			Groups      []AgyUsageGroup `json:"groups"`
 		} `json:"data"`
 	} `json:"command"`
 }
 
 type AgyUsageGroup struct {
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
+	Name        string           `json:"name" example:"Gemini Models"`
+	Description string           `json:"description" example:"Models within this group: Gemini 3.8 Flash"`
 	Buckets     []AgyUsageBucket `json:"buckets"`
 }
 
 type AgyUsageBucket struct {
-	ID                string  `json:"id"`
-	Name              string  `json:"name"`
-	Description       string  `json:"description"`
-	Window            string  `json:"window"` // "weekly" or "5h"
-	RemainingFraction float64 `json:"remaining_fraction"`
-	ResetTime         string  `json:"reset_time"`
+	ID                string  `json:"id" example:"gemini-weekly"`
+	Name              string  `json:"name" example:"Weekly Limit Remaining"`
+	Description       string  `json:"description" example:"You have used some of your weekly limit."`
+	Window            string  `json:"window" example:"weekly"` // "weekly" or "5h"
+	RemainingFraction float64 `json:"remaining_fraction" example:"0.4436"`
+	ResetTime         string  `json:"reset_time" example:"2026-11-28T08:57:41Z"`
 }
 
 // QuotaBucketInfo represents structured quota metrics for an individual window bucket.
 type QuotaBucketInfo struct {
-	ID                string    `json:"id"`
-	Name              string    `json:"name"`
-	Description       string    `json:"description,omitempty"`
-	Window            string    `json:"window"` // "weekly" or "5h"
-	RemainingFraction float64   `json:"remaining_fraction"`
-	RemainingPct      float64   `json:"remaining_pct"` // e.g. 95.68
-	ResetTime         time.Time `json:"reset_time"`
-	IsExhausted       bool      `json:"is_exhausted"`
+	ID                string    `json:"id" example:"gemini-5h"`
+	Name              string    `json:"name" example:"Five Hour Limit Remaining"`
+	Description       string    `json:"description,omitempty" example:"You have used some of your 5-hour limit."`
+	Window            string    `json:"window" example:"5h"` // "weekly" or "5h"
+	RemainingFraction float64   `json:"remaining_fraction" example:"0.7038"`
+	RemainingPct      float64   `json:"remaining_pct" example:"70.38"` // e.g. 95.68
+	ResetTime         time.Time `json:"reset_time" example:"2026-11-24T17:47:05Z"`
+	IsExhausted       bool      `json:"is_exhausted" example:"false"`
 }
 
 // QuotaGroupInfo groups quota buckets by model category (e.g. Gemini Models, Claude/GPT).
 type QuotaGroupInfo struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description,omitempty"`
+	Name        string            `json:"name" example:"Gemini Models"`
+	Description string            `json:"description,omitempty" example:"Gemini 3.8 Flash models pool"`
 	Buckets     []QuotaBucketInfo `json:"buckets"`
 }
 
 // AccountQuotaInfo represents enriched live quota status for an individual account.
 type AccountQuotaInfo struct {
-	ID             string                `json:"id"`
-	Email          string                `json:"email"`
-	Alias          string                `json:"alias,omitempty"`
-	Plan           string                `json:"plan"`
-	Active         bool                  `json:"active"`
-	Status         AccountStatus         `json:"status"`
-	QuotaAvailable bool                  `json:"quota_available"`
+	ID             string                `json:"id" example:"acc_9f3b18e2"`
+	Email          string                `json:"email" example:"dev@shukoilab.com"`
+	Alias          string                `json:"alias,omitempty" example:"primary-account"`
+	Plan           string                `json:"plan" example:"payg"`
+	Active         bool                  `json:"active" example:"true"`
+	Status         AccountStatus         `json:"status" example:"HEALTHY"`
+	QuotaAvailable bool                  `json:"quota_available" example:"true"`
 	CooldownUntil  *time.Time            `json:"cooldown_until,omitempty"`
 	Groups         []QuotaGroupInfo      `json:"groups"`
 	Quotas         map[string]QuotaGroup `json:"quotas,omitempty"`
-	Overview       string                `json:"overview,omitempty"`
-	LastSynced     time.Time             `json:"last_synced"`
+	Overview       string                `json:"overview,omitempty" example:"Gemini: 70.38% (5h reset in 23m)"`
+	LastSynced     time.Time             `json:"last_synced" example:"2026-11-24T10:00:00Z"`
 }
 
 // AccountsQuotaResponse wraps the list of accounts quota data.
 type AccountsQuotaResponse struct {
-	Timestamp time.Time          `json:"timestamp"`
-	Total     int                `json:"total"`
+	Timestamp time.Time          `json:"timestamp" example:"2026-11-24T10:00:00Z"`
+	Total     int                `json:"total" example:"2"`
 	Accounts  []AccountQuotaInfo `json:"accounts"`
 }
 

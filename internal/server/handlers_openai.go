@@ -53,6 +53,22 @@ func NewOpenAIHandlers(
 }
 
 // HandleChatCompletions serves POST /v1/chat/completions.
+//
+//	@Summary		Create chat completion
+//	@Description	Creates a model response for the given chat conversation. 100% compliant with the OpenAI 2026 chat completions standard. Supports streaming SSE (stream: true), multi-turn conversation history, real-time reasoning thoughts (reasoning_effort and reasoning_content), client-side tool calling with JIT prompt envelope translation, and automated multi-account failover.
+//	@Tags			OpenAI - Chat Completions
+//	@Accept			json
+//	@Produce		json
+//	@Produce		text/event-stream
+//	@Security		ClientBearerAuth
+//	@Param			request	body		openai.ChatCompletionRequest	true	"Chat completion request parameters including model, messages, tools, and reasoning preferences"
+//	@Success		200		{object}	openai.ChatCompletionResponse	"Chat completion generated successfully (non-streaming mode)"
+//	@Failure		400		{object}	openai.ErrorResponse			"Invalid JSON body, missing parameters, or unsupported option (e.g. n > 1)"
+//	@Failure		401		{object}	openai.ErrorResponse			"Missing, expired, or invalid Client Bearer API key"
+//	@Failure		404		{object}	openai.ErrorResponse			"Requested model identifier was not found in catalog"
+//	@Failure		429		{object}	openai.ErrorResponse			"Client rate limit exceeded (RPM) or all accounts in cooldown"
+//	@Failure		500		{object}	openai.ErrorResponse			"Internal gateway error or failure executing turn across workers"
+//	@Router			/v1/chat/completions [post]
 func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	telemetry.DefaultMetrics.RequestsTotal.Add(1)
 
@@ -485,6 +501,16 @@ func (h *OpenAIHandlers) handleStreaming(
 }
 
 // HandleListModels serves GET /v1/models.
+//
+//	@Summary		List available models
+//	@Description	Lists the currently available models dynamically discovered across authenticated Google Antigravity accounts.
+//	@Tags			OpenAI - Models
+//	@Accept			json
+//	@Produce		json
+//	@Security		ClientBearerAuth
+//	@Success		200	{object}	openai.ModelListResponse	"List of active models"
+//	@Failure		401	{object}	openai.ErrorResponse		"Missing or invalid Client Bearer token"
+//	@Router			/v1/models [get]
 func (h *OpenAIHandlers) HandleListModels(w http.ResponseWriter, r *http.Request) {
 	resp := openai.ModelListResponse{
 		Object: "list",
@@ -496,6 +522,19 @@ func (h *OpenAIHandlers) HandleListModels(w http.ResponseWriter, r *http.Request
 }
 
 // HandleGetModel serves GET /v1/models/{model}.
+//
+//	@Summary		Retrieve model details
+//	@Description	Retrieves detailed metadata for a specific model by identifier.
+//	@Tags			OpenAI - Models
+//	@Accept			json
+//	@Produce		json
+//	@Security		ClientBearerAuth
+//	@Param			model	path		string					true	"Model identifier (e.g. 'gemini-3.8-flash', 'claude-sonnet-4.6')"
+//	@Success		200		{object}	openai.ModelObject		"Model information"
+//	@Failure		400		{object}	openai.ErrorResponse	"Missing model identifier in request path"
+//	@Failure		401		{object}	openai.ErrorResponse	"Missing or invalid Client Bearer token"
+//	@Failure		404		{object}	openai.ErrorResponse	"The specified model was not found"
+//	@Router			/v1/models/{model} [get]
 func (h *OpenAIHandlers) HandleGetModel(w http.ResponseWriter, r *http.Request) {
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(pathParts) < 3 {

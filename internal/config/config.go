@@ -14,17 +14,17 @@ import (
 
 // Config represents the top-level unified gateway configuration.
 type Config struct {
-	Server        ServerConfig   `yaml:"server"`
-	Security      SecurityConfig `yaml:"security"`
-	Binaries      BinariesConfig `yaml:"binaries"`
+	Server        ServerConfig    `yaml:"server"`
+	Security      SecurityConfig  `yaml:"security"`
+	Binaries      BinariesConfig  `yaml:"binaries"`
 	Execution     ExecutionConfig `yaml:"execution"`
-	Storage       StorageConfig  `yaml:"storage"`
-	Pool          PoolConfig     `yaml:"pool"`
-	Accounts      AccountsConfig `yaml:"accounts"`
-	Admin         AdminConfig    `yaml:"admin"`
-	OpenAI        OpenAIConfig   `yaml:"openai"`
-	MCP           MCPConfig      `yaml:"mcp"`
-	Observability ObsConfig      `yaml:"observability"`
+	Storage       StorageConfig   `yaml:"storage"`
+	Pool          PoolConfig      `yaml:"pool"`
+	Accounts      AccountsConfig  `yaml:"accounts"`
+	Admin         AdminConfig     `yaml:"admin"`
+	OpenAI        OpenAIConfig    `yaml:"openai"`
+	MCP           MCPConfig       `yaml:"mcp"`
+	Observability ObsConfig       `yaml:"observability"`
 
 	// Compiled regex patterns for zero-runtime-allocation routing & validation
 	QueryRegex *regexp.Regexp `yaml:"-"`

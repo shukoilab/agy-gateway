@@ -1,0 +1,1177 @@
+basePath: /
+definitions:
+  auth.Account:
+    properties:
+      alias:
+        example: primary-account
+        type: string
+      assigned_worker:
+        description: -1 if unassigned
+        example: 0
+        type: integer
+      auth_method:
+        example: oauth
+        type: string
+      cooldown_until:
+        example: "2026-11-24T17:47:05Z"
+        type: string
+      email:
+        example: dev@shukoilab.com
+        type: string
+      enabled:
+        example: true
+        type: boolean
+      id:
+        example: acc_9f3b18e2
+        type: string
+      last_used:
+        example: "2026-11-24T10:00:00Z"
+        type: string
+      quotas:
+        additionalProperties:
+          $ref: '#/definitions/auth.QuotaGroup'
+        type: object
+      status:
+        allOf:
+        - $ref: '#/definitions/auth.AccountStatus'
+        example: HEALTHY
+      tier:
+        description: '"free", "payg", "standard"'
+        example: payg
+        type: string
+    type: object
+  auth.AccountQuotaInfo:
+    properties:
+      active:
+        example: true
+        type: boolean
+      alias:
+        example: primary-account
+        type: string
+      cooldown_until:
+        type: string
+      email:
+        example: dev@shukoilab.com
+        type: string
+      groups:
+        items:
+          $ref: '#/definitions/auth.QuotaGroupInfo'
+        type: array
+      id:
+        example: acc_9f3b18e2
+        type: string
+      last_synced:
+        example: "2026-11-24T10:00:00Z"
+        type: string
+      overview:
+        example: 'Gemini: 70.38% (5h reset in 23m)'
+        type: string
+      plan:
+        example: payg
+        type: string
+      quota_available:
+        example: true
+        type: boolean
+      quotas:
+        additionalProperties:
+          $ref: '#/definitions/auth.QuotaGroup'
+        type: object
+      status:
+        allOf:
+        - $ref: '#/definitions/auth.AccountStatus'
+        example: HEALTHY
+    type: object
+  auth.AccountStatus:
+    enum:
+    - HEALTHY
+    - COOLDOWN_5H
+    - COOLDOWN_WEEKLY
+    - AUTH_EXPIRED
+    - DISABLED
+    type: string
+    x-enum-varnames:
+    - StatusHealthy
+    - StatusCooldown5h
+    - StatusCooldownWeekly
+    - StatusAuthExpired
+    - StatusDisabled
+  auth.AccountsQuotaResponse:
+    properties:
+      accounts:
+        items:
+          $ref: '#/definitions/auth.AccountQuotaInfo'
+        type: array
+      timestamp:
+        example: "2026-11-24T10:00:00Z"
+        type: string
+      total:
+        example: 2
+        type: integer
+    type: object
+  auth.AgyUsageBucket:
+    properties:
+      description:
+        example: You have used some of your weekly limit.
+        type: string
+      id:
+        example: gemini-weekly
+        type: string
+      name:
+        example: Weekly Limit Remaining
+        type: string
+      remaining_fraction:
+        example: 0.4436
+        type: number
+      reset_time:
+        example: "2026-11-28T08:57:41Z"
+        type: string
+      window:
+        description: '"weekly" or "5h"'
+        example: weekly
+        type: string
+    type: object
+  auth.AgyUsageEnvelope:
+    properties:
+      command:
+        properties:
+          data:
+            properties:
+              description:
+                example: Within each group, models share a weekly limit and a 5-hour
+                  limit.
+                type: string
+              groups:
+                items:
+                  $ref: '#/definitions/auth.AgyUsageGroup'
+                type: array
+            type: object
+          name:
+            example: usage
+            type: string
+        type: object
+      conversation_id:
+        example: conv-1234
+        type: string
+      response:
+        example: "Gemini Models\tWeekly Limit Remaining\t44%\t2026-11-28T08:57:41Z"
+        type: string
+      status:
+        example: SUCCESS
+        type: string
+    type: object
+  auth.AgyUsageGroup:
+    properties:
+      buckets:
+        items:
+          $ref: '#/definitions/auth.AgyUsageBucket'
+        type: array
+      description:
+        example: 'Models within this group: Gemini 3.8 Flash'
+        type: string
+      name:
+        example: Gemini Models
+        type: string
+    type: object
+  auth.QuotaBucketInfo:
+    properties:
+      description:
+        example: You have used some of your 5-hour limit.
+        type: string
+      id:
+        example: gemini-5h
+        type: string
+      is_exhausted:
+        example: false
+        type: boolean
+      name:
+        example: Five Hour Limit Remaining
+        type: string
+      remaining_fraction:
+        example: 0.7038
+        type: number
+      remaining_pct:
+        description: e.g. 95.68
+        example: 70.38
+        type: number
+      reset_time:
+        example: "2026-11-24T17:47:05Z"
+        type: string
+      window:
+        description: '"weekly" or "5h"'
+        example: 5h
+        type: string
+    type: object
+  auth.QuotaGroup:
+    properties:
+      is_exhausted:
+        example: false
+        type: boolean
+      name:
+        example: Gemini Models
+        type: string
+      remaining_pct:
+        example: 70.38
+        type: number
+      reset_time:
+        example: "2026-11-24T17:47:05Z"
+        type: string
+    type: object
+  auth.QuotaGroupInfo:
+    properties:
+      buckets:
+        items:
+          $ref: '#/definitions/auth.QuotaBucketInfo'
+        type: array
+      description:
+        example: Gemini 3.8 Flash models pool
+        type: string
+      name:
+        example: Gemini Models
+        type: string
+    type: object
+  mcp.FunctionSchema:
+    properties:
+      description:
+        example: Retrieve current temperature and weather conditions
+        type: string
+      name:
+        example: get_weather
+        type: string
+      parameters:
+        type: object
+      strict:
+        example: true
+        type: boolean
+    type: object
+  mcp.OpenAIToolDefinition:
+    properties:
+      function:
+        $ref: '#/definitions/mcp.FunctionSchema'
+      type:
+        description: '"function"'
+        example: function
+        type: string
+    type: object
+  openai.ChatCompletionChoice:
+    properties:
+      finish_reason:
+        example: stop
+        type: string
+      index:
+        example: 0
+        type: integer
+      message:
+        $ref: '#/definitions/openai.ChatMessage'
+    type: object
+  openai.ChatCompletionRequest:
+    properties:
+      frequency_penalty:
+        example: 0
+        type: number
+      max_completion_tokens:
+        example: 2048
+        type: integer
+      max_tokens:
+        example: 2048
+        type: integer
+      messages:
+        items:
+          $ref: '#/definitions/openai.ChatMessage'
+        type: array
+      model:
+        example: gemini-3.8-flash
+        type: string
+      "n":
+        example: 1
+        type: integer
+      parallel_tool_calls:
+        type: boolean
+      presence_penalty:
+        example: 0
+        type: number
+      reasoning_effort:
+        enum:
+        - low
+        - medium
+        - high
+        example: medium
+        type: string
+      response_format:
+        type: object
+      stop:
+        example: |2+
+
+        type: string
+      stream:
+        example: false
+        type: boolean
+      stream_options:
+        $ref: '#/definitions/openai.StreamOptions'
+      temperature:
+        example: 0.7
+        type: number
+      tool_choice:
+        example: auto
+        type: string
+      tools:
+        items:
+          $ref: '#/definitions/mcp.OpenAIToolDefinition'
+        type: array
+      top_p:
+        example: 0.95
+        type: number
+      user:
+        example: client_user_123
+        type: string
+    type: object
+  openai.ChatCompletionResponse:
+    properties:
+      choices:
+        items:
+          $ref: '#/definitions/openai.ChatCompletionChoice'
+        type: array
+      created:
+        example: 1774350000
+        type: integer
+      id:
+        example: chatcmpl-9f3b18e2a1b2c3
+        type: string
+      model:
+        example: gemini-3.8-flash
+        type: string
+      object:
+        example: chat.completion
+        type: string
+      system_fingerprint:
+        example: fp_agy_v34
+        type: string
+      usage:
+        $ref: '#/definitions/openai.UsageDetails'
+    type: object
+  openai.ChatMessage:
+    properties:
+      content:
+        description: string or []ContentPart
+        example: Explain the architecture of distributed actor systems.
+        type: string
+      name:
+        example: analyst
+        type: string
+      reasoning_content:
+        example: Let's examine actor isolation, message mailboxes, and supervision
+          trees...
+        type: string
+      role:
+        description: '"developer", "system", "user", "assistant", "tool"'
+        enum:
+        - developer
+        - system
+        - user
+        - assistant
+        - tool
+        example: user
+        type: string
+      tool_call_id:
+        example: call_9f3b18e2
+        type: string
+      tool_calls:
+        items:
+          $ref: '#/definitions/openai.ToolCall'
+        type: array
+    type: object
+  openai.CompletionTokensDetails:
+    properties:
+      reasoning_tokens:
+        example: 120
+        type: integer
+    type: object
+  openai.ErrorDetails:
+    properties:
+      code:
+        example: invalid_api_key
+        type: string
+      message:
+        example: Missing or invalid Bearer token
+        type: string
+      param:
+        example: authorization
+        type: string
+      type:
+        example: invalid_request_error
+        type: string
+    type: object
+  openai.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/openai.ErrorDetails'
+    type: object
+  openai.FunctionCallData:
+    properties:
+      arguments:
+        example: '{"location":"Tokyo"}'
+        type: string
+      name:
+        example: get_weather
+        type: string
+    type: object
+  openai.ModelListResponse:
+    properties:
+      data:
+        items:
+          $ref: '#/definitions/openai.ModelObject'
+        type: array
+      object:
+        example: list
+        type: string
+    type: object
+  openai.ModelObject:
+    properties:
+      created:
+        example: 1774350000
+        type: integer
+      id:
+        example: gemini-3.8-flash
+        type: string
+      object:
+        example: model
+        type: string
+      owned_by:
+        example: google
+        type: string
+    type: object
+  openai.PromptTokensDetails:
+    properties:
+      cached_tokens:
+        example: 0
+        type: integer
+    type: object
+  openai.StreamOptions:
+    properties:
+      include_usage:
+        example: true
+        type: boolean
+    type: object
+  openai.ToolCall:
+    properties:
+      function:
+        $ref: '#/definitions/openai.FunctionCallData'
+      id:
+        example: call_abc123
+        type: string
+      index:
+        example: 0
+        type: integer
+      type:
+        description: '"function"'
+        example: function
+        type: string
+    type: object
+  openai.UsageDetails:
+    properties:
+      completion_tokens:
+        example: 180
+        type: integer
+      completion_tokens_details:
+        $ref: '#/definitions/openai.CompletionTokensDetails'
+      prompt_tokens:
+        example: 35
+        type: integer
+      prompt_tokens_details:
+        $ref: '#/definitions/openai.PromptTokensDetails'
+      total_tokens:
+        example: 215
+        type: integer
+    type: object
+  server.AdminErrorResponse:
+    properties:
+      error:
+        description: Human-readable error message explaining the failure condition
+        example: Account not found
+        type: string
+      query:
+        description: Optional query parameter or account identifier that caused the
+          error
+        example: work-account
+        type: string
+    type: object
+  server.LoginCallbackRequest:
+    properties:
+      code:
+        description: Authorization code extracted from Google's redirect query string
+          (e.g. "4/0AY0e-g...")
+        example: 4/0AY0e-g7X1234567890
+        type: string
+      login_id:
+        description: Unique login session ID returned by /admin/v1/accounts/login/init
+        example: login-b7c4a1
+        type: string
+      redirect_url:
+        description: Full loopback redirect URL captured from the browser address
+          bar
+        example: http://localhost:43125/?code=4/0AY0e-g7X1234567890&scope=email
+        type: string
+    type: object
+  server.LoginInitRequest:
+    properties:
+      alias:
+        description: Optional alias to assign to the newly authenticated account upon
+          successful onboarding
+        example: secondary-account
+        type: string
+    type: object
+  server.LoginInitResponse:
+    properties:
+      auth_url:
+        description: Google OAuth2 authorization URL that the administrator must open
+          in a browser
+        example: https://accounts.google.com/o/oauth2/auth?client_id=example.apps.googleusercontent.com&redirect_uri=http%3A%2F%2Flocalhost%3A43125&response_type=code&scope=email%20profile
+        type: string
+      login_id:
+        description: Unique tracking identifier for this in-flight login session
+        example: login-b7c4a1
+        type: string
+    type: object
+  server.LoginStatusResponse:
+    properties:
+      alias:
+        description: Optional account alias requested during initialization
+        example: secondary-account
+        type: string
+      auth_url:
+        description: Google OAuth2 authorization URL
+        example: https://accounts.google.com/o/oauth2/auth?...
+        type: string
+      completed:
+        description: True if token exchange succeeded and account credentials were
+          saved to the vault
+        example: true
+        type: boolean
+      created_at:
+        description: Timestamp when the onboarding session was initialized
+        example: "2026-11-24T10:00:00Z"
+        type: string
+      failed:
+        description: True if the onboarding process failed or was terminated
+        example: false
+        type: boolean
+      id:
+        description: Unique login session ID
+        example: login-b7c4a1
+        type: string
+      pinned_port:
+        description: Ephemeral loopback port pinned for the callback redirect listener
+        example: "43125"
+        type: string
+    type: object
+  server.OpsHealthResponse:
+    properties:
+      status:
+        description: Status health indicator ("healthy" or "ready")
+        example: healthy
+        type: string
+    type: object
+  server.StatusResponse:
+    properties:
+      status:
+        description: Status outcome description (e.g. "switched", "rotated", "completed",
+          "healthy")
+        example: switched
+        type: string
+      target:
+        description: Target account or entity impacted by the operation, if applicable
+        example: work-account
+        type: string
+    type: object
+  server.SwitchAccountRequest:
+    properties:
+      query:
+        description: Query matches the account ID, email address, or assigned alias
+          to activate
+        example: work-account
+        type: string
+    type: object
+  server.VaultCleanRequest:
+    properties:
+      dry_run:
+        description: When true, simulates vault cleaning without deleting files from
+          disk
+        example: false
+        type: boolean
+    type: object
+host: localhost:8080
+info:
+  contact:
+    email: support@shukoilab.com
+    name: ShukoiLab
+    url: https://github.com/shukoilab/agy-gateway
+  description: |-
+    Enterprise-grade OpenAI-compatible reverse proxy gateway bridging OpenAI client applications to Google Antigravity CLI (`agy acp`).
+    Features multi-account quota rotation, live quota tracking (`agy /usage`), streaming reasoning tokens (`reasoning_effort` / `reasoning_content`), client-side tool calling with JIT prompt envelope translation, and headless OAuth onboarding.
+  license:
+    name: MIT
+    url: https://github.com/shukoilab/agy-gateway/blob/main/LICENSE
+  termsOfService: https://github.com/shukoilab/agy-gateway
+  title: agy-gateway API
+  version: 3.4.0
+paths:
+  /admin/v1/accounts:
+    get:
+      consumes:
+      - application/json
+      description: Lists all Google Antigravity credential accounts managed by the
+        gateway, including IDs, aliases, emails, subscription tiers, health statuses,
+        and cooldown timestamps.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of registered accounts
+          schema:
+            items:
+              $ref: '#/definitions/auth.Account'
+            type: array
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: List Antigravity accounts
+      tags:
+      - Admin - Accounts
+  /admin/v1/accounts/login/{login_id}:
+    get:
+      consumes:
+      - application/json
+      description: Checks whether an ongoing OAuth onboarding session is still waiting
+        for user consent, has completed token exchange, or has timed out/failed.
+      parameters:
+      - description: Login session identifier
+        in: path
+        name: login_id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Current status of the OAuth onboarding session
+          schema:
+            $ref: '#/definitions/server.LoginStatusResponse'
+        "400":
+          description: Missing login_id in path
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "404":
+          description: Session not found or expired
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Inspect in-flight OAuth onboarding status
+      tags:
+      - Admin - OAuth Onboarding
+  /admin/v1/accounts/login/callback:
+    post:
+      consumes:
+      - application/json
+      description: Submits the Google authorization code or full loopback redirect
+        URL captured from the administrator's browser to finalize token exchange and
+        store credentials in the central vault.
+      parameters:
+      - description: Login ID and either authorization code or full loopback redirect
+          URL
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.LoginCallbackRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: OAuth token exchange completed and account synced
+          schema:
+            $ref: '#/definitions/server.StatusResponse'
+        "400":
+          description: Invalid payload, invalid redirect URL, or token exchange failure
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Complete OAuth onboarding callback
+      tags:
+      - Admin - OAuth Onboarding
+  /admin/v1/accounts/login/init:
+    post:
+      consumes:
+      - application/json
+      description: Spawns a background `agy-auth login` process on an isolated loopback
+        port and generates a Google OAuth2 consent URL for administrative onboarding.
+      parameters:
+      - description: Optional account alias to configure
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/server.LoginInitRequest'
+      produces:
+      - application/json
+      responses:
+        "201":
+          description: OAuth onboarding flow initialized with Google consent URL
+          schema:
+            $ref: '#/definitions/server.LoginInitResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to initialize OAuth process
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Initialize headless OAuth onboarding
+      tags:
+      - Admin - OAuth Onboarding
+  /admin/v1/accounts/quota:
+    get:
+      consumes:
+      - application/json
+      description: Queries live quota statistics directly from Google Antigravity
+        (`agy /usage`) across all accounts or filtered by query. Reports weekly and
+        5-hour limit percentages, reset countdowns, and exhaustion cooldown flags.
+      parameters:
+      - description: Filter by specific account ID or alias
+        in: query
+        name: account
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Live quota status report for all accounts
+          schema:
+            $ref: '#/definitions/auth.AccountsQuotaResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "404":
+          description: Specified account was not found
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Internal failure polling live quota from agy CLI
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Get live accounts quota
+      tags:
+      - Admin - Accounts
+  /admin/v1/accounts/quota/{id}:
+    get:
+      consumes:
+      - application/json
+      description: Queries live quota metrics for a single designated account by its
+        ID, alias, or email address.
+      parameters:
+      - description: Account ID, alias, or email address
+        in: path
+        name: id
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Detailed live quota for the targeted account
+          schema:
+            $ref: '#/definitions/auth.AccountQuotaInfo'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "404":
+          description: Account not found
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Internal failure querying quota from agy CLI
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Get live quota for specific account
+      tags:
+      - Admin - Accounts
+  /admin/v1/accounts/rotate:
+    post:
+      consumes:
+      - application/json
+      description: Manually forces account rotation to the next available healthy
+        account with sufficient quota.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Account rotated successfully
+          schema:
+            $ref: '#/definitions/server.StatusResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to rotate account or no eligible accounts
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Rotate to next eligible account
+      tags:
+      - Admin - Accounts
+  /admin/v1/accounts/switch:
+    post:
+      consumes:
+      - application/json
+      description: Manually sets the active default Google Antigravity account used
+        by workers and synchronizes available models.
+      parameters:
+      - description: Target account identifier, email, or alias
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.SwitchAccountRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Account successfully switched
+          schema:
+            $ref: '#/definitions/server.StatusResponse'
+        "400":
+          description: Missing or empty query parameter
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to switch account in vault
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Switch active account
+      tags:
+      - Admin - Accounts
+  /admin/v1/accounts/usage:
+    get:
+      consumes:
+      - application/json
+      description: Returns the raw, unadulterated JSON envelope directly produced
+        by `agy -p "/usage" --output-format json`.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Raw agy usage JSON response envelope
+          schema:
+            $ref: '#/definitions/auth.AgyUsageEnvelope'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to execute agy usage command
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Get raw agy usage JSON
+      tags:
+      - Admin - Accounts
+  /admin/v1/vault/clean:
+    post:
+      consumes:
+      - application/json
+      description: Cleans expired, orphaned, or corrupted token caches from the central
+        credential vault. Supports dry-run simulation mode.
+      parameters:
+      - description: Vault cleaning options (e.g. dry_run)
+        in: body
+        name: request
+        schema:
+          $ref: '#/definitions/server.VaultCleanRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Summary of cleaned token files and status
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to clean vault
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Clean credential vault
+      tags:
+      - Admin - Vault
+  /admin/v1/vault/status:
+    get:
+      consumes:
+      - application/json
+      description: Returns diagnostic health information and status of the central
+        credential vault and stored accounts.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Raw credential vault status details
+          schema:
+            additionalProperties: true
+            type: object
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to query vault status
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Inspect credential vault status
+      tags:
+      - Admin - Vault
+  /healthz:
+    get:
+      consumes:
+      - application/json
+      description: Returns the service liveness state. Used by orchestrators (Kubernetes,
+        Docker) to determine if process is alive.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Service is alive and healthy
+          schema:
+            $ref: '#/definitions/server.OpsHealthResponse'
+      summary: Liveness health check probe
+      tags:
+      - Operations & Telemetry
+  /metrics:
+    get:
+      description: Exposes real-time Prometheus metrics for telemetry, request tracking,
+        error counts, and worker pool utilization.
+      produces:
+      - text/plain
+      responses:
+        "200":
+          description: Prometheus text metric exposition
+          schema:
+            type: string
+      summary: Prometheus and runtime metrics
+      tags:
+      - Operations & Telemetry
+  /readyz:
+    get:
+      consumes:
+      - application/json
+      description: Returns readiness state indicating worker pool availability and
+        gateway capability to process requests.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Service is ready to handle traffic
+          schema:
+            $ref: '#/definitions/server.OpsHealthResponse'
+      summary: Readiness health check probe
+      tags:
+      - Operations & Telemetry
+  /v1/chat/completions:
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a model response for the given chat conversation. 100%
+        compliant with the OpenAI 2026 chat completions standard. Supports streaming
+        SSE (stream: true), multi-turn conversation history, real-time reasoning thoughts
+        (reasoning_effort and reasoning_content), client-side tool calling with JIT
+        prompt envelope translation, and automated multi-account failover.'
+      parameters:
+      - description: Chat completion request parameters including model, messages,
+          tools, and reasoning preferences
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/openai.ChatCompletionRequest'
+      produces:
+      - application/json
+      - text/event-stream
+      responses:
+        "200":
+          description: Chat completion generated successfully (non-streaming mode)
+          schema:
+            $ref: '#/definitions/openai.ChatCompletionResponse'
+        "400":
+          description: Invalid JSON body, missing parameters, or unsupported option
+            (e.g. n > 1)
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "401":
+          description: Missing, expired, or invalid Client Bearer API key
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "404":
+          description: Requested model identifier was not found in catalog
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "429":
+          description: Client rate limit exceeded (RPM) or all accounts in cooldown
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "500":
+          description: Internal gateway error or failure executing turn across workers
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+      security:
+      - ClientBearerAuth: []
+      summary: Create chat completion
+      tags:
+      - OpenAI - Chat Completions
+  /v1/models:
+    get:
+      consumes:
+      - application/json
+      description: Lists the currently available models dynamically discovered across
+        authenticated Google Antigravity accounts.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: List of active models
+          schema:
+            $ref: '#/definitions/openai.ModelListResponse'
+        "401":
+          description: Missing or invalid Client Bearer token
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+      security:
+      - ClientBearerAuth: []
+      summary: List available models
+      tags:
+      - OpenAI - Models
+  /v1/models/{model}:
+    get:
+      consumes:
+      - application/json
+      description: Retrieves detailed metadata for a specific model by identifier.
+      parameters:
+      - description: Model identifier (e.g. 'gemini-3.8-flash', 'claude-sonnet-4.6')
+        in: path
+        name: model
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Model information
+          schema:
+            $ref: '#/definitions/openai.ModelObject'
+        "400":
+          description: Missing model identifier in request path
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "401":
+          description: Missing or invalid Client Bearer token
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+        "404":
+          description: The specified model was not found
+          schema:
+            $ref: '#/definitions/openai.ErrorResponse'
+      security:
+      - ClientBearerAuth: []
+      summary: Retrieve model details
+      tags:
+      - OpenAI - Models
+securityDefinitions:
+  AdminBearerAuth:
+    description: 'Admin Control Plane authorization. Format: `Bearer <your-admin-api-key>`.
+      Used to access administrative endpoints (`/admin/v1/*`).'
+    in: header
+    name: Authorization
+    type: apiKey
+  ClientBearerAuth:
+    description: 'Client API authorization. Format: `Bearer <your-client-api-key>`.
+      Used to access OpenAI-compatible endpoints (`/v1/*`).'
+    in: header
+    name: Authorization
+    type: apiKey
+swagger: "2.0"

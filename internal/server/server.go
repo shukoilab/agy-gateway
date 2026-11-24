@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	httpSwagger "github.com/swaggo/http-swagger/v2"
+
+	_ "agy-gateway/docs"
 	"agy-gateway/internal/config"
 )
 
@@ -47,7 +50,7 @@ func NewServer(
 	adminPrefix := "/admin/v1/"
 	mux.Handle(adminPrefix+"accounts", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleListAccounts)))
 	mux.Handle(adminPrefix+"accounts/quota", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleQuota)))
-	mux.Handle(adminPrefix+"accounts/quota/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleQuota)))
+	mux.Handle(adminPrefix+"accounts/quota/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleQuotaByID)))
 	mux.Handle(adminPrefix+"accounts/usage", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleUsage)))
 	mux.Handle(adminPrefix+"accounts/switch", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleSwitch)))
 	mux.Handle(adminPrefix+"accounts/rotate", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleRotate)))
@@ -56,6 +59,23 @@ func NewServer(
 	mux.Handle(adminPrefix+"accounts/login/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleLoginStatus)))
 	mux.Handle(adminPrefix+"vault/status", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultStatus)))
 	mux.Handle(adminPrefix+"vault/clean", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultClean)))
+
+	// 4. OpenAPI / Swagger Documentation UI (Public / Interactive)
+	mux.HandleFunc("GET /swagger/", httpSwagger.Handler(
+		httpSwagger.URL("/swagger/doc.json"),
+		httpSwagger.PersistAuthorization(true),
+		httpSwagger.DocExpansion("list"),
+		httpSwagger.DeepLinking(true),
+	))
+	mux.HandleFunc("GET /swagger", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /docs", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("GET /docs/", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
+	})
 
 	// Wrap root with RequestID and MaxBytes middleware
 	var rootHandler http.Handler = mux
@@ -88,6 +108,11 @@ func NewServer(
 		cfg:        cfg,
 		logger:     logger,
 	}
+}
+
+// Handler returns the underlying configured root http.Handler (useful for testing and embedding).
+func (s *Server) Handler() http.Handler {
+	return s.httpServer.Handler
 }
 
 // Start launches the HTTP server listening on the configured address.
