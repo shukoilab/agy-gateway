@@ -93,9 +93,25 @@ curl -f http://localhost:8080/healthz
 
 ---
 
-## ⚙️ Configuration (`config.yaml`)
+## ⚙️ Configuration (`config.yaml` & 12-Factor `.env`)
 
-Configuration is externalized via `config.yaml` and supports environment variable overrides:
+`agy-gateway` is designed for enterprise flexibility with **zero-hardcoding**, adhering strictly to the 12-factor application configuration hierarchy:
+1. **Production Defaults**: Safe, memory-resident defaults ensuring startup even without external config files.
+2. **YAML Configuration**: Structured configuration in `config.yaml`.
+3. **Environment File (`.env`)**: Zero-dependency local environment file ingestion (see `.env.example`).
+4. **System Environment Variables**: Process and container environment variables take highest priority (`PORT`, `HOST`, `AGY_GW_*`).
+
+### Quick Start with `.env`
+```bash
+cp .env.example .env
+# Customize PORT, AGY_GW_HOST_PORT, AGY_GW_ADMIN_KEY, etc.
+docker compose up -d
+
+# Manage accounts interactively inside the container:
+docker exec -it agy-gateway agy-accounts
+```
+
+### Reference `config.yaml`
 
 ```yaml
 server:
@@ -470,6 +486,86 @@ curl -s -H "Authorization: Bearer admin-super-secret-key-change-me" \
   ]
 }
 ```
+
+---
+
+### 6. Interactive Account CRUD CLI (`agy-accounts`)
+
+`agy-gateway` provides a dedicated CLI utility for managing Google Antigravity credentials directly from the command line or inside Docker containers.
+
+#### Running Interactively (TUI Dashboard)
+Launch the interactive dashboard to view live quotas, add accounts via OAuth, switch active accounts, set aliases, or remove accounts:
+
+```bash
+# Inside Docker container:
+docker exec -it agy-gateway agy-accounts
+
+# Or using the main binary subcommand:
+docker exec -it agy-gateway agy-gateway accounts
+
+# On host:
+./bin/agy-accounts
+```
+
+**Interactive Menu Interface:**
+```text
+================================================================================
+          GOOGLE ANTIGRAVITY GATEWAY — ACCOUNT MANAGEMENT CLI
+================================================================================
+Config: /var/lib/agy-gateway/vault-xdg | Storage: /var/lib/agy-gateway
+
+[1] List Accounts & Live Quotas     (View all IDs, aliases, health & quotas)
+[2] Add New Account (OAuth Login)   (Initiate headless Google OAuth login flow)
+[3] Switch Active Account           (Set active account in central vault)
+[4] Force Account Rotation          (Cycle active credentials to next healthy account)
+[5] Set Account Alias               (Assign friendly nickname to account ID)
+[6] Clear Account Alias             (Remove friendly nickname from account)
+[7] Remove Account                  (Delete account credentials permanently)
+[8] Clean Vault Cache               (Purge orphaned sessions & stale files)
+[9] View Raw Status / Diagnostics   (Show raw JSON telemetry from agy-auth)
+[0] Exit
+--------------------------------------------------------------------------------
+Select an option [0-9]: 
+```
+
+#### Scriptable Non-Interactive Subcommands
+For automation, scripting, and CI/CD pipelines, `agy-accounts` provides subcommands with optional `-json` formatting:
+
+```bash
+# List all accounts with live quota in aligned table:
+docker exec agy-gateway agy-accounts list
+
+# List all accounts as machine-readable JSON:
+docker exec agy-gateway agy-accounts list -json
+
+# Switch active account to a specific ID, email, or alias:
+docker exec agy-gateway agy-accounts switch acc_9f3b18e2
+
+# Force immediate account rotation to the next healthy account:
+docker exec agy-gateway agy-accounts rotate
+
+# Assign a friendly alias to an account:
+docker exec agy-gateway agy-accounts alias set acc_9f3b18e2 primary-work
+
+# Clear an assigned alias:
+docker exec agy-gateway agy-accounts alias clear primary-work
+
+# Remove an account permanently from the vault:
+docker exec agy-gateway agy-accounts remove acc_9f3b18e2
+
+# Clean orphaned sessions and temporary files:
+docker exec agy-gateway agy-accounts clean
+
+# View raw agy-auth diagnostics:
+docker exec agy-gateway agy-accounts status -json
+```
+
+#### Adding Accounts Headless via OAuth Wizard
+When selecting `[2]` or running `agy-accounts add`:
+1. The CLI initializes a headless Google OAuth session and outputs an authorization URL.
+2. Open the URL in any web browser and authorize your Google account.
+3. Paste the authorization code (or the full redirect URL) back into the terminal prompt.
+4. The CLI exchanges tokens, mirrors the credentials into the central vault, and updates worker homes automatically.
 
 ---
 

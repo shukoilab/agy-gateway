@@ -47,6 +47,13 @@ func NewPool(ctx context.Context, cfg *config.Config, authMgr *auth.Manager, log
 	return p, nil
 }
 
+func (p *Pool) log() *slog.Logger {
+	if p.logger == nil {
+		return slog.Default()
+	}
+	return p.logger
+}
+
 func (p *Pool) initWorkers(ctx context.Context) error {
 	accounts := p.authMgr.GetAccounts()
 
@@ -95,21 +102,25 @@ func (p *Pool) Acquire(ctx context.Context, requiresPaidTier bool) (*Worker, err
 			return nil, errors.New("timeout acquiring worker from pool (queue saturated)")
 		case w := <-p.leaseCh:
 			// Ensure bound account is refreshed from auth manager if missing or previously expired
-			accounts := p.authMgr.GetAccounts()
-			if len(accounts) > 0 {
-				if w.Account == nil || w.Account.Status == auth.StatusAuthExpired {
-					acc := accounts[w.ID%len(accounts)]
-					acc.Status = auth.StatusHealthy
-					w.Account = &acc
+			if p.authMgr != nil {
+				accounts := p.authMgr.GetAccounts()
+				if len(accounts) > 0 {
+					if w.Account == nil || w.Account.Status == auth.StatusAuthExpired {
+						acc := accounts[w.ID%len(accounts)]
+						acc.Status = auth.StatusHealthy
+						w.Account = &acc
+					}
 				}
 			}
 
 			// Check if process is alive; if dead or unstarted, restart
 			if w.Process == nil || !w.Process.IsRunning() {
-				p.logger.Info("restarting inactive worker before lease", "workerID", w.ID)
-				_, _, _, _ = p.authMgr.ProvisionWorkerHome(w.ID)
+				p.log().Info("restarting inactive worker before lease", "workerID", w.ID)
+				if p.authMgr != nil {
+					_, _, _, _ = p.authMgr.ProvisionWorkerHome(w.ID)
+				}
 				if err := w.Start(timeoutCtx); err != nil {
-					p.logger.Error("failed to restart worker", "workerID", w.ID, "err", err)
+					p.log().Error("failed to restart worker", "workerID", w.ID, "err", err)
 					// Put back and try another
 					p.leaseCh <- w
 					time.Sleep(100 * time.Millisecond)
@@ -119,7 +130,7 @@ func (p *Pool) Acquire(ctx context.Context, requiresPaidTier bool) (*Worker, err
 
 			// Validate account eligibility if account is bound
 			if w.Account != nil && !w.Account.IsEligible(requiresPaidTier, p.cfg.Accounts.MinRemainingQuotaPct) {
-				p.logger.Debug("worker account not eligible, seeking alternate", "workerID", w.ID)
+				p.log().Debug("worker account not eligible, seeking alternate", "workerID", w.ID)
 				// Return to pool and seek next
 				p.leaseCh <- w
 				time.Sleep(50 * time.Millisecond)
@@ -160,7 +171,7 @@ func (p *Pool) Release(w *Worker) {
 			(p.cfg.Pool.MaxWorkerUptime > 0 && time.Since(w.CreatedAt) >= p.cfg.Pool.MaxWorkerUptime)
 
 		if shouldRecycle {
-			p.logger.Info("proactively recycling worker", "workerID", w.ID, "tainted", w.TaintedForRecycle.Load())
+			p.log().Info("proactively recycling worker", "workerID", w.ID, "tainted", w.TaintedForRecycle.Load())
 			w.Close()
 
 			// Reset worker state
@@ -171,7 +182,7 @@ func (p *Pool) Release(w *Worker) {
 			startCtx, cancel := context.WithTimeout(context.Background(), p.cfg.Pool.HandshakeTimeout*2)
 			defer cancel()
 			if err := w.Start(startCtx); err != nil {
-				p.logger.Error("failed to respawn recycled worker", "workerID", w.ID, "err", err)
+				p.log().Error("failed to respawn recycled worker", "workerID", w.ID, "err", err)
 			}
 		}
 

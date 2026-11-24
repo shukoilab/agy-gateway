@@ -77,10 +77,12 @@ func NewServer(
 		http.Redirect(w, r, "/swagger/index.html", http.StatusMovedPermanently)
 	})
 
-	// Wrap root with RequestID and MaxBytes middleware
+	// Wrap root with Recovery, CORS, MaxBytes, and RequestID middleware
 	var rootHandler http.Handler = mux
 	rootHandler = mw.MaxBytes(rootHandler)
+	rootHandler = mw.CORS(rootHandler)
 	rootHandler = mw.RequestID(rootHandler)
+	rootHandler = mw.Recovery(rootHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	if strings.HasPrefix(addr, ":") {

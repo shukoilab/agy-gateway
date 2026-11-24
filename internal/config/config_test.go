@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestConfigLoadAndValidation(t *testing.T) {
@@ -58,5 +59,105 @@ openai:
 	}
 	if effort := MapReasoningEffort("none", "medium"); effort != "off" {
 		t.Errorf("expected off for none, got %s", effort)
+	}
+}
+
+func TestConfigEnvOverridesAndDefaults(t *testing.T) {
+	// 1. Set various 12-factor environment variables
+	_ = os.Setenv("PORT", "7777")
+	_ = os.Setenv("HOST", "127.0.0.1")
+	_ = os.Setenv("WORKER_COUNT", "4")
+	_ = os.Setenv("LOG_LEVEL", "debug")
+	_ = os.Setenv("DEFAULT_MODEL", "claude-sonnet-4.6")
+	_ = os.Setenv("AGY_GW_MAX_RETRIES", "5")
+	_ = os.Setenv("AGY_GW_RETRY_INITIAL_BACKOFF", "250ms")
+	_ = os.Setenv("AGY_GW_RETRY_MAX_BACKOFF", "5s")
+	_ = os.Setenv("AGY_GW_CLIENT_KEYS", "secret-key-1:60,secret-key-2:120")
+	_ = os.Setenv("AGY_GW_ALLOWED_CORS_ORIGINS", "http://localhost:3000, http://localhost:5173")
+
+	defer func() {
+		_ = os.Unsetenv("PORT")
+		_ = os.Unsetenv("HOST")
+		_ = os.Unsetenv("WORKER_COUNT")
+		_ = os.Unsetenv("LOG_LEVEL")
+		_ = os.Unsetenv("DEFAULT_MODEL")
+		_ = os.Unsetenv("AGY_GW_MAX_RETRIES")
+		_ = os.Unsetenv("AGY_GW_RETRY_INITIAL_BACKOFF")
+		_ = os.Unsetenv("AGY_GW_RETRY_MAX_BACKOFF")
+		_ = os.Unsetenv("AGY_GW_CLIENT_KEYS")
+		_ = os.Unsetenv("AGY_GW_ALLOWED_CORS_ORIGINS")
+	}()
+
+	// 2. Load without existing YAML file (tests DefaultConfig + applyEnvOverrides fallback)
+	cfg, err := Load("non-existent-default/config.yaml")
+	// If path doesn't exist and is config.yaml, it initializes cleanly
+	if err != nil {
+		cfg, err = Load("config.yaml")
+	}
+	if err != nil {
+		t.Fatalf("failed to load config with defaults and env overrides: %v", err)
+	}
+
+	if cfg.Server.Port != 7777 {
+		t.Errorf("expected port 7777 from PORT env, got %d", cfg.Server.Port)
+	}
+	if cfg.Server.Host != "127.0.0.1" {
+		t.Errorf("expected host 127.0.0.1 from HOST env, got %s", cfg.Server.Host)
+	}
+	if cfg.Pool.WorkerCount != 4 {
+		t.Errorf("expected worker_count 4 from WORKER_COUNT env, got %d", cfg.Pool.WorkerCount)
+	}
+	if cfg.Observability.LogLevel != "debug" {
+		t.Errorf("expected log_level debug from LOG_LEVEL env, got %s", cfg.Observability.LogLevel)
+	}
+	if cfg.OpenAI.DefaultModel != "claude-sonnet-4.6" {
+		t.Errorf("expected default model claude-sonnet-4.6 from DEFAULT_MODEL env, got %s", cfg.OpenAI.DefaultModel)
+	}
+	if len(cfg.Security.APIKeys) < 2 {
+		t.Fatalf("expected at least 2 parsed client API keys, got %d", len(cfg.Security.APIKeys))
+	}
+	if cfg.Security.APIKeys[0].KeySecret != "secret-key-1" || cfg.Security.APIKeys[0].RateLimitRPM != 60 {
+		t.Errorf("unexpected APIKey[0]: %+v", cfg.Security.APIKeys[0])
+	}
+	if cfg.Security.APIKeys[1].KeySecret != "secret-key-2" || cfg.Security.APIKeys[1].RateLimitRPM != 120 {
+		t.Errorf("unexpected APIKey[1]: %+v", cfg.Security.APIKeys[1])
+	}
+	if len(cfg.Security.AllowedCORSOrigins) != 2 || cfg.Security.AllowedCORSOrigins[0] != "http://localhost:3000" {
+		t.Errorf("unexpected AllowedCORSOrigins: %v", cfg.Security.AllowedCORSOrigins)
+	}
+	if cfg.Execution.MaxRetries != 5 || cfg.Accounts.MaxFailoverRetries != 5 {
+		t.Errorf("expected MaxRetries 5 from AGY_GW_MAX_RETRIES env, got exec=%d, acc=%d", cfg.Execution.MaxRetries, cfg.Accounts.MaxFailoverRetries)
+	}
+	if cfg.Execution.RetryInitialBackoff != 250*time.Millisecond {
+		t.Errorf("expected RetryInitialBackoff 250ms, got %v", cfg.Execution.RetryInitialBackoff)
+	}
+	if cfg.Execution.RetryMaxBackoff != 5*time.Second {
+		t.Errorf("expected RetryMaxBackoff 5s, got %v", cfg.Execution.RetryMaxBackoff)
+	}
+}
+
+func TestConfig_1MContextDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	if cfg.Server.MaxRequestBodyBytes != 104857600 {
+		t.Errorf("expected 100 MiB (104857600) MaxRequestBodyBytes, got %d", cfg.Server.MaxRequestBodyBytes)
+	}
+	if cfg.Server.IdleTimeout != 300*time.Second {
+		t.Errorf("expected 300s IdleTimeout, got %v", cfg.Server.IdleTimeout)
+	}
+	if cfg.Server.ShutdownDrainTimeout != 120*time.Second {
+		t.Errorf("expected 120s ShutdownDrainTimeout, got %v", cfg.Server.ShutdownDrainTimeout)
+	}
+	if cfg.Pool.InferenceTimeout != 900*time.Second {
+		t.Errorf("expected 900s InferenceTimeout, got %v", cfg.Pool.InferenceTimeout)
+	}
+	if cfg.Pool.FirstTokenTimeout != 120*time.Second {
+		t.Errorf("expected 120s FirstTokenTimeout, got %v", cfg.Pool.FirstTokenTimeout)
+	}
+	if cfg.Pool.MaxScannerBufferBytes != 134217728 {
+		t.Errorf("expected 128 MiB (134217728) MaxScannerBufferBytes, got %d", cfg.Pool.MaxScannerBufferBytes)
+	}
+	if cfg.MCP.ClientToolCalling.MaxToolArgumentBytes != 16777216 {
+		t.Errorf("expected 16 MiB (16777216) MaxToolArgumentBytes, got %d", cfg.MCP.ClientToolCalling.MaxToolArgumentBytes)
 	}
 }

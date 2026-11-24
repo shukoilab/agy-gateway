@@ -31,6 +31,8 @@ type ModelInfo struct {
 	RequiresPaidTier bool     `json:"requires_paid_tier"`
 	SupportedEfforts []string `json:"supported_efforts"`
 	AccountIDs       []string `json:"account_ids,omitempty"`
+	ContextWindow    int      `json:"context_window,omitempty"`
+	MaxOutputTokens  int      `json:"max_output_tokens,omitempty"`
 }
 
 // ModelRegistry provides thread-safe dynamic model discovery and catalog queries.
@@ -126,10 +128,12 @@ func (mr *ModelRegistry) SyncModels(ctx context.Context) error {
 		list := make([]openai.ModelObject, 0, len(discovered))
 		for _, m := range discovered {
 			list = append(list, openai.ModelObject{
-				ID:      m.ID,
-				Object:  "model",
-				Created: m.Created,
-				OwnedBy: m.OwnedBy,
+				ID:              m.ID,
+				Object:          "model",
+				Created:         m.Created,
+				OwnedBy:         m.OwnedBy,
+				ContextWindow:   m.ContextWindow,
+				MaxOutputTokens: m.MaxOutputTokens,
 			})
 		}
 
@@ -255,6 +259,16 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 
 		requiresPaidTier := strings.Contains(modelID, "opus")
 
+		contextWindow := 1048576 // 1M tokens default for Gemini family
+		maxOutputTokens := 65536
+		if strings.Contains(modelID, "claude") {
+			contextWindow = 200000
+			maxOutputTokens = 8192
+		} else if strings.Contains(modelID, "gpt") {
+			contextWindow = 128000
+			maxOutputTokens = 16384
+		}
+
 		result = append(result, &ModelInfo{
 			ID:               modelID,
 			DisplayName:      displayName,
@@ -265,6 +279,8 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 			RequiresPaidTier: requiresPaidTier,
 			SupportedEfforts: supportedEfforts,
 			AccountIDs:       []string{},
+			ContextWindow:    contextWindow,
+			MaxOutputTokens:  maxOutputTokens,
 		})
 	}
 
@@ -285,6 +301,16 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 				ownedBy = "openai"
 			}
 
+			baseContextWindow := 1048576 // 1M tokens default for Gemini family
+			baseMaxOutputTokens := 65536
+			if strings.Contains(baseID, "claude") {
+				baseContextWindow = 200000
+				baseMaxOutputTokens = 8192
+			} else if strings.Contains(baseID, "gpt") {
+				baseContextWindow = 128000
+				baseMaxOutputTokens = 16384
+			}
+
 			result = append(result, &ModelInfo{
 				ID:               baseID,
 				DisplayName:      strings.Title(strings.ReplaceAll(baseID, "-", " ")),
@@ -295,6 +321,8 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 				RequiresPaidTier: strings.Contains(baseID, "opus"),
 				SupportedEfforts: []string{"low", "medium", "high", "extra"},
 				AccountIDs:       []string{},
+				ContextWindow:    baseContextWindow,
+				MaxOutputTokens:  baseMaxOutputTokens,
 			})
 		}
 	}

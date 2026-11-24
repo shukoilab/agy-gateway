@@ -13,7 +13,7 @@ const docTemplate = `{
         "contact": {
             "name": "ShukoiLab",
             "url": "https://github.com/shukoilab/agy-gateway",
-            "email": "support@shukoilab.com"
+            "email": "shukoilab@proton.me"
         },
         "license": {
             "name": "MIT",
@@ -1445,6 +1445,10 @@ const docTemplate = `{
         "openai.ModelObject": {
             "type": "object",
             "properties": {
+                "context_window": {
+                    "type": "integer",
+                    "example": 1048576
+                },
                 "created": {
                     "type": "integer",
                     "example": 1774350000
@@ -1452,6 +1456,10 @@ const docTemplate = `{
                 "id": {
                     "type": "string",
                     "example": "gemini-3.8-flash"
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "example": 65536
                 },
                 "object": {
                     "type": "string",
@@ -1689,7 +1697,7 @@ const docTemplate = `{
 
 // SwaggerInfo holds exported Swagger Info so clients can modify it
 var SwaggerInfo = &swag.Spec{
-	Version:          "3.4.0",
+	Version:          "3.5.0",
 	Host:             "localhost:8080",
 	BasePath:         "/",
 	Schemes:          []string{},

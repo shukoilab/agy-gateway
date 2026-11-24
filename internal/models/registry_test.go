@@ -42,6 +42,12 @@ gpt-oss-120b-medium	GPT-OSS 120B (Medium)
 	if high.OwnedBy != "google" {
 		t.Errorf("expected owned_by google, got %s", high.OwnedBy)
 	}
+	if high.ContextWindow != 1048576 {
+		t.Errorf("expected context window 1048576, got %d", high.ContextWindow)
+	}
+	if high.MaxOutputTokens != 65536 {
+		t.Errorf("expected max output tokens 65536, got %d", high.MaxOutputTokens)
+	}
 
 	// Verify inferred base model
 	base, exists := modelMap["gemini-3.8-flash"]

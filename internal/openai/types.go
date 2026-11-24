@@ -125,10 +125,12 @@ type CompletionTokensDetails struct {
 }
 
 type ModelObject struct {
-	ID      string `json:"id" example:"gemini-3.8-flash"`
-	Object  string `json:"object" example:"model"`
-	Created int64  `json:"created" example:"1774350000"`
-	OwnedBy string `json:"owned_by" example:"google"`
+	ID              string `json:"id" example:"gemini-3.8-flash"`
+	Object          string `json:"object" example:"model"`
+	Created         int64  `json:"created" example:"1774350000"`
+	OwnedBy         string `json:"owned_by" example:"google"`
+	ContextWindow   int    `json:"context_window,omitempty" example:"1048576"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty" example:"65536"`
 }
 
 type ModelListResponse struct {

@@ -426,12 +426,18 @@ definitions:
     type: object
   openai.ModelObject:
     properties:
+      context_window:
+        example: 1048576
+        type: integer
       created:
         example: 1774350000
         type: integer
       id:
         example: gemini-3.8-flash
         type: string
+      max_output_tokens:
+        example: 65536
+        type: integer
       object:
         example: model
         type: string
@@ -601,7 +607,7 @@ definitions:
 host: localhost:8080
 info:
   contact:
-    email: support@shukoilab.com
+    email: shukoilab@proton.me
     name: ShukoiLab
     url: https://github.com/shukoilab/agy-gateway
   description: |-
@@ -612,7 +618,7 @@ info:
     url: https://github.com/shukoilab/agy-gateway/blob/main/LICENSE
   termsOfService: https://github.com/shukoilab/agy-gateway
   title: agy-gateway API
-  version: 3.4.0
+  version: 3.5.0
 paths:
   /admin/v1/accounts:
     get:

@@ -2,6 +2,7 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -35,7 +36,7 @@ type Transport struct {
 // NewTransport creates an initialized Transport wrapping input and output streams.
 func NewTransport(in io.WriteCloser, out io.ReadCloser, maxScannerBuffer int, logger *slog.Logger) *Transport {
 	if maxScannerBuffer <= 0 {
-		maxScannerBuffer = 16 * 1024 * 1024 // 16 MiB default
+		maxScannerBuffer = 134217728 // 128 MiB default (1M+ context support)
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -158,61 +159,90 @@ func (t *Transport) send(v any) error {
 	return err
 }
 
+// - @purpose: Continuously consumes JSON-RPC lines from the process stdout stream and dispatches them.
+// - @rationale: Uses a dynamic line reader with a 128 MiB ceiling guard instead of rigid bufio.Scanner to prevent ErrTooLong fatal pipe closures during 1M context turns.
+// - @preconditions: t.out must be a readable io.ReadCloser.
+// - @param: maxBuffer (int) - Maximum permissible size for a single JSON-RPC message line in bytes.
+// - @returns: None.
+// - @throws: None.
+// - @invariants: Linear time complexity O(N); cleans up transport on EOF or fatal stream failure.
 func (t *Transport) readLoop(maxBuffer int) {
-	scanner := bufio.NewScanner(t.out)
-	buf := make([]byte, 64*1024)
-	scanner.Buffer(buf, maxBuffer)
+	if maxBuffer <= 0 {
+		maxBuffer = 134217728 // 128 MiB default
+	}
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
+	reader := bufio.NewReaderSize(t.out, 256*1024)
 
-		// First, probe whether this is a Response, Request, or Notification
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(line, &raw); err != nil {
-			t.logger.Warn("invalid JSON-RPC line received", "error", err, "line", string(line))
-			continue
-		}
-
-		// Handle Response (has id and (result or error))
-		if _, hasID := raw["id"]; hasID {
-			if _, hasMethod := raw["method"]; !hasMethod {
-				var resp Response
-				if err := json.Unmarshal(line, &resp); err == nil {
-					t.dispatchResponse(&resp)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimSpace(line)
+			if len(line) > 0 {
+				if len(line) > maxBuffer {
+					t.logger.Error("acp transport line exceeded max buffer ceiling", "len", len(line), "max", maxBuffer)
 					continue
 				}
+				t.processLine(line)
 			}
 		}
 
-		// Handle Request from Agent (e.g. session/request_permission)
-		if rawMethod, hasMethod := raw["method"]; hasMethod {
-			var method string
-			_ = json.Unmarshal(rawMethod, &method)
-
-			if _, hasID := raw["id"]; hasID {
-				var req Request
-				if err := json.Unmarshal(line, &req); err == nil {
-					t.handleIncomingRequest(&req)
-					continue
-				}
-			} else {
-				// Handle Notification (e.g. session/update)
-				var notif Notification
-				if err := json.Unmarshal(line, &notif); err == nil {
-					t.handleIncomingNotification(&notif)
-					continue
-				}
+		if err != nil {
+			if !t.closed.Load() && !errors.Is(err, io.EOF) {
+				t.logger.Error("acp transport stream error", "error", err)
 			}
+			break
 		}
 	}
 
-	if err := scanner.Err(); err != nil && !t.closed.Load() {
-		t.logger.Error("acp transport scanner error", "error", err)
-	}
 	_ = t.Close()
+}
+
+// - @purpose: Decodes and routes an individual JSON-RPC response, request, or notification line.
+// - @rationale: Decouples line framing from JSON-RPC protocol demuxing for high testability.
+// - @preconditions: line must be non-empty trimmed bytes.
+// - @param: line ([]byte) - Single line raw JSON-RPC payload.
+// - @returns: None.
+// - @throws: None.
+// - @invariants: Thread-safe dispatch to pending response channels or registered listeners.
+func (t *Transport) processLine(line []byte) {
+	// First, probe whether this is a Response, Request, or Notification
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(line, &raw); err != nil {
+		t.logger.Warn("invalid JSON-RPC line received", "error", err, "line", string(line))
+		return
+	}
+
+	// Handle Response (has id and (result or error))
+	if _, hasID := raw["id"]; hasID {
+		if _, hasMethod := raw["method"]; !hasMethod {
+			var resp Response
+			if err := json.Unmarshal(line, &resp); err == nil {
+				t.dispatchResponse(&resp)
+				return
+			}
+		}
+	}
+
+	// Handle Request from Agent (e.g. session/request_permission)
+	if rawMethod, hasMethod := raw["method"]; hasMethod {
+		var method string
+		_ = json.Unmarshal(rawMethod, &method)
+
+		if _, hasID := raw["id"]; hasID {
+			var req Request
+			if err := json.Unmarshal(line, &req); err == nil {
+				t.handleIncomingRequest(&req)
+				return
+			}
+		} else {
+			// Handle Notification (e.g. session/update)
+			var notif Notification
+			if err := json.Unmarshal(line, &notif); err == nil {
+				t.handleIncomingNotification(&notif)
+				return
+			}
+		}
+	}
 }
 
 func (t *Transport) dispatchResponse(resp *Response) {

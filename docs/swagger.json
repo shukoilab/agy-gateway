@@ -7,13 +7,13 @@
         "contact": {
             "name": "ShukoiLab",
             "url": "https://github.com/shukoilab/agy-gateway",
-            "email": "support@shukoilab.com"
+            "email": "shukoilab@proton.me"
         },
         "license": {
             "name": "MIT",
             "url": "https://github.com/shukoilab/agy-gateway/blob/main/LICENSE"
         },
-        "version": "3.4.0"
+        "version": "3.5.0"
     },
     "host": "localhost:8080",
     "basePath": "/",
@@ -1439,6 +1439,10 @@
         "openai.ModelObject": {
             "type": "object",
             "properties": {
+                "context_window": {
+                    "type": "integer",
+                    "example": 1048576
+                },
                 "created": {
                     "type": "integer",
                     "example": 1774350000
@@ -1446,6 +1450,10 @@
                 "id": {
                     "type": "string",
                     "example": "gemini-3.8-flash"
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "example": 65536
                 },
                 "object": {
                     "type": "string",

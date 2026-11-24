@@ -1,18 +1,25 @@
 services:
   agy-gateway:
-    image: agy-gateway:3.4.0
+    image: agy-gateway:3.5.0
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
     container_name: agy-gateway
     restart: unless-stopped
     stop_signal: SIGTERM
     stop_grace_period: 30s
     ports:
-      - "8080:8080"
+      - "${AGY_GW_HOST_PORT:-${PORT:-8080}}:${AGY_GW_PORT:-${PORT:-8080}}"
     environment:
+      - AGY_GW_PORT=${AGY_GW_PORT:-${PORT:-8080}}
+      - AGY_GW_HOST=${AGY_GW_HOST:-0.0.0.0}
       - AGY_GW_ADMIN_KEY=${AGY_GW_ADMIN_KEY:-admin-super-secret-key-change-me}
       - AGY_GW_CLIENT_KEY_1=${AGY_GW_CLIENT_KEY_1:-sk-antigravity-dev-test}
+      - AGY_GW_POOL_WORKER_COUNT=${AGY_GW_POOL_WORKER_COUNT:-2}
+      - AGY_GW_LOG_LEVEL=${AGY_GW_LOG_LEVEL:-info}
+      - AGY_GW_LOG_FORMAT=${AGY_GW_LOG_FORMAT:-json}
+      - AGY_GW_DEFAULT_MODEL=${AGY_GW_DEFAULT_MODEL:-gemini-3.8-flash}
+      - AGY_GW_DEFAULT_REASONING_EFFORT=${AGY_GW_DEFAULT_REASONING_EFFORT:-medium}
       - AGY_AUTH_NO_UPDATE_CHECK=1
     volumes:
       - agy-vault-data:/var/lib/agy-gateway/vault-xdg
@@ -38,7 +45,7 @@ services:
           cpus: "0.5"
           memory: "512M"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "/usr/local/bin/agy-gateway", "-config", "/etc/agy-gateway/config.yaml", "-healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 3

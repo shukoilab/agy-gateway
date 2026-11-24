@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -131,7 +132,23 @@ func (h *OpenAIHandlers) handleSync(
 	var fullThoughts strings.Builder
 	var turnMu sync.Mutex
 
-	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, h.cfg.Accounts.MaxFailoverRetries, func(ctx context.Context, worker *pool.Worker) error {
+	ttftDuration := h.cfg.Pool.FirstTokenTimeout
+	if ttftDuration <= 0 {
+		ttftDuration = 120 * time.Second
+	}
+	var ttftTimedOut atomic.Bool
+
+	maxRetries := h.cfg.Execution.MaxRetries
+	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
+		maxRetries = h.cfg.Accounts.MaxFailoverRetries
+	}
+
+	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+		turnMu.Lock()
+		fullText.Reset()
+		fullThoughts.Reset()
+		turnMu.Unlock()
+
 		// A. Call session/new (pure editor cwd boundary, 100% compliant with standard ACP)
 		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
 		defer cancelSess()
@@ -170,8 +187,32 @@ func (h *OpenAIHandlers) handleSync(
 			}, nil)
 		}
 
+		// TTFT Watchdog initialization for this attempt
+		var ttftDisarmed atomic.Bool
+		ttftTimer := time.NewTimer(ttftDuration)
+		defer ttftTimer.Stop()
+
+		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
+		defer cancelPrompt()
+
+		go func() {
+			select {
+			case <-promptCtx.Done():
+			case <-ttftTimer.C:
+				if !ttftDisarmed.Load() {
+					ttftTimedOut.Store(true)
+					h.logger.Warn("time-to-first-token watchdog triggered", "timeout", ttftDuration)
+					cancelPrompt()
+				}
+			}
+		}()
+
 		// C. Register listener for turn updates
 		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
+			if !ttftDisarmed.Load() {
+				ttftDisarmed.Store(true)
+				ttftTimer.Stop()
+			}
 			turnMu.Lock()
 			defer turnMu.Unlock()
 
@@ -186,9 +227,6 @@ func (h *OpenAIHandlers) handleSync(
 		defer worker.Transport.SetUpdateListener(nil)
 
 		// D. Send session/prompt turn
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
 		var promptResult acp.PromptResult
 		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
 			SessionID: newResult.SessionID,
@@ -201,6 +239,10 @@ func (h *OpenAIHandlers) handleSync(
 	})
 
 	if err != nil {
+		if ttftTimedOut.Load() {
+			h.writeOpenAIError(w, http.StatusGatewayTimeout, fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttftDuration), "api_error", "first_token_timeout", "")
+			return
+		}
 		var respErr *acp.ResponseError
 		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
 			strings.Contains(err.Error(), "Authentication required") ||
@@ -320,7 +362,24 @@ func (h *OpenAIHandlers) handleStreaming(
 		}
 	}()
 
-	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, h.cfg.Accounts.MaxFailoverRetries, func(ctx context.Context, worker *pool.Worker) error {
+	ttftDuration := h.cfg.Pool.FirstTokenTimeout
+	if ttftDuration <= 0 {
+		ttftDuration = 120 * time.Second
+	}
+	var ttftTimedOut atomic.Bool
+
+	maxRetries := h.cfg.Execution.MaxRetries
+	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
+		maxRetries = h.cfg.Accounts.MaxFailoverRetries
+	}
+
+	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+		totalText.Reset()
+		totalThoughts.Reset()
+		streamParser = openai.NewStreamParser(delimiter)
+		firstChunkSent = false
+		hasToolCalls = false
+
 		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
 		defer cancelSess()
 
@@ -357,7 +416,31 @@ func (h *OpenAIHandlers) handleStreaming(
 			}, nil)
 		}
 
+		// TTFT Watchdog initialization for this streaming attempt
+		var ttftDisarmed atomic.Bool
+		ttftTimer := time.NewTimer(ttftDuration)
+		defer ttftTimer.Stop()
+
+		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
+		defer cancelPrompt()
+
+		go func() {
+			select {
+			case <-promptCtx.Done():
+			case <-ttftTimer.C:
+				if !ttftDisarmed.Load() {
+					ttftTimedOut.Store(true)
+					h.logger.Warn("streaming time-to-first-token watchdog triggered", "timeout", ttftDuration)
+					cancelPrompt()
+				}
+			}
+		}()
+
 		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
+			if !ttftDisarmed.Load() {
+				ttftDisarmed.Store(true)
+				ttftTimer.Stop()
+			}
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
 				textChunk := update.Update.Content.Text
 				totalText.WriteString(textChunk)
@@ -422,14 +505,14 @@ func (h *OpenAIHandlers) handleStreaming(
 		})
 		defer worker.Transport.SetUpdateListener(nil)
 
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
 		var promptResult acp.PromptResult
 		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
 			SessionID: newResult.SessionID,
 			Prompt:    promptBlocks,
 		}, &promptResult); err != nil {
+			if firstChunkSent {
+				return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, err)
+			}
 			return err
 		}
 
@@ -438,6 +521,10 @@ func (h *OpenAIHandlers) handleStreaming(
 
 	if err != nil {
 		h.logger.Error("streaming turn failed", "err", err)
+		if ttftTimedOut.Load() {
+			_ = sseWriter.WriteError(fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttftDuration), "first_token_timeout")
+			return
+		}
 		var respErr *acp.ResponseError
 		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
 			strings.Contains(err.Error(), "Authentication required") ||

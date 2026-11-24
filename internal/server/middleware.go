@@ -4,7 +4,11 @@ package server
 
 import (
 	"crypto/subtle"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -52,9 +56,86 @@ func (m *Middleware) MaxBytes(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := m.cfg.Server.MaxRequestBodyBytes
 		if limit <= 0 {
-			limit = 10 * 1024 * 1024 // 10 MiB default
+			limit = 100 * 1024 * 1024 // 100 MiB default (1M+ context support)
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CORS enforces allowed origins and intercepts HTTP OPTIONS preflight queries.
+//
+// @purpose Provides enterprise-grade Cross-Origin Resource Sharing (CORS) header injection and preflight negotiation.
+// @rationale Enables web-based dashboards, Swagger UI, and third-party frontend apps to securely communicate with the gateway API.
+// @preconditions m.cfg must be non-nil; r must be a valid HTTP request pointer.
+// - @param: next Downstream HTTP handler to execute if request is not an OPTIONS preflight.
+// @returns An http.Handler wrapping next with CORS headers and OPTIONS short-circuiting.
+// @throws None.
+// @invariants O(K) lookup where K is count of allowed CORS origins. Safe for concurrent request streams.
+func (m *Middleware) CORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := ""
+
+		if len(m.cfg.Security.AllowedCORSOrigins) == 0 {
+			allowedOrigin = "*"
+		} else {
+			for _, o := range m.cfg.Security.AllowedCORSOrigins {
+				if o == "*" || o == origin {
+					allowedOrigin = origin
+					if o == "*" && origin == "" {
+						allowedOrigin = "*"
+					}
+					break
+				}
+			}
+		}
+
+		if allowedOrigin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Request-ID, User-Agent")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Content-Length")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			if allowedOrigin != "*" {
+				w.Header().Set("Vary", "Origin")
+			}
+		}
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Recovery catches downstream panics, logs stack traces, and returns a safe 500 error.
+//
+// @purpose Prevents unexpected handler panics from crashing the HTTP server process or orphaning connections.
+// @rationale Enforces fault tolerance and guarantees that the client always receives a structured, compliant JSON response on internal errors.
+// @preconditions next must be a non-nil http.Handler.
+// - @param: next Downstream HTTP handler whose execution will be guarded by defer/recover.
+// @returns An http.Handler wrapped with structured recovery handling.
+// @throws None (intercepts all panics gracefully).
+// @invariants Panic stack traces are emitted to structured logs; returns HTTP 500 with OpenAI-compatible JSON schema.
+func (m *Middleware) Recovery(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				stack := debug.Stack()
+				slog.Error("panic intercepted by recovery middleware", "panic", rec, "stack", string(stack))
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"error": map[string]string{
+						"message": fmt.Sprintf("Internal gateway panic: %v", rec),
+						"type":    "internal_server_error",
+					},
+				})
+			}
+		}()
 		next.ServeHTTP(w, r)
 	})
 }

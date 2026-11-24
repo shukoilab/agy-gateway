@@ -3,13 +3,20 @@ package pool
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"time"
 
-	"agy-gateway/internal/acp"
 	"agy-gateway/internal/auth"
+	"agy-gateway/internal/retry"
 )
 
-// FailoverCoordinator handles transparent pre-first-byte retries when an account expires.
+// ErrNonRetryableStream indicates that tokens have already been emitted to the client stream,
+// making transparent failover prohibited to prevent duplicated or conflicting tokens.
+var ErrNonRetryableStream = errors.New("stream already started; failover prohibited")
+
+// FailoverCoordinator handles transparent pre-first-byte retries, multi-account failover,
+// and exponential backoff with full jitter across worker lease attempts.
 type FailoverCoordinator struct {
 	pool    *Pool
 	authMgr *auth.Manager
@@ -28,8 +35,20 @@ func NewFailoverCoordinator(pool *Pool, authMgr *auth.Manager, logger *slog.Logg
 	}
 }
 
-// ExecuteWithFailover leases a worker, attempts the operation, and if an auth error
-// (-32000) or quota exhaustion occurs pre-first-byte, marks the account and retries.
+// ExecuteWithFailover leases a worker, attempts the operation, and if a recoverable
+// failure (e.g. auth expired, quota exhausted, model overloaded, pipe closed, TTFT timeout)
+// occurs pre-first-token, intelligently switches accounts, applies jittered backoff, and retries.
+//
+// @purpose Coordinates resilient inference turn executions across transient failures and multi-account rotations.
+// @rationale Ensures zero-semantic-loss for API callers by hiding transient Google API glitches and quota limits.
+// @preconditions ctx must be active; maxRetries >= 0; op must not be nil.
+// - @param: ctx Context governing overall operation lifetime.
+// - @param: requiresPaidTier True if the model requires a paid Google tier.
+// - @param: maxRetries Maximum number of retry attempts before giving up.
+// - @param: op The closure executing the turn with the leased worker.
+// @returns Nil on successful completion, or the terminating error.
+// @throws Returns typed errors if all retries are exhausted or non-retryable failure occurs.
+// @invariants Releases leased workers on every code path; guarantees zero worker leakage.
 func (fc *FailoverCoordinator) ExecuteWithFailover(
 	ctx context.Context,
 	requiresPaidTier bool,
@@ -40,11 +59,27 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 		maxRetries = 0
 	}
 
+	initialBackoff := 500 * time.Millisecond
+	maxBackoff := 10 * time.Second
+	if fc.pool != nil && fc.pool.cfg != nil {
+		if fc.pool.cfg.Execution.RetryInitialBackoff > 0 {
+			initialBackoff = fc.pool.cfg.Execution.RetryInitialBackoff
+		}
+		if fc.pool.cfg.Execution.RetryMaxBackoff > 0 {
+			maxBackoff = fc.pool.cfg.Execution.RetryMaxBackoff
+		}
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Check context before leasing
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		w, err := fc.pool.Acquire(ctx, requiresPaidTier)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to acquire worker from pool: %w", err)
 		}
 
 		err = op(ctx, w)
@@ -53,24 +88,120 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 			return nil
 		}
 
-		fc.pool.Release(w)
 		lastErr = err
 
-		// Check for ACP auth expired error (-32000)
-		var respErr *acp.ResponseError
-		if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
-			fc.logger.Warn("detected auth required error (-32000); triggering failover",
-				"workerID", w.ID,
-				"attempt", attempt+1,
-			)
-			if w.Account != nil {
-				w.Account.Status = auth.StatusAuthExpired
-			}
-			continue
+		// If mid-stream tokens were already sent, retry is strictly prohibited
+		if errors.Is(err, ErrNonRetryableStream) {
+			fc.pool.Release(w)
+			fc.logger.Warn("non-retryable stream error encountered; aborting failover", "err", err)
+			return err
 		}
 
-		// Non-recoverable or business logic error, return immediately
-		return err
+		failureClass := retry.ClassifyFailure(err)
+		fc.logger.Warn("worker turn operation failed",
+			"attempt", attempt+1,
+			"maxRetries", maxRetries,
+			"workerID", w.ID,
+			"failureClass", failureClass.String(),
+			"err", err,
+		)
+
+		if !failureClass.IsRetryable() || attempt >= maxRetries {
+			fc.pool.Release(w)
+			return err
+		}
+
+		var currentAccID string
+		if w.Account != nil {
+			currentAccID = w.Account.ID
+		}
+
+		switch failureClass {
+		case retry.FailureClassAuthExpired:
+			if currentAccID != "" && fc.authMgr != nil {
+				fc.authMgr.MarkAccountStatus(currentAccID, auth.StatusAuthExpired, 0)
+			}
+			w.TaintedForRecycle.Store(true)
+
+			// Check for alternate eligible account in vault
+			if fc.authMgr != nil {
+				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, requiresPaidTier)
+				if findErr == nil && nextAcc != nil {
+					fc.logger.Info("auth expired; auto-switching worker to alternate account",
+						"workerID", w.ID,
+						"fromAccount", currentAccID,
+						"toAccount", nextAcc.ID,
+					)
+					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
+						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
+					}
+					w.Account = nextAcc
+					fc.pool.Release(w)
+					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
+					continue
+				}
+			}
+
+			fc.pool.Release(w)
+			delay := retry.ComputeBackoff(attempt, initialBackoff, maxBackoff)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return sleepErr
+			}
+
+		case retry.FailureClassQuotaExhausted:
+			cooldownDuration := 30 * time.Minute
+			if fc.pool != nil && fc.pool.cfg != nil && fc.pool.cfg.Accounts.DefaultCooldown5h > 0 {
+				cooldownDuration = fc.pool.cfg.Accounts.DefaultCooldown5h
+			}
+			if currentAccID != "" && fc.authMgr != nil {
+				fc.authMgr.MarkAccountStatus(currentAccID, auth.StatusCooldown5h, cooldownDuration)
+			}
+			w.TaintedForRecycle.Store(true)
+
+			// Ultra-smart auto-switch to alternate account if available
+			if fc.authMgr != nil {
+				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, requiresPaidTier)
+				if findErr == nil && nextAcc != nil {
+					fc.logger.Info("quota exhausted; auto-switching worker to alternate account",
+						"workerID", w.ID,
+						"fromAccount", currentAccID,
+						"toAccount", nextAcc.ID,
+					)
+					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
+						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
+					}
+					w.Account = nextAcc
+					fc.pool.Release(w)
+					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
+					continue
+				}
+			}
+
+			fc.pool.Release(w)
+			delay := retry.ComputeBackoff(attempt, initialBackoff, maxBackoff)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return sleepErr
+			}
+
+		case retry.FailureClassTransportClosed, retry.FailureClassFirstTokenTimeout:
+			w.TaintedForRecycle.Store(true)
+			fc.pool.Release(w)
+			delay := retry.ComputeBackoff(attempt, initialBackoff, maxBackoff)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return sleepErr
+			}
+
+		case retry.FailureClassTransientOverload:
+			fc.pool.Release(w)
+			delay := retry.ComputeBackoff(attempt, initialBackoff, maxBackoff)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return sleepErr
+			}
+
+		default:
+			fc.pool.Release(w)
+			return err
+		}
 	}
 
 	return lastErr

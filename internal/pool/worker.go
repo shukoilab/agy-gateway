@@ -33,6 +33,9 @@ type Worker struct {
 
 	cfg    *config.Config
 	logger *slog.Logger
+
+	// StartFn optionally overrides subprocess spawning for testing or custom process isolation.
+	StartFn func(ctx context.Context) error
 }
 
 // NewWorker initializes a worker struct with isolated filesystem paths.
@@ -55,6 +58,10 @@ func NewWorker(id int, homeDir, tmpDir, cwd string, account *auth.Account, cfg *
 
 // Start launches the agy acp subprocess and completes the initialize handshake.
 func (w *Worker) Start(ctx context.Context) error {
+	if w.StartFn != nil {
+		return w.StartFn(ctx)
+	}
+
 	args := w.cfg.Binaries.AgyAcpArgs
 	if len(args) == 0 {
 		args = []string{"acp", "--dangerously-skip-permissions"}

@@ -17,9 +17,13 @@ import (
 	"time"
 
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/retry"
 )
 
-var ErrAccountNotFound = errors.New("account not found")
+var (
+	ErrAccountNotFound    = errors.New("account not found")
+	ErrNoEligibleAccounts = errors.New("no eligible accounts available in vault")
+)
 
 // AgyUsageEnvelope mirrors the stdout from agy -p "/usage" --output-format json.
 type AgyUsageEnvelope struct {
@@ -189,6 +193,94 @@ func (m *Manager) GetAccounts() []Account {
 	out := make([]Account, len(m.accounts))
 	copy(out, m.accounts)
 	return out
+}
+
+// SetAccountsForTest injects accounts directly into the manager for unit and integration testing.
+func (m *Manager) SetAccountsForTest(accounts []Account) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+	m.accounts = accounts
+}
+
+// MarkAccountStatus updates the status and optional cooldown duration of a specific account by ID.
+func (m *Manager) MarkAccountStatus(accountID string, status AccountStatus, cooldown time.Duration) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	for i := range m.accounts {
+		if m.accounts[i].ID == accountID {
+			m.accounts[i].Status = status
+			if cooldown > 0 {
+				m.accounts[i].CooldownUntil = time.Now().Add(cooldown)
+			} else {
+				m.accounts[i].CooldownUntil = time.Time{}
+			}
+			m.logger.Info("marked account status", "accountID", accountID, "status", status, "cooldown", cooldown)
+			return
+		}
+	}
+}
+
+// FindNextEligibleAccount locates the next healthy, non-exhausted account excluding excludeAccountID.
+func (m *Manager) FindNextEligibleAccount(excludeAccountID string, requiresPaidTier bool) (*Account, error) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	now := time.Now()
+	// Auto-recover expired cooldown accounts back to healthy
+	for i := range m.accounts {
+		if !m.accounts[i].CooldownUntil.IsZero() && now.After(m.accounts[i].CooldownUntil) {
+			if m.accounts[i].Status == StatusCooldown5h || m.accounts[i].Status == StatusCooldownWeekly {
+				m.logger.Info("account cooldown expired; recovering to healthy", "accountID", m.accounts[i].ID)
+				m.accounts[i].Status = StatusHealthy
+				m.accounts[i].CooldownUntil = time.Time{}
+			}
+		}
+	}
+
+	for _, acc := range m.accounts {
+		if acc.ID == excludeAccountID {
+			continue
+		}
+		if acc.IsEligible(requiresPaidTier, m.cfg.Accounts.MinRemainingQuotaPct) {
+			copyAcc := acc
+			return &copyAcc, nil
+		}
+	}
+
+	return nil, ErrNoEligibleAccounts
+}
+
+// SwitchWorkerAccount switches the active account in agy-auth and syncs credentials into the worker's home sandbox.
+func (m *Manager) SwitchWorkerAccount(ctx context.Context, workerID int, targetAccountID string) error {
+	m.vaultMu.Lock()
+	defer m.vaultMu.Unlock()
+
+	if _, err := m.execAgyAuth(ctx, "switch", targetAccountID); err != nil {
+		return fmt.Errorf("failed to switch agy-auth account to %s: %w", targetAccountID, err)
+	}
+
+	// Update token mirror in worker home
+	homeDir := filepath.Join(m.cfg.Storage.WorkersRootDir, fmt.Sprintf("w%d", workerID))
+	dstTokenDir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
+	_ = os.MkdirAll(dstTokenDir, 0755)
+	dstToken := filepath.Join(dstTokenDir, "antigravity-oauth-token")
+
+	tokenCandidates := []string{
+		"/home/agygw/.gemini/antigravity-cli/antigravity-oauth-token",
+		filepath.Join(m.cfg.Storage.VaultXDGConfigDir, "gemini", "antigravity-cli", "antigravity-oauth-token"),
+		filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token"),
+	}
+
+	for _, tokenPath := range tokenCandidates {
+		if _, err := os.Stat(tokenPath); err == nil {
+			_ = copyFile(tokenPath, dstToken)
+			break
+		}
+	}
+
+	m.logger.Info("switched worker account successfully", "workerID", workerID, "accountID", targetAccountID)
+	return nil
 }
 
 // FetchAgyUsage executes agy -p "/usage" --output-format json to pull live quota directly from Google Antigravity.
@@ -451,46 +543,95 @@ func (m *Manager) Clean(ctx context.Context, dryRun bool) ([]byte, error) {
 	return m.execAgyAuth(ctx, args...)
 }
 
-// ExecAgy executes the agy CLI binary under the given HOME directory and returns its stdout.
+// ExecAgy executes the agy CLI binary under the given HOME directory and returns its stdout,
+// applying transient retries with exponential backoff on SQLite lock contention or fork exhaustion.
 func (m *Manager) ExecAgy(ctx context.Context, homeDir string, args ...string) ([]byte, error) {
 	if homeDir == "" {
 		homeDir = os.Getenv("HOME")
 	}
 
-	cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyPath, args...)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("HOME=%s", homeDir),
-		fmt.Sprintf("XDG_CONFIG_HOME=%s", filepath.Join(homeDir, ".config")),
-		"DBUS_SESSION_BUS_ADDRESS=",
-		"AGY_AUTH_NO_UPDATE_CHECK=1",
-	)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("agy %v failed (%w): %s", args, err, stderr.String())
+	maxRetries := m.cfg.Execution.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	return stdout.Bytes(), nil
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyPath, args...)
+		cmd.Env = append(os.Environ(),
+			fmt.Sprintf("HOME=%s", homeDir),
+			fmt.Sprintf("XDG_CONFIG_HOME=%s", filepath.Join(homeDir, ".config")),
+			"DBUS_SESSION_BUS_ADDRESS=",
+			"AGY_AUTH_NO_UPDATE_CHECK=1",
+		)
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		if err == nil {
+			return stdout.Bytes(), nil
+		}
+
+		runErr := fmt.Errorf("agy %v failed (%w): %s", args, err, stderr.String())
+		lastErr = runErr
+
+		if retry.ClassifyFailure(runErr) == retry.FailureClassTransientCLI && attempt < maxRetries {
+			delay := retry.ComputeBackoff(attempt, 100*time.Millisecond, 2*time.Second)
+			m.logger.Warn("agy execution encountered transient lock; retrying", "attempt", attempt+1, "delay", delay, "err", runErr)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
+		}
+
+		return nil, runErr
+	}
+
+	return nil, lastErr
 }
 
 func (m *Manager) execAgyAuth(ctx context.Context, args ...string) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyAuthPath, args...)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("XDG_CONFIG_HOME=%s", m.cfg.Storage.VaultXDGConfigDir),
-		"AGY_AUTH_NO_UPDATE_CHECK=1",
-		"DBUS_SESSION_BUS_ADDRESS=",
-	)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("agy-auth %v failed (%w): %s", args, err, stderr.String())
+	maxRetries := m.cfg.Execution.MaxRetries
+	if maxRetries < 0 {
+		maxRetries = 0
 	}
-	return stdout.Bytes(), nil
+
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyAuthPath, args...)
+		cmd.Env = append(os.Environ(),
+			fmt.Sprintf("XDG_CONFIG_HOME=%s", m.cfg.Storage.VaultXDGConfigDir),
+			"AGY_AUTH_NO_UPDATE_CHECK=1",
+			"DBUS_SESSION_BUS_ADDRESS=",
+		)
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		if err == nil {
+			return stdout.Bytes(), nil
+		}
+
+		runErr := fmt.Errorf("agy-auth %v failed (%w): %s", args, err, stderr.String())
+		lastErr = runErr
+
+		if retry.ClassifyFailure(runErr) == retry.FailureClassTransientCLI && attempt < maxRetries {
+			delay := retry.ComputeBackoff(attempt, 100*time.Millisecond, 2*time.Second)
+			m.logger.Warn("agy-auth execution encountered transient lock; retrying", "attempt", attempt+1, "delay", delay, "err", runErr)
+			if sleepErr := retry.SleepWithContext(ctx, delay); sleepErr != nil {
+				return nil, sleepErr
+			}
+			continue
+		}
+
+		return nil, runErr
+	}
+
+	return nil, lastErr
 }
 
 func copyFile(src, dst string) error {
