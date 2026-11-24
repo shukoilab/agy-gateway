@@ -52,7 +52,7 @@ A common challenge when bridging developer IDEs and autonomous coding agents (su
 ### The Architectural Solution
 This project explores a sustainable, standards-compliant alternative:
 1. **Standard ACP Emulation**: The gateway emulates a native code editor client (such as Zed) communicating directly with the official Google Antigravity CLI (`agy acp`) using standard JSON-RPC 2.0. The underlying CLI runtime operates in its natural state without file injection or binary tampering.
-2. **Safe Prompt Encapsulation**: Rather than altering core system files, developer instructions and system prompts are safely delineated inside `<important>...</important>` context envelopes.
+2. **Native ACP System Prompt Integration**: Rather than altering core system files or injecting artificial wrapper tags into conversation turns, developer instructions and tool schemas are forwarded directly upstream via official ACP `_meta.antigravity.systemPrompt.append` parameters during session creation (`session/new`). This prevents prompt-injection false positives in safety filters (such as Claude Sonnet) while maintaining pure conversational turn symmetry.
 3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy /usage`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
 4. **Drop-in Compatibility**: Exposes standards-compliant REST endpoints for both `/v1/chat/completions` and `/v1/messages`, enabling developers to benchmark models like Gemini 3.8 Flash (supporting up to 1M+ token context windows) using existing tooling.
 
@@ -69,8 +69,10 @@ This project explores a sustainable, standards-compliant alternative:
   - Queries available models dynamically across authenticated accounts.
   - Integrates with [models.dev](https://models.dev) to score and rank models by capability, automatically electing "Family Champions" (Sonnet, Haiku, Opus, and Flash) with resilient offline disk caching.
   - Supports administrative runtime model aliasing and manual overrides through dedicated REST endpoints (`/admin/v1/models/anthropic/*`).
-- **Client-Side Tool Calling (Function Calling)**:
-  - Just-in-Time (JIT) conversion of declared functions into delimiter-protected prompt envelopes (`<tool_call>`), handling multi-turn tool submissions and execution returns transparently.
+- **Client-Side Tool Calling (Function Calling) & Autonomous Anti-Stall**:
+  - Native ACP system prompt appending for tool schemas and execution directives, eliminating safety filter conflicts.
+  - Active execution loop priming (`BuildActiveContinuationCue`) and structured turn symmetry, keeping autonomous agents (OpenCode, Claude Code, Cursor, Cline, Roo Code, Continue.dev) executing continuously without premature stalls.
+  - Streaming parser with closing tag prefix buffering and resilient flush recovery, guaranteeing zero unclosed or fragmented tool calls across network chunk boundaries.
 - **Live Quota Tracking & Zero-Downtime Failover**:
   - Real-time account quota polling via `agy /usage`, tracking remaining percentages across rolling 5-hour and weekly bucket limits.
   - Automatic cooldown scheduling and seamless standby worker rotation upon rate limit detection (`429`).
@@ -84,8 +86,8 @@ This project explores a sustainable, standards-compliant alternative:
   - Continuous background discovery, cryptographic verification (SHA-512 and SHA-256), and non-root atomic installation for both the official Google Antigravity CLI (`agy`) and `@fikrilal/agy-auth`.
   - Zero-downtime rolling worker pool reload without interrupting active inference streams or client requests.
   - Complete control plane integration via REST endpoints (`/admin/v1/updater/*`), CLI subcommands (`agy-gateway update`), and interactive dashboard.
-- **Resource-Safe Architecture**:
-  - Built with Go 1.25, memory-backed scratch storage, supervised process group lifecycles preventing zombie processes, and zero data races.
+- **Resource-Safe Architecture & Zero-Garbage Janitor**:
+  - Built with Go 1.25, supervised process group lifecycles preventing zombie processes, zero data races, and JIT ACP session teardown (`session/close`) with automatic purging of SQLite databases, WAL journals (`.db-wal`), shared memory (`.db-shm`), and brain artifacts between requests.
 
 ---
 
