@@ -178,15 +178,92 @@ func TestMiddleware_ClientAuth_DualHeader(t *testing.T) {
 		t.Errorf("expected 200 for valid Bearer token, got %d", rec3.Code)
 	}
 
-	// 4. OpenAI Bearer invalid -> OpenAI JSON error format
+	// 4. OpenAI raw token in Authorization header (Swagger UI default when user inputs key directly)
 	req4 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
-	req4.Header.Set("Authorization", "Bearer wrong-key")
+	req4.Header.Set("Authorization", "sk-anthropic-secret-12345")
 	rec4 := httptest.NewRecorder()
 	handler.ServeHTTP(rec4, req4)
-	if rec4.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401 for wrong Bearer key, got %d", rec4.Code)
+	if rec4.Code != http.StatusOK {
+		t.Errorf("expected 200 for raw token in Authorization header, got %d", rec4.Code)
 	}
-	if !strings.Contains(rec4.Body.String(), "invalid_request_error") {
-		t.Errorf("expected OpenAI invalid_request_error format, got %s", rec4.Body.String())
+
+	// 5. OpenAI lowercase bearer prefix in Authorization header
+	req5 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	req5.Header.Set("Authorization", "bearer sk-anthropic-secret-12345")
+	rec5 := httptest.NewRecorder()
+	handler.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusOK {
+		t.Errorf("expected 200 for lowercase bearer token, got %d", rec5.Code)
+	}
+
+	// 6. OpenAI Bearer invalid -> OpenAI JSON error format
+	req6 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	req6.Header.Set("Authorization", "Bearer wrong-key")
+	rec6 := httptest.NewRecorder()
+	handler.ServeHTTP(rec6, req6)
+	if rec6.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong Bearer key, got %d", rec6.Code)
+	}
+	if !strings.Contains(rec6.Body.String(), "invalid_request_error") {
+		t.Errorf("expected OpenAI invalid_request_error format, got %s", rec6.Body.String())
+	}
+}
+
+func TestMiddleware_AdminAuth(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			AdminAPIKeySecret: "admin-super-secret-123",
+		},
+	}
+	mw := server.NewMiddleware(cfg)
+
+	handler := mw.AdminAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("admin-ok"))
+	}))
+
+	// 1. Bearer valid
+	req1 := httptest.NewRequest(http.MethodGet, "/admin/v1/accounts", nil)
+	req1.Header.Set("Authorization", "Bearer admin-super-secret-123")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid admin Bearer token, got %d", rec1.Code)
+	}
+
+	// 2. Raw token (Swagger UI)
+	req2 := httptest.NewRequest(http.MethodGet, "/admin/v1/accounts", nil)
+	req2.Header.Set("Authorization", "admin-super-secret-123")
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid admin raw token, got %d", rec2.Code)
+	}
+
+	// 3. Lowercase bearer
+	req3 := httptest.NewRequest(http.MethodGet, "/admin/v1/accounts", nil)
+	req3.Header.Set("Authorization", "bearer admin-super-secret-123")
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid admin lowercase bearer token, got %d", rec3.Code)
+	}
+
+	// 4. x-api-key valid
+	req4 := httptest.NewRequest(http.MethodGet, "/admin/v1/accounts", nil)
+	req4.Header.Set("x-api-key", "admin-super-secret-123")
+	rec4 := httptest.NewRecorder()
+	handler.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid admin x-api-key, got %d", rec4.Code)
+	}
+
+	// 5. Wrong key
+	req5 := httptest.NewRequest(http.MethodGet, "/admin/v1/accounts", nil)
+	req5.Header.Set("Authorization", "Bearer wrong-secret")
+	rec5 := httptest.NewRecorder()
+	handler.ServeHTTP(rec5, req5)
+	if rec5.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong admin key, got %d", rec5.Code)
 	}
 }

@@ -35,7 +35,13 @@ services:
       - AGY_GW_PROXY_HTTPS_PROXY=${AGY_GW_PROXY_HTTPS_PROXY:-}
       - AGY_GW_PROXY_NO_PROXY=${AGY_GW_PROXY_NO_PROXY:-}
       - NODE_USE_ENV_PROXY=1
+      # Background Auto-Updater (Optional - Cron engine for agy CLI and agy-auth)
+      - AGY_GW_AUTO_UPDATE_ENABLED=${AGY_GW_AUTO_UPDATE_ENABLED:-true}
+      - AGY_GW_AUTO_UPDATE_INTERVAL=${AGY_GW_AUTO_UPDATE_INTERVAL:-6h}
+      - AGY_GW_AUTO_UPDATE_ON_STARTUP=${AGY_GW_AUTO_UPDATE_ON_STARTUP:-true}
+      - AGY_GW_AUTO_UPDATE_BIN_DIR=${AGY_GW_AUTO_UPDATE_BIN_DIR:-/var/lib/agy-gateway/bin}
     volumes:
+      - agy-bin:/var/lib/agy-gateway/bin
       - agy-vault-data:/var/lib/agy-gateway/vault-xdg
       - agy-workspaces:/var/lib/agy-gateway/workspaces
       - agy-workers:/var/lib/agy-gateway/workers
@@ -72,6 +78,7 @@ networks:
     driver: bridge
 
 volumes:
+  agy-bin:
   agy-vault-data:
   agy-workspaces:
   agy-workers:

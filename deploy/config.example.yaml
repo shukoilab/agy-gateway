@@ -90,6 +90,19 @@ proxy:
   https_proxy: ""
   no_proxy: "localhost,127.0.0.1,::1,agy-net,agy-gateway"
 
+auto_update:
+  enabled: true
+  interval: "6h"
+  check_on_startup: true
+  bin_dir: "/var/lib/agy-gateway/bin"
+  agy_cli:
+    enabled: true
+    manifest_url: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests"
+  agy_auth:
+    enabled: true
+    source: "github"
+    release_repo: "fikrilal/agy-auth"
+
 mcp:
   client_tool_calling:
     enabled: true

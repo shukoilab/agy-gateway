@@ -737,6 +737,104 @@ const docTemplate = `{
                 }
             }
         },
+        "/admin/v1/updater/check": {
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Queries upstream release repositories immediately and downloads/installs any available updates for agy CLI or agy-auth.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Auto-Updater"
+                ],
+                "summary": "Trigger immediate auto-update check",
+                "responses": {
+                    "200": {
+                        "description": "Result of update inspection and installation",
+                        "schema": {
+                            "$ref": "#/definitions/updater.CheckResult"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Update check or installation encountered errors",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Auto-updater service not initialized",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/v1/updater/status": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Returns operational telemetry, scheduled intervals, active binary paths, and upstream version status for agy CLI and agy-auth.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Auto-Updater"
+                ],
+                "summary": "Get auto-updater status",
+                "responses": {
+                    "200": {
+                        "description": "Auto-updater status payload",
+                        "schema": {
+                            "$ref": "#/definitions/updater.AutoUpdateStatusResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "503": {
+                        "description": "Auto-updater service not initialized",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/v1/vault/clean": {
             "post": {
                 "security": [
@@ -2341,17 +2439,118 @@ const docTemplate = `{
                     "example": false
                 }
             }
+        },
+        "updater.AutoUpdateStatusResponse": {
+            "type": "object",
+            "properties": {
+                "components": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "$ref": "#/definitions/updater.ComponentVersionInfo"
+                    }
+                },
+                "enabled": {
+                    "type": "boolean"
+                },
+                "interval": {
+                    "type": "string"
+                },
+                "next_check_at": {
+                    "type": "string"
+                },
+                "status": {
+                    "$ref": "#/definitions/updater.UpdateStatus"
+                }
+            }
+        },
+        "updater.CheckResult": {
+            "type": "object",
+            "properties": {
+                "agy_auth_checked": {
+                    "type": "boolean"
+                },
+                "agy_auth_new_version": {
+                    "type": "string"
+                },
+                "agy_auth_old_version": {
+                    "type": "string"
+                },
+                "agy_auth_updated": {
+                    "type": "boolean"
+                },
+                "agy_checked": {
+                    "type": "boolean"
+                },
+                "agy_new_version": {
+                    "type": "string"
+                },
+                "agy_old_version": {
+                    "type": "string"
+                },
+                "agy_updated": {
+                    "type": "boolean"
+                },
+                "errors": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                }
+            }
+        },
+        "updater.ComponentVersionInfo": {
+            "type": "object",
+            "properties": {
+                "active_binary_path": {
+                    "type": "string"
+                },
+                "current_version": {
+                    "type": "string"
+                },
+                "last_checked_at": {
+                    "type": "string"
+                },
+                "last_error": {
+                    "type": "string"
+                },
+                "last_updated_at": {
+                    "type": "string"
+                },
+                "latest_version": {
+                    "type": "string"
+                },
+                "update_available": {
+                    "type": "boolean"
+                }
+            }
+        },
+        "updater.UpdateStatus": {
+            "type": "string",
+            "enum": [
+                "IDLE",
+                "CHECKING",
+                "UPDATING",
+                "SUCCESS",
+                "FAILED"
+            ],
+            "x-enum-varnames": [
+                "StatusIdle",
+                "StatusChecking",
+                "StatusUpdating",
+                "StatusSuccess",
+                "StatusFailed"
+            ]
         }
     },
     "securityDefinitions": {
         "AdminBearerAuth": {
-            "description": "Admin Control Plane authorization. Format: ` + "`" + `Bearer \u003cyour-admin-api-key\u003e` + "`" + `. Used to access administrative endpoints (` + "`" + `/admin/v1/*` + "`" + `).",
+            "description": "Admin Control Plane authorization. Format: ` + "`" + `Bearer \u003cyour-admin-api-key\u003e` + "`" + ` or directly ` + "`" + `\u003cyour-admin-api-key\u003e` + "`" + `. Used to access administrative endpoints (` + "`" + `/admin/v1/*` + "`" + `).",
             "type": "apiKey",
             "name": "Authorization",
             "in": "header"
         },
         "ClientBearerAuth": {
-            "description": "Client API authorization. Format: ` + "`" + `Bearer \u003cyour-client-api-key\u003e` + "`" + `. Used to access OpenAI-compatible endpoints (` + "`" + `/v1/*` + "`" + `).",
+            "description": "Client API authorization. Format: ` + "`" + `Bearer \u003cyour-client-api-key\u003e` + "`" + ` or directly ` + "`" + `\u003cyour-client-api-key\u003e` + "`" + `. Used to access OpenAI-compatible and Anthropic endpoints (` + "`" + `/v1/*` + "`" + `).",
             "type": "apiKey",
             "name": "Authorization",
             "in": "header"
@@ -2366,7 +2565,7 @@ var SwaggerInfo = &swag.Spec{
 	BasePath:         "/",
 	Schemes:          []string{},
 	Title:            "agy-gateway API",
-	Description:      "Enterprise-grade OpenAI-compatible reverse proxy gateway bridging OpenAI client applications to Google Antigravity CLI (`agy acp`).\nFeatures multi-account quota rotation, live quota tracking (`agy /usage`), streaming reasoning tokens (`reasoning_effort` / `reasoning_content`), client-side tool calling with JIT prompt envelope translation, and headless OAuth onboarding.",
+	Description:      "An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).",
 	InfoInstanceName: "swagger",
 	SwaggerTemplate:  docTemplate,
 	LeftDelim:        "{{",

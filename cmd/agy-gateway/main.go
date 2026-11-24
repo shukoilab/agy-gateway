@@ -19,12 +19,12 @@ import (
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/pool"
 	"agy-gateway/internal/server"
+	"agy-gateway/internal/updater"
 )
 
 // @title           agy-gateway API
 // @version         3.5.0
-// @description     Enterprise-grade OpenAI-compatible reverse proxy gateway bridging OpenAI client applications to Google Antigravity CLI (`agy acp`).
-// @description     Features multi-account quota rotation, live quota tracking (`agy /usage`), streaming reasoning tokens (`reasoning_effort` / `reasoning_content`), client-side tool calling with JIT prompt envelope translation, and headless OAuth onboarding.
+// @description     An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).
 // @termsOfService  https://github.com/shukoilab/agy-gateway
 
 // @contact.name   ShukoiLab
@@ -40,12 +40,12 @@ import (
 // @securityDefinitions.apikey  ClientBearerAuth
 // @in                          header
 // @name                        Authorization
-// @description                 Client API authorization. Format: `Bearer <your-client-api-key>`. Used to access OpenAI-compatible endpoints (`/v1/*`).
+// @description                 Client API authorization. Format: `Bearer <your-client-api-key>` or directly `<your-client-api-key>`. Used to access OpenAI-compatible and Anthropic endpoints (`/v1/*`).
 
 // @securityDefinitions.apikey  AdminBearerAuth
 // @in                          header
 // @name                        Authorization
-// @description                 Admin Control Plane authorization. Format: `Bearer <your-admin-api-key>`. Used to access administrative endpoints (`/admin/v1/*`).
+// @description                 Admin Control Plane authorization. Format: `Bearer <your-admin-api-key>` or directly `<your-admin-api-key>`. Used to access administrative endpoints (`/admin/v1/*`).
 
 var version = "3.5.0"
 
@@ -62,6 +62,12 @@ func main() {
 	// Direct delegation if invoked as 'agy-gateway models [subcommand]'
 	if len(os.Args) > 1 && (os.Args[1] == "models" || os.Args[1] == "model") {
 		runModelsSubcommand(os.Args[2:])
+		return
+	}
+
+	// Direct delegation if invoked as 'agy-gateway update [subcommand]'
+	if len(os.Args) > 1 && (os.Args[1] == "update" || os.Args[1] == "updater") {
+		runUpdaterSubcommand(os.Args[2:])
 		return
 	}
 
@@ -158,10 +164,15 @@ func main() {
 		logger.Warn("initial dynamic model discovery encountered issue", "err", err)
 	}
 
+	// 8b. Initialize background auto-updater service
+	updaterSvc := updater.NewService(cfg, workerPool, logger)
+	updaterSvc.Start(ctx)
+	defer updaterSvc.Stop()
+
 	// 9. Wire HTTP handlers and server
 	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
 	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
-	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry)
+	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry, updaterSvc)
 	opsHandlers := server.NewOpsHandlers()
 
 	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, logger)
@@ -316,6 +327,35 @@ func runModelsSubcommand(args []string) {
 	mr := models.NewModelRegistry(cfg, mgr, logger)
 	modelsCLI := cli.NewModelsCLI(cfg, mgr, mr, os.Stdin, os.Stdout)
 	if err := modelsCLI.Run(ctx, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// @purpose: Runs the auto-updater CLI subcommand.
+// @rationale: Provides CLI access to inspect versions, trigger manual checks, and update binaries.
+// @preconditions: None.
+// - @param: args ([]string) - Subcommand arguments passed after "update".
+// - @returns: None (terminates or returns upon command completion).
+// - @throws: os.Exit(1) on fatal config or execution failures.
+// - @invariants: Cleans up signal notifications and I/O descriptors. Thread-safe.
+func runUpdaterSubcommand(args []string) {
+	configPath := "config.yaml"
+	if _, err := os.Stat("/etc/agy-gateway/config.yaml"); err == nil {
+		configPath = "/etc/agy-gateway/config.yaml"
+	}
+	for i, arg := range args {
+		if arg == "-config" && i+1 < len(args) {
+			configPath = args[i+1]
+		}
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Config load failed: %v\n", err)
+		os.Exit(1)
+	}
+	updaterCLI := cli.NewUpdaterCLI(cfg, nil, os.Stdin, os.Stdout)
+	if err := updaterCLI.Run(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

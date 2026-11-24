@@ -53,7 +53,7 @@ func setupTestServerWithAdminModels(t *testing.T) (*Server, *models.ModelRegistr
 		"claude-3-7-sonnet": "claude-sonnet-4-6",
 	})
 
-	adminHandlers := NewAdminHandlers(cfg, authMgr, onboard, mr)
+	adminHandlers := NewAdminHandlers(cfg, authMgr, onboard, mr, nil)
 	opsHandlers := NewOpsHandlers()
 
 	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil)

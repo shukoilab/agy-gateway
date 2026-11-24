@@ -29,6 +29,7 @@
   - [Configuration File (`config.yaml`)](#configuration-file-configyaml)
   - [Environment Variables (`.env`)](#environment-variables-env)
   - [Optional Outbound HTTP/HTTPS Proxy](#optional-outbound-httphttps-proxy)
+  - [Automated Background Auto-Updater](#automated-background-auto-updater)
   - [Interactive Account Management CLI](#interactive-account-management-cli)
   - [Connecting Client Applications](#connecting-client-applications)
 - [5. Contributing & Development Guidelines](#5-contributing--development-guidelines)
@@ -79,6 +80,10 @@ This project explores a sustainable, standards-compliant alternative:
 - **Optional Outbound HTTP/HTTPS Proxy Support**:
   - Full compatibility with Docker client proxy configurations (`~/.docker/config.json`) and standard `.env` variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`).
   - Strict proxy routing for all external egress traffic (`agy acp`, `agy-auth`, and `models.dev`), combined with automatic loopback protection for internal container healthchecks.
+- **Automated Background Auto-Updater (Cron Engine)**:
+  - Continuous background discovery, cryptographic verification (SHA-512 and SHA-256), and non-root atomic installation for both the official Google Antigravity CLI (`agy`) and `@fikrilal/agy-auth`.
+  - Zero-downtime rolling worker pool reload without interrupting active inference streams or client requests.
+  - Complete control plane integration via REST endpoints (`/admin/v1/updater/*`), CLI subcommands (`agy-gateway update`), and interactive dashboard.
 - **Resource-Safe Architecture**:
   - Built with Go 1.25, memory-backed scratch storage, supervised process group lifecycles preventing zombie processes, and zero data races.
 
@@ -218,6 +223,10 @@ The gateway follows standard 12-factor configuration principles. Key variables:
 | `AGY_GW_ANTHROPIC_DEFAULT_MODEL` | `claude-3-5-sonnet` | Default model when unspecified by Anthropic clients |
 | `HTTP_PROXY` / `HTTPS_PROXY` | - | Optional outbound forward proxy URL |
 | `NO_PROXY` | `localhost,127.0.0.1` | Addresses exempt from proxying |
+| `AGY_GW_AUTO_UPDATE_ENABLED` | `true` | Master switch for background cron auto-updater |
+| `AGY_GW_AUTO_UPDATE_INTERVAL` | `6h` | Cron check duration (`1h`, `6h`, `24h`) |
+| `AGY_GW_AUTO_UPDATE_ON_STARTUP` | `true` | Run initial update check immediately on boot |
+| `AGY_GW_AUTO_UPDATE_BIN_DIR` | `/var/lib/agy-gateway/bin` | Destination directory for non-root binary installation |
 
 ### Optional Outbound HTTP/HTTPS Proxy
 
@@ -253,6 +262,40 @@ NO_PROXY=localhost,127.0.0.1,::1,agy-net,agy-gateway,.local
 
 ---
 
+### Automated Background Auto-Updater
+
+The gateway includes an autonomous cron engine that keeps the underlying Google Antigravity CLI and `@fikrilal/agy-auth` updated to their latest upstream releases.
+
+#### Key Invariants & Safety Measures:
+- **Non-Root Execution**: Downloads are staged into `/var/lib/agy-gateway/bin` (owned by `agygw` UID `10001`), which takes precedence on `PATH` before `/usr/local/bin` while preserving baked binaries as immutable recovery fallbacks.
+- **Atomic Swap (`ETXTBSY` Prevention)**: Binaries are downloaded to temporary staging files, verified with SHA-512/SHA-256 and `--version` smoke tests, and atomically swapped via `os.Rename`.
+- **Zero-Downtime Worker Recycling**: When a new binary is installed, `pool.MarkAllForRecycle()` gracefully flags existing workers. Active streaming requests run to completion uninterrupted, and recycled workers reload the new executable upon return.
+
+#### Administrative REST Endpoints:
+```bash
+# Check updater lifecycle, component versions, and next scheduled check
+curl -s http://localhost:8080/admin/v1/updater/status \
+  -H "Authorization: Bearer your-admin-secret-key"
+
+# Trigger an immediate on-demand check and upgrade
+curl -s -X POST http://localhost:8080/admin/v1/updater/check \
+  -H "Authorization: Bearer your-admin-secret-key"
+```
+
+#### CLI Subcommand:
+```bash
+# Display aligned status table
+docker exec agy-gateway agy-gateway update status
+
+# Output status in JSON format
+docker exec agy-gateway agy-gateway update status --json
+
+# Trigger manual update check
+docker exec agy-gateway agy-gateway update check
+```
+
+---
+
 ### Interactive Account Management CLI
 
 The gateway includes an interactive Terminal User Interface (TUI) for account CRUD and health tracking.
@@ -275,6 +318,7 @@ docker exec -it agy-gateway agy-accounts
 - `[7] Remove Account`: Permanently delete stored credentials.
 - `[8] Clean Vault Cache`: Purge orphaned tokens and temporary files.
 - `[10] Anthropic Model Aliases & Ranking`: View active model mappings, pin manual overrides, and trigger capability recalculations.
+- `[11] Auto-Updater & Binary Versions`: Inspect active binary paths, check upstream releases, and trigger manual upgrades.
 
 **Non-Interactive Scripting Example:**
 ```bash

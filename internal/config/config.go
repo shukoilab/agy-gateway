@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -17,23 +18,25 @@ import (
 
 // Config represents the top-level unified gateway configuration.
 type Config struct {
-	Server        ServerConfig    `yaml:"server"`
-	Security      SecurityConfig  `yaml:"security"`
-	Binaries      BinariesConfig  `yaml:"binaries"`
-	Execution     ExecutionConfig `yaml:"execution"`
-	Storage       StorageConfig   `yaml:"storage"`
-	Pool          PoolConfig      `yaml:"pool"`
-	Accounts      AccountsConfig  `yaml:"accounts"`
-	Admin         AdminConfig     `yaml:"admin"`
-	OpenAI        OpenAIConfig    `yaml:"openai"`
-	Anthropic     AnthropicConfig `yaml:"anthropic"`
-	Proxy         ProxyConfig     `yaml:"proxy"`
-	MCP           MCPConfig       `yaml:"mcp"`
-	Observability ObsConfig       `yaml:"observability"`
+	Server        ServerConfig     `yaml:"server"`
+	Security      SecurityConfig   `yaml:"security"`
+	Binaries      BinariesConfig   `yaml:"binaries"`
+	Execution     ExecutionConfig  `yaml:"execution"`
+	Storage       StorageConfig    `yaml:"storage"`
+	Pool          PoolConfig       `yaml:"pool"`
+	Accounts      AccountsConfig   `yaml:"accounts"`
+	Admin         AdminConfig      `yaml:"admin"`
+	OpenAI        OpenAIConfig     `yaml:"openai"`
+	Anthropic     AnthropicConfig  `yaml:"anthropic"`
+	Proxy         ProxyConfig      `yaml:"proxy"`
+	AutoUpdate    AutoUpdateConfig `yaml:"auto_update"`
+	MCP           MCPConfig        `yaml:"mcp"`
+	Observability ObsConfig        `yaml:"observability"`
 
 	// Compiled regex patterns for zero-runtime-allocation routing & validation
 	QueryRegex *regexp.Regexp `yaml:"-"`
 	AliasRegex *regexp.Regexp `yaml:"-"`
+	binMu      sync.RWMutex   `yaml:"-"`
 }
 
 type ServerConfig struct {
@@ -196,6 +199,57 @@ func (p *ProxyConfig) EnvSlice() []string {
 	return envs
 }
 
+// AutoUpdateConfig governs the automated background update checking and installation engine.
+type AutoUpdateConfig struct {
+	Enabled        bool                `yaml:"enabled"`
+	Interval       time.Duration       `yaml:"interval"`
+	CheckOnStartup bool                `yaml:"check_on_startup"`
+	BinDir         string              `yaml:"bin_dir"`
+	AgyCLI         AgyCLIUpdateConfig  `yaml:"agy_cli"`
+	AgyAuth        AgyAuthUpdateConfig `yaml:"agy_auth"`
+}
+
+// AgyCLIUpdateConfig defines parameters for updating the Google Antigravity CLI flat binary.
+type AgyCLIUpdateConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	ManifestURL string `yaml:"manifest_url"`
+}
+
+// AgyAuthUpdateConfig defines parameters for updating @fikrilal/agy-auth multi-account CLI.
+type AgyAuthUpdateConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Source      string `yaml:"source"`       // "github" (default) or "npm"
+	ReleaseRepo string `yaml:"release_repo"` // default: "fikrilal/agy-auth"
+}
+
+// GetAgyPath returns the current active path to the agy CLI binary with thread safety.
+func (c *Config) GetAgyPath() string {
+	c.binMu.RLock()
+	defer c.binMu.RUnlock()
+	return c.Binaries.AgyPath
+}
+
+// SetAgyPath safely updates the active path to the agy CLI binary.
+func (c *Config) SetAgyPath(p string) {
+	c.binMu.Lock()
+	defer c.binMu.Unlock()
+	c.Binaries.AgyPath = p
+}
+
+// GetAgyAuthPath returns the current active path to the agy-auth binary with thread safety.
+func (c *Config) GetAgyAuthPath() string {
+	c.binMu.RLock()
+	defer c.binMu.RUnlock()
+	return c.Binaries.AgyAuthPath
+}
+
+// SetAgyAuthPath safely updates the active path to the agy-auth binary.
+func (c *Config) SetAgyAuthPath(p string) {
+	c.binMu.Lock()
+	defer c.binMu.Unlock()
+	c.Binaries.AgyAuthPath = p
+}
+
 type MCPClientToolCallingConfig struct {
 	Enabled                bool   `yaml:"enabled"`
 	DefaultParallel        bool   `yaml:"default_parallel"`
@@ -313,6 +367,21 @@ func DefaultConfig() *Config {
 			HTTPProxy:  "",
 			HTTPSProxy: "",
 			NoProxy:    "localhost,127.0.0.1,::1,agy-net,agy-gateway",
+		},
+		AutoUpdate: AutoUpdateConfig{
+			Enabled:        true,
+			Interval:       6 * time.Hour,
+			CheckOnStartup: true,
+			BinDir:         "/var/lib/agy-gateway/bin",
+			AgyCLI: AgyCLIUpdateConfig{
+				Enabled:     true,
+				ManifestURL: "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests",
+			},
+			AgyAuth: AgyAuthUpdateConfig{
+				Enabled:     true,
+				Source:      "github",
+				ReleaseRepo: "fikrilal/agy-auth",
+			},
 		},
 		MCP: MCPConfig{
 			ClientToolCalling: MCPClientToolCallingConfig{
@@ -690,6 +759,40 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	} else if lp, err := exec.LookPath("agy"); err == nil {
 		cfg.Binaries.AgyPath = lp
+	}
+
+	// 10. Auto-update environment variable overrides
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_ENABLED", "AUTO_UPDATE_ENABLED"); v != "" {
+		cfg.AutoUpdate.Enabled = parseBoolEnv(v, cfg.AutoUpdate.Enabled)
+	}
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_INTERVAL", "AUTO_UPDATE_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.AutoUpdate.Interval = d
+		}
+	}
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_ON_STARTUP", "AUTO_UPDATE_ON_STARTUP"); v != "" {
+		cfg.AutoUpdate.CheckOnStartup = parseBoolEnv(v, cfg.AutoUpdate.CheckOnStartup)
+	}
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_BIN_DIR", "AUTO_UPDATE_BIN_DIR"); v != "" {
+		cfg.AutoUpdate.BinDir = v
+	}
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_AGY_ENABLED", "AUTO_UPDATE_AGY_ENABLED"); v != "" {
+		cfg.AutoUpdate.AgyCLI.Enabled = parseBoolEnv(v, cfg.AutoUpdate.AgyCLI.Enabled)
+	}
+	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_AGY_AUTH_ENABLED", "AUTO_UPDATE_AGY_AUTH_ENABLED"); v != "" {
+		cfg.AutoUpdate.AgyAuth.Enabled = parseBoolEnv(v, cfg.AutoUpdate.AgyAuth.Enabled)
+	}
+
+	// 11. Prioritize auto-updated binaries in BinDir if present and executable
+	if cfg.AutoUpdate.BinDir != "" {
+		overrideAgy := filepath.Join(cfg.AutoUpdate.BinDir, "agy")
+		if info, err := os.Stat(overrideAgy); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+			cfg.Binaries.AgyPath = overrideAgy
+		}
+		overrideAuth := filepath.Join(cfg.AutoUpdate.BinDir, "agy-auth")
+		if info, err := os.Stat(overrideAuth); err == nil && !info.IsDir() && info.Mode()&0111 != 0 {
+			cfg.Binaries.AgyAuthPath = overrideAuth
+		}
 	}
 }
 

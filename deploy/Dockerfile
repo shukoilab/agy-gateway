@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && groupadd --gid 10001 agygw \
     && useradd --uid 10001 --gid 10001 --shell /usr/sbin/nologin --create-home agygw \
     && mkdir -p /etc/agy-gateway \
+                /var/lib/agy-gateway/bin \
                 /var/lib/agy-gateway/vault-xdg \
                 /var/lib/agy-gateway/workers \
                 /var/lib/agy-gateway/tmp \
@@ -47,7 +48,8 @@ COPY config.yaml /etc/agy-gateway/config.yaml
 RUN chmod 0755 /usr/local/bin/agy-gateway /usr/local/bin/agy-accounts /usr/local/bin/agy && \
     chown -R 10001:10001 /etc/agy-gateway /var/lib/agy-gateway
 
-ENV DBUS_SESSION_BUS_ADDRESS="" \
+ENV PATH="/var/lib/agy-gateway/bin:/home/agygw/.local/bin:/usr/local/bin:$PATH" \
+    DBUS_SESSION_BUS_ADDRESS="" \
     AGY_AUTH_NO_UPDATE_CHECK="1" \
     XDG_CONFIG_HOME="/var/lib/agy-gateway/vault-xdg" \
     NODE_USE_ENV_PROXY="1"

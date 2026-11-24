@@ -73,6 +73,10 @@ func NewServer(
 	mux.Handle("DELETE "+adminPrefix+"models/anthropic/aliases/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleDeleteAnthropicAlias)))
 	mux.Handle("POST "+adminPrefix+"models/anthropic/sync", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleSyncAnthropicModels)))
 
+	// Admin - Auto-Updater
+	mux.Handle("GET "+adminPrefix+"updater/status", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleGetUpdaterStatus)))
+	mux.Handle("POST "+adminPrefix+"updater/check", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleTriggerUpdateCheck)))
+
 	// 4. OpenAPI / Swagger Documentation UI (Public / Interactive)
 	mux.HandleFunc("GET /swagger/", httpSwagger.Handler(
 		httpSwagger.URL("/swagger/doc.json"),

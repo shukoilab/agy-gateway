@@ -214,6 +214,28 @@ func (p *Pool) Release(w *Worker) {
 	}()
 }
 
+// MarkAllForRecycle flags all workers in the pool for rolling recycling.
+// Active workers will respawn upon release; idle workers will be recycled as they are acquired or released.
+//
+// @purpose Coordinates seamless transition to an updated agy CLI binary without dropping in-flight requests.
+// @rationale Tainting workers ensures atomic rolling respawn without race conditions or server restart downtime.
+// @preconditions Pool must be initialized.
+// - @param: None.
+// @returns None.
+// @throws None.
+// @invariants Thread-safe via worker atomic flags.
+func (p *Pool) MarkAllForRecycle() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, w := range p.workers {
+		if w != nil {
+			w.TaintedForRecycle.Store(true)
+		}
+	}
+	p.log().Info("all pool workers marked for rolling recreation following binary update")
+}
+
 // Close terminates all workers in the pool.
 func (p *Pool) Close() {
 	p.mu.Lock()

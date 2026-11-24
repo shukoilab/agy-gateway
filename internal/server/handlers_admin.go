@@ -9,6 +9,7 @@ import (
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/config"
 	"agy-gateway/internal/models"
+	"agy-gateway/internal/updater"
 )
 
 // AdminHandlers provides endpoints for the headless Admin Control Plane.
@@ -17,6 +18,7 @@ type AdminHandlers struct {
 	authMgr       *auth.Manager
 	onboard       *auth.OAuthOnboardingManager
 	modelRegistry *models.ModelRegistry
+	updaterSvc    *updater.Service
 }
 
 // NewAdminHandlers creates an AdminHandlers instance.
@@ -25,12 +27,14 @@ func NewAdminHandlers(
 	authMgr *auth.Manager,
 	onboard *auth.OAuthOnboardingManager,
 	modelRegistry *models.ModelRegistry,
+	updaterSvc *updater.Service,
 ) *AdminHandlers {
 	return &AdminHandlers{
 		cfg:           cfg,
 		authMgr:       authMgr,
 		onboard:       onboard,
 		modelRegistry: modelRegistry,
+		updaterSvc:    updaterSvc,
 	}
 }
 
@@ -592,4 +596,59 @@ func (h *AdminHandlers) HandleSyncAnthropicModels(w http.ResponseWriter, r *http
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleGetUpdaterStatus serves GET /admin/v1/updater/status.
+//
+// @Summary      Get auto-updater status
+// @Description  Returns operational telemetry, scheduled intervals, active binary paths, and upstream version status for agy CLI and agy-auth.
+// @Tags         Admin - Auto-Updater
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Success      200  {object}  updater.AutoUpdateStatusResponse  "Auto-updater status payload"
+// @Failure      401  {object}  AdminErrorResponse                "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403  {object}  AdminErrorResponse                "Forbidden: Admin API key is not configured"
+// @Failure      503  {object}  AdminErrorResponse                "Auto-updater service not initialized"
+// @Router       /admin/v1/updater/status [get]
+func (h *AdminHandlers) HandleGetUpdaterStatus(w http.ResponseWriter, r *http.Request) {
+	if h.updaterSvc == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Auto-updater service not initialized"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(h.updaterSvc.GetStatus())
+}
+
+// HandleTriggerUpdateCheck serves POST /admin/v1/updater/check.
+//
+// @Summary      Trigger immediate auto-update check
+// @Description  Queries upstream release repositories immediately and downloads/installs any available updates for agy CLI or agy-auth.
+// @Tags         Admin - Auto-Updater
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Success      200  {object}  updater.CheckResult  "Result of update inspection and installation"
+// @Failure      401  {object}  AdminErrorResponse   "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403  {object}  AdminErrorResponse   "Forbidden: Admin API key is not configured"
+// @Failure      500  {object}  AdminErrorResponse   "Update check or installation encountered errors"
+// @Failure      503  {object}  AdminErrorResponse   "Auto-updater service not initialized"
+// @Router       /admin/v1/updater/check [post]
+func (h *AdminHandlers) HandleTriggerUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	if h.updaterSvc == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Auto-updater service not initialized"})
+		return
+	}
+
+	result, err := h.updaterSvc.CheckAndUpdateAll(r.Context())
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil && (result == nil || len(result.Errors) > 0) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	_ = json.NewEncoder(w).Encode(result)
 }

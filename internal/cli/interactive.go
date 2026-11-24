@@ -84,12 +84,16 @@ func (c *AccountsCLI) RunInteractive(ctx context.Context) error {
 			modelsCLI := NewModelsCLI(c.cfg, c.mgr, nil, c.in, c.out)
 			_ = modelsCLI.RunInteractive(ctx)
 
+		case "11":
+			updaterCLI := NewUpdaterCLI(c.cfg, nil, c.in, c.out)
+			_ = updaterCLI.RunInteractive(ctx)
+
 		case "0", "q", "quit", "exit":
 			fmt.Fprintln(c.out, "Exiting account manager. Goodbye!")
 			return nil
 
 		default:
-			fmt.Fprintf(c.out, "Invalid selection %q. Please enter a number between 0 and 10.\n", choice)
+			fmt.Fprintf(c.out, "Invalid selection %q. Please enter a number between 0 and 11.\n", choice)
 		}
 
 		fmt.Fprintln(c.out, "\nPress Enter to return to menu...")
@@ -116,6 +120,7 @@ Config: `+c.cfg.Storage.VaultXDGConfigDir+` | Storage: `+c.cfg.Storage.BaseDataD
 [8] Clean Vault Cache               (Purge orphaned sessions & stale files)
 [9] View Raw Status / Diagnostics   (Show raw JSON telemetry from agy-auth)
 [10] Anthropic Model Aliases & Rank  (Inspect mappings, pin manual overrides)
+[11] Auto-Updater & Binary Versions (Inspect & update agy CLI / agy-auth)
 [0] Exit
 --------------------------------------------------------------------------------`)
 }

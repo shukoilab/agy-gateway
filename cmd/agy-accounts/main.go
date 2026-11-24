@@ -63,11 +63,19 @@ func main() {
 	// Initial vault sync
 	_ = mgr.Sync(ctx)
 
-	// 5. Run Models CLI if 'models' subcommand requested, otherwise Accounts CLI
+	// 5. Run Models CLI if 'models' subcommand requested, Updater CLI if 'update' requested, otherwise Accounts CLI
 	args := flag.Args()
 	if len(args) > 0 && (args[0] == "models" || args[0] == "model") {
 		modelsCLI := cli.NewModelsCLI(cfg, mgr, nil, os.Stdin, os.Stdout)
 		if err := modelsCLI.Run(ctx, args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(args) > 0 && (args[0] == "update" || args[0] == "updater") {
+		updaterCLI := cli.NewUpdaterCLI(cfg, nil, os.Stdin, os.Stdout)
+		if err := updaterCLI.Run(args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}

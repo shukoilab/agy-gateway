@@ -140,8 +140,31 @@ func (m *Middleware) Recovery(next http.Handler) http.Handler {
 	})
 }
 
+// extractBearerOrRawToken extracts the API token from an Authorization header.
+// It gracefully supports "Bearer <token>", "bearer <token>", and direct raw tokens "<token>".
+//
+// @purpose Normalizes Authorization headers across HTTP clients, OpenAPI/Swagger UI, and CLI tools.
+// @rationale Interactive tools such as Swagger UI frequently populate the Authorization header
+// with the raw token value directly when users paste their API key into the authorization modal.
+// Accepting both standard Bearer scheme and raw tokens ensures seamless developer UX while maintaining
+// strict cryptographic constant-time comparison against configured secrets.
+// @preconditions None.
+// - @param: authHeader Raw Authorization header value.
+// @returns Normalized token string with surrounding whitespace and any leading Bearer prefix stripped.
+// @invariants Memory safe, O(N) where N is header length, thread safe.
+func extractBearerOrRawToken(authHeader string) string {
+	authHeader = strings.TrimSpace(authHeader)
+	if authHeader == "" {
+		return ""
+	}
+	if len(authHeader) >= 7 && strings.EqualFold(authHeader[:7], "bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+	return authHeader
+}
+
 // ClientAuth verifies the client API key against configured security credentials.
-// Supports both Anthropic (x-api-key header) and OpenAI (Authorization: Bearer header) conventions.
+// Supports both Anthropic (x-api-key header) and OpenAI (Authorization: Bearer header or raw token) conventions.
 func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// If no client keys are configured, allow access
@@ -154,13 +177,8 @@ func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 
 		token := strings.TrimSpace(r.Header.Get("x-api-key"))
 		if token == "" {
-			authHeader := r.Header.Get("Authorization")
-			token = strings.TrimPrefix(authHeader, "Bearer ")
-			if token == authHeader {
-				token = ""
-			}
+			token = extractBearerOrRawToken(r.Header.Get("Authorization"))
 		}
-		token = strings.TrimSpace(token)
 
 		if token == "" {
 			if isAnthropic {
@@ -212,7 +230,7 @@ func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 	})
 }
 
-// AdminAuth verifies the Authorization Bearer token strictly against the Admin API key.
+// AdminAuth verifies the Authorization Bearer token or raw key strictly against the Admin API key.
 func (m *Middleware) AdminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		adminKey := m.cfg.Security.AdminAPIKeySecret
@@ -221,8 +239,10 @@ func (m *Middleware) AdminAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		authHeader := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(authHeader, "Bearer ")
+		token := extractBearerOrRawToken(r.Header.Get("Authorization"))
+		if token == "" {
+			token = strings.TrimSpace(r.Header.Get("x-api-key"))
+		}
 		if subtle.ConstantTimeCompare([]byte(token), []byte(adminKey)) != 1 {
 			http.Error(w, `{"error":"Unauthorized admin access"}`, http.StatusUnauthorized)
 			return
