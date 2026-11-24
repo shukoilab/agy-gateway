@@ -49,7 +49,8 @@ RUN chmod 0755 /usr/local/bin/agy-gateway /usr/local/bin/agy-accounts /usr/local
 
 ENV DBUS_SESSION_BUS_ADDRESS="" \
     AGY_AUTH_NO_UPDATE_CHECK="1" \
-    XDG_CONFIG_HOME="/var/lib/agy-gateway/vault-xdg"
+    XDG_CONFIG_HOME="/var/lib/agy-gateway/vault-xdg" \
+    NODE_USE_ENV_PROXY="1"
 
 USER 10001:10001
 EXPOSE 8080

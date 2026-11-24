@@ -75,6 +75,9 @@ func (w *Worker) Start(ctx context.Context) error {
 		"DBUS_SESSION_BUS_ADDRESS=",
 		"AGY_AUTH_NO_UPDATE_CHECK=1",
 	)
+	if proxyEnvs := w.cfg.Proxy.EnvSlice(); len(proxyEnvs) > 0 {
+		env = append(env, proxyEnvs...)
+	}
 
 	proc, err := acp.SpawnProcess(context.Background(), w.cfg.Binaries.AgyPath, args, env, w.Cwd, w.logger)
 	if err != nil {

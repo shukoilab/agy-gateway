@@ -1,0 +1,183 @@
+package anthropic
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+
+	"github.com/google/uuid"
+)
+
+// StreamParser manages chunk-by-chunk demuxing of text and Anthropic tool_use calls.
+//
+// @purpose Buffers incoming ACP text chunks to isolate delimited tool calls (<tool_call>)
+// without leaking delimiter markup into client text deltas.
+// @rationale Ensures zero-semantic-loss and clean streaming for Anthropic clients.
+// @preconditions delimiter must be non-empty.
+type StreamParser struct {
+	delimiter    string
+	openTag      string
+	closeTag     string
+	mu           sync.Mutex
+	buffer       strings.Builder
+	toolIndex    int
+	inTool       bool
+	toolJSONBuf  strings.Builder
+	activeCallID string
+}
+
+// NewStreamParser creates an initialized streaming parser.
+func NewStreamParser(delimiter string) *StreamParser {
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+	return &StreamParser{
+		delimiter: delimiter,
+		openTag:   fmt.Sprintf("<%s>", delimiter),
+		closeTag:  fmt.Sprintf("</%s>", delimiter),
+	}
+}
+
+// ParseChunk processes a raw text chunk and yields either delta text or completed tool_use blocks.
+func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolBlocks []ContentBlock) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	sp.buffer.WriteString(chunk)
+	current := sp.buffer.String()
+
+	for len(current) > 0 {
+		if !sp.inTool {
+			idx := strings.Index(current, sp.openTag)
+			if idx == -1 {
+				// No opening tag; check if trailing part might be a prefix of openTag
+				keepLen := 0
+				for k := len(sp.openTag) - 1; k > 0; k-- {
+					if strings.HasSuffix(current, sp.openTag[:k]) {
+						keepLen = k
+						break
+					}
+				}
+				emitLen := len(current) - keepLen
+				if emitLen > 0 {
+					textDelta += current[:emitLen]
+					current = current[emitLen:]
+				}
+				sp.buffer.Reset()
+				sp.buffer.WriteString(current)
+				return textDelta, toolBlocks
+			}
+
+			// Found opening tag; emit text before tag
+			if idx > 0 {
+				textDelta += current[:idx]
+			}
+			current = current[idx+len(sp.openTag):]
+			sp.inTool = true
+			sp.toolJSONBuf.Reset()
+			sp.activeCallID = fmt.Sprintf("toolu_%s", uuid.New().String()[:12])
+		}
+
+		if sp.inTool {
+			idx := strings.Index(current, sp.closeTag)
+			if idx == -1 {
+				// Still accumulating tool JSON
+				sp.toolJSONBuf.WriteString(current)
+				sp.buffer.Reset()
+				return textDelta, toolBlocks
+			}
+
+			// Tool tag closed
+			sp.toolJSONBuf.WriteString(current[:idx])
+			current = current[idx+len(sp.closeTag):]
+			sp.inTool = false
+
+			fullJSON := sp.toolJSONBuf.String()
+			var parsed struct {
+				ID        string          `json:"id"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(fullJSON), &parsed); err == nil {
+				callID := parsed.ID
+				if callID == "" {
+					callID = sp.activeCallID
+				}
+				if !strings.HasPrefix(callID, "toolu_") {
+					callID = "toolu_" + callID
+				}
+
+				rawInput := parsed.Arguments
+				if len(rawInput) == 0 {
+					rawInput = json.RawMessage("{}")
+				}
+
+				toolBlocks = append(toolBlocks, ContentBlock{
+					Type:  "tool_use",
+					ID:    callID,
+					Name:  parsed.Name,
+					Input: rawInput,
+				})
+				sp.toolIndex++
+			}
+			sp.buffer.Reset()
+			sp.buffer.WriteString(current)
+		}
+	}
+
+	return textDelta, toolBlocks
+}
+
+// ParseCompleteResponse parses a complete completion response for non-streaming mode.
+func ParseCompleteResponse(rawText, delimiter string) (string, []ContentBlock, bool) {
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+
+	openTag := fmt.Sprintf("<%s>", delimiter)
+	closeTag := fmt.Sprintf("</%s>", delimiter)
+
+	pattern := regexp.MustCompile(fmt.Sprintf(`%s([\s\S]*?)%s`, regexp.QuoteMeta(openTag), regexp.QuoteMeta(closeTag)))
+	matches := pattern.FindAllStringSubmatch(rawText, -1)
+
+	if len(matches) == 0 {
+		return rawText, nil, false
+	}
+
+	var toolBlocks []ContentBlock
+	for _, m := range matches {
+		if len(m) > 1 {
+			var parsed struct {
+				ID        string          `json:"id"`
+				Name      string          `json:"name"`
+				Arguments json.RawMessage `json:"arguments"`
+			}
+			if err := json.Unmarshal([]byte(m[1]), &parsed); err == nil {
+				callID := parsed.ID
+				if callID == "" {
+					callID = fmt.Sprintf("toolu_%s", uuid.New().String()[:12])
+				}
+				if !strings.HasPrefix(callID, "toolu_") {
+					callID = "toolu_" + callID
+				}
+
+				rawInput := parsed.Arguments
+				if len(rawInput) == 0 {
+					rawInput = json.RawMessage("{}")
+				}
+
+				toolBlocks = append(toolBlocks, ContentBlock{
+					Type:  "tool_use",
+					ID:    callID,
+					Name:  parsed.Name,
+					Input: rawInput,
+				})
+			}
+		}
+	}
+
+	cleanText := strings.TrimSpace(pattern.ReplaceAllString(rawText, ""))
+	return cleanText, toolBlocks, len(toolBlocks) > 0
+}

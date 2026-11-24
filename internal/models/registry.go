@@ -37,13 +37,17 @@ type ModelInfo struct {
 
 // ModelRegistry provides thread-safe dynamic model discovery and catalog queries.
 type ModelRegistry struct {
-	cfg       *config.Config
-	authMgr   *auth.Manager
-	logger    *slog.Logger
-	mu        sync.RWMutex
-	models    map[string]*ModelInfo
-	modelList []openai.ModelObject
-	lastSync  time.Time
+	cfg             *config.Config
+	authMgr         *auth.Manager
+	modelsDevClient *ModelsDevClient
+	ranker          *ModelRanker
+	aliasStore      *AliasStore
+	logger          *slog.Logger
+	mu              sync.RWMutex
+	models          map[string]*ModelInfo
+	modelList       []openai.ModelObject
+	champions       map[string]*ModelInfo
+	lastSync        time.Time
 }
 
 // NewModelRegistry initializes a new dynamic ModelRegistry.
@@ -51,13 +55,90 @@ func NewModelRegistry(cfg *config.Config, authMgr *auth.Manager, logger *slog.Lo
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ModelRegistry{
-		cfg:       cfg,
-		authMgr:   authMgr,
-		logger:    logger.With("component", "model-registry"),
-		models:    make(map[string]*ModelInfo),
-		modelList: make([]openai.ModelObject, 0),
+
+	vaultDir := ""
+	if cfg != nil && cfg.Storage.VaultXDGConfigDir != "" {
+		vaultDir = cfg.Storage.VaultXDGConfigDir
 	}
+
+	return &ModelRegistry{
+		cfg:             cfg,
+		authMgr:         authMgr,
+		modelsDevClient: NewModelsDevClient(vaultDir, logger),
+		ranker:          NewModelRanker(),
+		aliasStore:      NewAliasStore(vaultDir, logger),
+		logger:          logger.With("component", "model-registry"),
+		models:          make(map[string]*ModelInfo),
+		modelList:       make([]openai.ModelObject, 0),
+		champions:       make(map[string]*ModelInfo),
+	}
+}
+
+// AliasStore returns the underlying thread-safe alias store.
+func (mr *ModelRegistry) AliasStore() *AliasStore {
+	return mr.aliasStore
+}
+
+// ModelsDevClient returns the models.dev client.
+func (mr *ModelRegistry) ModelsDevClient() *ModelsDevClient {
+	return mr.modelsDevClient
+}
+
+// Champions returns the elected model champions.
+func (mr *ModelRegistry) Champions() map[string]*ModelInfo {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	out := make(map[string]*ModelInfo, len(mr.champions))
+	for k, v := range mr.champions {
+		out[k] = v
+	}
+	return out
+}
+
+// RegisterModel adds or updates a model in the registry.
+func (mr *ModelRegistry) RegisterModel(info *ModelInfo) {
+	mr.mu.Lock()
+	defer mr.mu.Unlock()
+
+	mr.models[info.ID] = info
+
+	found := false
+	for i, m := range mr.modelList {
+		if m.ID == info.ID {
+			mr.modelList[i] = openai.ModelObject{
+				ID:              info.ID,
+				Object:          "model",
+				Created:         info.Created,
+				OwnedBy:         info.OwnedBy,
+				ContextWindow:   info.ContextWindow,
+				MaxOutputTokens: info.MaxOutputTokens,
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		mr.modelList = append(mr.modelList, openai.ModelObject{
+			ID:              info.ID,
+			Object:          "model",
+			Created:         info.Created,
+			OwnedBy:         info.OwnedBy,
+			ContextWindow:   info.ContextWindow,
+			MaxOutputTokens: info.MaxOutputTokens,
+		})
+	}
+
+	mr.refreshChampionsLocked()
+}
+
+func (mr *ModelRegistry) refreshChampionsLocked() {
+	if mr.modelsDevClient == nil || mr.ranker == nil || mr.aliasStore == nil {
+		return
+	}
+	catalog := mr.modelsDevClient.GetCatalog(context.Background())
+	mr.champions = mr.ranker.ElectChampions(mr.models, catalog)
+	dynamicAliases := mr.ranker.SynthesizeAliases(mr.champions)
+	mr.aliasStore.SetDynamicAliases(dynamicAliases)
 }
 
 // SyncModels dynamically queries available models from all registered accounts.
@@ -143,7 +224,21 @@ func (mr *ModelRegistry) SyncModels(ctx context.Context) error {
 
 		mr.modelList = list
 		mr.lastSync = time.Now()
-		mr.logger.Info("dynamic model discovery completed", "model_count", len(mr.modelList))
+
+		// Dynamic Ranking and Alias Synthesis
+		catalog := mr.modelsDevClient.GetCatalog(ctx)
+		champions := mr.ranker.ElectChampions(discovered, catalog)
+		mr.champions = champions
+
+		// Synthesize dynamic aliases from elected champions
+		dynamicAliases := mr.ranker.SynthesizeAliases(champions)
+		mr.aliasStore.SetDynamicAliases(dynamicAliases)
+
+		mr.logger.Info("dynamic model discovery completed",
+			"model_count", len(mr.modelList),
+			"champions", len(mr.champions),
+			"dynamic_aliases", len(dynamicAliases),
+		)
 		return nil
 	}
 
@@ -162,23 +257,164 @@ func (mr *ModelRegistry) ListModels() []openai.ModelObject {
 }
 
 // FindModel searches the dynamic registry for a matching model.
+// Resolution order:
+// 1. Manual Admin Overrides & Dynamic Aliases via AliasStore.Resolve(id)
+// 2. Exact match in discovered models
+// 3. Case-insensitive match in discovered models
+// 4. Normalized match (punctuation / dash normalized)
+// 5. Prefix match
+// 6. Graceful cross-family fallback (Claude -> Gemini Flash champion)
 func (mr *ModelRegistry) FindModel(id string) (*ModelInfo, bool) {
 	mr.mu.RLock()
 	defer mr.mu.RUnlock()
 
-	// Exact match
+	// 1. Check AliasStore (Manual Admin Overrides + Dynamic Synthesized Aliases)
+	if target, ok := mr.aliasStore.Resolve(id); ok {
+		if m, exists := mr.models[target]; exists {
+			return m, true
+		}
+		// If target has prefix match in models
+		for _, m := range mr.models {
+			if strings.HasPrefix(m.ID, target) {
+				return m, true
+			}
+		}
+	}
+
+	// 2. Exact match
 	if m, exists := mr.models[id]; exists {
 		return m, true
 	}
 
-	// Case-insensitive match
+	// 3. Case-insensitive match
 	for _, m := range mr.models {
 		if strings.EqualFold(m.ID, id) {
 			return m, true
 		}
 	}
 
+	// 4. Normalized match
+	normID := NormalizeAlias(id)
+	if target, ok := mr.aliasStore.Resolve(normID); ok {
+		if m, exists := mr.models[target]; exists {
+			return m, true
+		}
+	}
+	for _, m := range mr.models {
+		if NormalizeAlias(m.ID) == normID {
+			return m, true
+		}
+	}
+
+	// 5. Prefix match
+	for _, m := range mr.models {
+		if strings.HasPrefix(m.ID, normID) || strings.HasPrefix(normID, m.ID) {
+			return m, true
+		}
+	}
+
+	// 6. Family & Cross-Family Fallback for Claude models:
+	if strings.Contains(normID, "claude") || strings.Contains(normID, "sonnet") || strings.Contains(normID, "haiku") || strings.Contains(normID, "opus") {
+		// 6a. Try finding a model within the same Claude sub-family
+		if strings.Contains(normID, "sonnet") {
+			if champ, ok := mr.champions["claude-sonnet"]; ok && champ != nil {
+				return champ, true
+			}
+			for _, m := range mr.models {
+				if strings.Contains(m.ID, "sonnet") {
+					return m, true
+				}
+			}
+		}
+		if strings.Contains(normID, "haiku") {
+			if champ, ok := mr.champions["claude-haiku"]; ok && champ != nil {
+				return champ, true
+			}
+			for _, m := range mr.models {
+				if strings.Contains(m.ID, "haiku") {
+					return m, true
+				}
+			}
+		}
+		if strings.Contains(normID, "opus") {
+			if champ, ok := mr.champions["claude-opus"]; ok && champ != nil {
+				return champ, true
+			}
+			for _, m := range mr.models {
+				if strings.Contains(m.ID, "opus") {
+					return m, true
+				}
+			}
+		}
+
+		// 6b. Try any available Claude model
+		for _, m := range mr.models {
+			if strings.Contains(m.ID, "claude") {
+				return m, true
+			}
+		}
+
+		// 6c. Graceful cross-family fallback to Gemini Flash champion when accounts have zero Claude models
+		if champ, ok := mr.champions["gemini-flash"]; ok && champ != nil {
+			mr.logger.Warn("cross-family fallback: routing Claude request to Gemini Flash champion", "requested", id, "target", champ.ID)
+			return champ, true
+		}
+		for _, m := range mr.models {
+			if strings.HasPrefix(m.ID, "gemini") {
+				mr.logger.Warn("cross-family fallback: routing Claude request to discovered Gemini model", "requested", id, "target", m.ID)
+				return m, true
+			}
+		}
+	}
+
 	return nil, false
+}
+
+// AnthropicDefaultModel returns the default model ID for Anthropic requests.
+func (mr *ModelRegistry) AnthropicDefaultModel() string {
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+
+	// 1. Config override
+	if mr.cfg != nil && mr.cfg.Anthropic.DefaultModel != "" {
+		cfgTarget := mr.cfg.Anthropic.DefaultModel
+		if _, exists := mr.models[cfgTarget]; exists {
+			return cfgTarget
+		}
+		if target, ok := mr.aliasStore.Resolve(cfgTarget); ok {
+			if _, exists := mr.models[target]; exists {
+				return target
+			}
+		}
+	}
+
+	// 2. Alias store "default" alias
+	if target, ok := mr.aliasStore.Resolve("default"); ok {
+		if _, exists := mr.models[target]; exists {
+			return target
+		}
+	}
+
+	// 3. Elected Champions in preference order: Sonnet -> Haiku -> Opus -> Flash
+	for _, fam := range []string{"claude-sonnet", "claude-haiku", "claude-opus", "gemini-flash"} {
+		if champ, ok := mr.champions[fam]; ok && champ != nil {
+			return champ.ID
+		}
+	}
+
+	// 4. Fallback search among discovered models
+	for _, id := range []string{"claude-3-5-sonnet", "claude-3-sonnet", "claude-3-5-haiku", "gemini-3.8-flash"} {
+		if _, exists := mr.models[id]; exists {
+			return id
+		}
+	}
+
+	// 5. First discovered model
+	if len(mr.modelList) > 0 {
+		return mr.modelList[0].ID
+	}
+
+	return "claude-3-5-sonnet"
 }
 
 // DefaultModel returns the default model ID from configuration or the first discovered model.

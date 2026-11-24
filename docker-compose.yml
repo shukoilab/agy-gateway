@@ -21,6 +21,20 @@ services:
       - AGY_GW_DEFAULT_MODEL=${AGY_GW_DEFAULT_MODEL:-gemini-3.8-flash}
       - AGY_GW_DEFAULT_REASONING_EFFORT=${AGY_GW_DEFAULT_REASONING_EFFORT:-medium}
       - AGY_AUTH_NO_UPDATE_CHECK=1
+      # Outbound Proxy Configuration (Optional - Docker layer & container egress)
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,::1,agy-net,agy-gateway}
+      - http_proxy=${http_proxy:-${HTTP_PROXY:-}}
+      - https_proxy=${https_proxy:-${HTTPS_PROXY:-}}
+      - no_proxy=${no_proxy:-${NO_PROXY:-localhost,127.0.0.1,::1,agy-net,agy-gateway}}
+      - ALL_PROXY=${ALL_PROXY:-}
+      - all_proxy=${all_proxy:-${ALL_PROXY:-}}
+      - AGY_GW_PROXY_ENABLED=${AGY_GW_PROXY_ENABLED:-}
+      - AGY_GW_PROXY_HTTP_PROXY=${AGY_GW_PROXY_HTTP_PROXY:-}
+      - AGY_GW_PROXY_HTTPS_PROXY=${AGY_GW_PROXY_HTTPS_PROXY:-}
+      - AGY_GW_PROXY_NO_PROXY=${AGY_GW_PROXY_NO_PROXY:-}
+      - NODE_USE_ENV_PROXY=1
     volumes:
       - agy-vault-data:/var/lib/agy-gateway/vault-xdg
       - agy-workspaces:/var/lib/agy-gateway/workspaces

@@ -82,6 +82,17 @@ openai:
   default_reasoning_effort: "medium"
   expose_reasoning_content: true
 
+anthropic:
+  default_model: "claude-3-5-sonnet"
+  default_max_tokens: 4096
+  expose_reasoning_content: true
+
+proxy:
+  enabled: false
+  http_proxy: ""
+  https_proxy: ""
+  no_proxy: "localhost,127.0.0.1,::1,agy-net,agy-gateway"
+
 mcp:
   client_tool_calling:
     enabled: true

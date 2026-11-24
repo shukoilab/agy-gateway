@@ -30,7 +30,7 @@ func (c *AccountsCLI) RunInteractive(ctx context.Context) error {
 		}
 
 		c.printHeader()
-		fmt.Fprint(c.out, "Select an option [0-9]: ")
+		fmt.Fprint(c.out, "Select an option [0-10]: ")
 
 		line, err := reader.ReadString('\n')
 		if err != nil {
@@ -80,12 +80,16 @@ func (c *AccountsCLI) RunInteractive(ctx context.Context) error {
 				fmt.Fprintf(c.out, "Error fetching status: %v\n", err)
 			}
 
+		case "10":
+			modelsCLI := NewModelsCLI(c.cfg, c.mgr, nil, c.in, c.out)
+			_ = modelsCLI.RunInteractive(ctx)
+
 		case "0", "q", "quit", "exit":
 			fmt.Fprintln(c.out, "Exiting account manager. Goodbye!")
 			return nil
 
 		default:
-			fmt.Fprintf(c.out, "Invalid selection %q. Please enter a number between 0 and 9.\n", choice)
+			fmt.Fprintf(c.out, "Invalid selection %q. Please enter a number between 0 and 10.\n", choice)
 		}
 
 		fmt.Fprintln(c.out, "\nPress Enter to return to menu...")
@@ -111,6 +115,7 @@ Config: `+c.cfg.Storage.VaultXDGConfigDir+` | Storage: `+c.cfg.Storage.BaseDataD
 [7] Remove Account                  (Delete account credentials permanently)
 [8] Clean Vault Cache               (Purge orphaned sessions & stale files)
 [9] View Raw Status / Diagnostics   (Show raw JSON telemetry from agy-auth)
+[10] Anthropic Model Aliases & Rank  (Inspect mappings, pin manual overrides)
 [0] Exit
 --------------------------------------------------------------------------------`)
 }

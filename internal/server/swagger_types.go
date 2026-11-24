@@ -2,6 +2,8 @@ package server
 
 import (
 	"time"
+
+	"agy-gateway/internal/models"
 )
 
 // SwitchAccountRequest defines the payload for switching the default active Antigravity account.
@@ -102,4 +104,42 @@ type AdminErrorResponse struct {
 	Error string `json:"error" example:"Account not found"`
 	// Optional query parameter or account identifier that caused the error
 	Query string `json:"query,omitempty" example:"work-account"`
+}
+
+// SetModelAliasRequest defines the payload for setting or updating a manual Anthropic model alias.
+//
+//	@purpose	Encapsulates the target model mapping and optional human description.
+type SetModelAliasRequest struct {
+	// Canonical alias or requested model identifier (e.g. "claude-3-7-sonnet")
+	Alias string `json:"alias" example:"claude-3-7-sonnet"`
+	// Target model discovered from accounts to route requests to (e.g. "claude-sonnet-4-6")
+	Target string `json:"target" example:"claude-sonnet-4-6"`
+	// Optional description or rationale for this manual mapping override
+	Description string `json:"description,omitempty" example:"Manual override pinned to Sonnet 4.6"`
+}
+
+// AnthropicAliasesResponse describes the response listing all active Anthropic model aliases and champions.
+//
+//	@purpose	Reports manual overrides, dynamic synthesized aliases, and family champions.
+type AnthropicAliasesResponse struct {
+	// Total count of active model aliases
+	Total int `json:"total" example:"12"`
+	// Elected family champions mapped to discovered models
+	Champions map[string]string `json:"champions"`
+	// Active model aliases sorted with manual overrides first
+	Aliases []models.ModelAliasEntry `json:"aliases"`
+}
+
+// ModelSyncResponse reports the result of triggering a dynamic model discovery and alias sync.
+//
+//	@purpose	Summarizes discovered model counts, elected champions, and synthesized aliases.
+type ModelSyncResponse struct {
+	// Status outcome indicator (e.g. "synchronized")
+	Status string `json:"status" example:"synchronized"`
+	// Number of unique models discovered across accounts
+	DiscoveredModels int `json:"discovered_models" example:"6"`
+	// Total count of active aliases (manual + dynamic)
+	TotalAliases int `json:"total_aliases" example:"12"`
+	// Elected family champions
+	Champions map[string]string `json:"champions"`
 }

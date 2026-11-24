@@ -25,6 +25,7 @@ type Server struct {
 func NewServer(
 	cfg *config.Config,
 	openaiHandlers *OpenAIHandlers,
+	anthropicHandlers *AnthropicHandlers,
 	adminHandlers *AdminHandlers,
 	opsHandlers *OpsHandlers,
 	logger *slog.Logger,
@@ -46,6 +47,11 @@ func NewServer(
 	mux.Handle("GET /v1/models", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleListModels)))
 	mux.Handle("GET /v1/models/", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleGetModel)))
 
+	// 3. Anthropic Messages Endpoint (Protected by ClientAuth with dual-header support)
+	if anthropicHandlers != nil {
+		mux.Handle("POST /v1/messages", mw.ClientAuth(http.HandlerFunc(anthropicHandlers.HandleMessages)))
+	}
+
 	// 3. Admin Control Plane Endpoints (Protected by AdminAuth)
 	adminPrefix := "/admin/v1/"
 	mux.Handle(adminPrefix+"accounts", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleListAccounts)))
@@ -59,6 +65,13 @@ func NewServer(
 	mux.Handle(adminPrefix+"accounts/login/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleLoginStatus)))
 	mux.Handle(adminPrefix+"vault/status", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultStatus)))
 	mux.Handle(adminPrefix+"vault/clean", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleVaultClean)))
+
+	// Admin - Anthropic Models & Aliases
+	mux.Handle("GET "+adminPrefix+"models/anthropic/aliases", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleListAnthropicAliases)))
+	mux.Handle("POST "+adminPrefix+"models/anthropic/aliases", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleSetAnthropicAlias)))
+	mux.Handle("DELETE "+adminPrefix+"models/anthropic/aliases/{alias}", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleDeleteAnthropicAlias)))
+	mux.Handle("DELETE "+adminPrefix+"models/anthropic/aliases/", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleDeleteAnthropicAlias)))
+	mux.Handle("POST "+adminPrefix+"models/anthropic/sync", mw.AdminAuth(http.HandlerFunc(adminHandlers.HandleSyncAnthropicModels)))
 
 	// 4. OpenAPI / Swagger Documentation UI (Public / Interactive)
 	mux.HandleFunc("GET /swagger/", httpSwagger.Handler(

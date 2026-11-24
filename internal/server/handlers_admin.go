@@ -393,3 +393,203 @@ func (h *AdminHandlers) HandleVaultClean(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(data)
 }
+
+// HandleListAnthropicAliases serves GET /admin/v1/models/anthropic/aliases.
+//
+// @Summary      List active Anthropic model aliases and champions
+// @Description  Returns all manual admin overrides, dynamic synthesized aliases, and family champions (Sonnet, Haiku, Opus, Flash).
+// @Tags         Admin - Anthropic Models
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Success      200  {object}  AnthropicAliasesResponse "Active model aliases and champion rankings"
+// @Failure      401  {object}  AdminErrorResponse       "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403  {object}  AdminErrorResponse       "Forbidden: Admin API key is not configured"
+// @Failure      500  {object}  AdminErrorResponse       "Model registry not initialized"
+// @Router       /admin/v1/models/anthropic/aliases [get]
+func (h *AdminHandlers) HandleListAnthropicAliases(w http.ResponseWriter, r *http.Request) {
+	if h.modelRegistry == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Model registry not initialized"})
+		return
+	}
+
+	aliases := h.modelRegistry.AliasStore().GetAllAliases()
+	championsMap := make(map[string]string)
+	for fam, info := range h.modelRegistry.Champions() {
+		if info != nil {
+			championsMap[fam] = info.ID
+		}
+	}
+
+	resp := AnthropicAliasesResponse{
+		Total:     len(aliases),
+		Champions: championsMap,
+		Aliases:   aliases,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleSetAnthropicAlias serves POST /admin/v1/models/anthropic/aliases.
+//
+// @Summary      Create or override a manual Anthropic model alias
+// @Description  Registers a permanent manual alias override in the vault ($VAULT_DIR/anthropic-model-aliases.json). Takes precedence over dynamic synthesized aliases.
+// @Tags         Admin - Anthropic Models
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Param        request  body      SetModelAliasRequest  true  "Alias mapping specification"
+// @Success      200      {object}  StatusResponse        "Confirmation of saved alias"
+// @Failure      400      {object}  AdminErrorResponse    "Invalid request parameters"
+// @Failure      401      {object}  AdminErrorResponse    "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403      {object}  AdminErrorResponse    "Forbidden: Admin API key is not configured"
+// @Failure      500      {object}  AdminErrorResponse    "Failed to persist alias"
+// @Router       /admin/v1/models/anthropic/aliases [post]
+func (h *AdminHandlers) HandleSetAnthropicAlias(w http.ResponseWriter, r *http.Request) {
+	if h.modelRegistry == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Model registry not initialized"})
+		return
+	}
+
+	var req SetModelAliasRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Invalid JSON payload: " + err.Error()})
+		return
+	}
+
+	req.Alias = strings.TrimSpace(req.Alias)
+	req.Target = strings.TrimSpace(req.Target)
+	if req.Alias == "" || req.Target == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Fields 'alias' and 'target' are required"})
+		return
+	}
+
+	if err := h.modelRegistry.AliasStore().SetManual(req.Alias, req.Target, req.Description); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Failed to persist alias: " + err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(StatusResponse{
+		Status: "configured",
+		Target: req.Alias + " -> " + req.Target,
+	})
+}
+
+// HandleDeleteAnthropicAlias serves DELETE /admin/v1/models/anthropic/aliases/{alias}.
+//
+// @Summary      Delete a manual Anthropic model alias override
+// @Description  Removes a manual alias override from the persistent vault, restoring dynamic capability-based routing for that alias.
+// @Tags         Admin - Anthropic Models
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Param        alias  path      string              true  "Alias identifier to delete (e.g. claude-3-7-sonnet)"
+// @Success      200    {object}  StatusResponse      "Confirmation of removed alias"
+// @Failure      400    {object}  AdminErrorResponse  "Missing alias identifier"
+// @Failure      401    {object}  AdminErrorResponse  "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403    {object}  AdminErrorResponse  "Forbidden: Admin API key is not configured"
+// @Failure      404    {object}  AdminErrorResponse  "Manual alias override not found"
+// @Failure      500    {object}  AdminErrorResponse  "Failed to delete alias"
+// @Router       /admin/v1/models/anthropic/aliases/{alias} [delete]
+func (h *AdminHandlers) HandleDeleteAnthropicAlias(w http.ResponseWriter, r *http.Request) {
+	if h.modelRegistry == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Model registry not initialized"})
+		return
+	}
+
+	alias := r.PathValue("alias")
+	if alias == "" {
+		prefix := "/admin/v1/models/anthropic/aliases/"
+		if strings.HasPrefix(r.URL.Path, prefix) {
+			alias = strings.TrimPrefix(r.URL.Path, prefix)
+		}
+	}
+	alias = strings.TrimSpace(alias)
+	if alias == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Missing alias parameter in path"})
+		return
+	}
+
+	deleted, err := h.modelRegistry.AliasStore().DeleteManual(alias)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Failed to delete alias: " + err.Error()})
+		return
+	}
+
+	if !deleted {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Manual alias override not found", Query: alias})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(StatusResponse{
+		Status: "deleted",
+		Target: alias,
+	})
+}
+
+// HandleSyncAnthropicModels serves POST /admin/v1/models/anthropic/sync.
+//
+// @Summary      Trigger dynamic Anthropic model discovery and ranking
+// @Description  Queries models dynamically from all accounts and refreshes intelligence from models.dev, electing new family champions and updating synthesized aliases.
+// @Tags         Admin - Anthropic Models
+// @Accept       json
+// @Produce      json
+// @Security     AdminBearerAuth
+// @Success      200  {object}  ModelSyncResponse   "Summary of synchronized models and champions"
+// @Failure      401  {object}  AdminErrorResponse  "Unauthorized: missing or invalid Admin Bearer token"
+// @Failure      403  {object}  AdminErrorResponse  "Forbidden: Admin API key is not configured"
+// @Failure      500  {object}  AdminErrorResponse  "Sync failed"
+// @Router       /admin/v1/models/anthropic/sync [post]
+func (h *AdminHandlers) HandleSyncAnthropicModels(w http.ResponseWriter, r *http.Request) {
+	if h.modelRegistry == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Model registry not initialized"})
+		return
+	}
+
+	if err := h.modelRegistry.SyncModels(r.Context()); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: "Model sync failed: " + err.Error()})
+		return
+	}
+
+	championsMap := make(map[string]string)
+	for fam, info := range h.modelRegistry.Champions() {
+		if info != nil {
+			championsMap[fam] = info.ID
+		}
+	}
+
+	resp := ModelSyncResponse{
+		Status:           "synchronized",
+		DiscoveredModels: len(h.modelRegistry.ListModels()),
+		TotalAliases:     len(h.modelRegistry.AliasStore().GetAllAliases()),
+		Champions:        championsMap,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}

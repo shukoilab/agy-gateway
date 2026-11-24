@@ -47,6 +47,17 @@ func NewPool(ctx context.Context, cfg *config.Config, authMgr *auth.Manager, log
 	return p, nil
 }
 
+// NewTestPoolWithWorker initializes a pool wrapping a pre-configured worker for integration testing.
+func NewTestPoolWithWorker(worker *Worker, cfg *config.Config) *Pool {
+	p := &Pool{
+		cfg:     cfg,
+		leaseCh: make(chan *Worker, 1),
+		workers: []*Worker{worker},
+	}
+	p.leaseCh <- worker
+	return p
+}
+
 func (p *Pool) log() *slog.Logger {
 	if p.logger == nil {
 		return slog.Default()

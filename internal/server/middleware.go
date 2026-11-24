@@ -94,7 +94,7 @@ func (m *Middleware) CORS(next http.Handler) http.Handler {
 		if allowedOrigin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Request-ID, User-Agent")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Accept, X-Request-ID, User-Agent, x-api-key, anthropic-version, anthropic-beta")
 			w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Content-Length")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 			if allowedOrigin != "*" {
@@ -140,7 +140,8 @@ func (m *Middleware) Recovery(next http.Handler) http.Handler {
 	})
 }
 
-// ClientAuth verifies the Authorization Bearer token against configured client API keys.
+// ClientAuth verifies the client API key against configured security credentials.
+// Supports both Anthropic (x-api-key header) and OpenAI (Authorization: Bearer header) conventions.
 func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// If no client keys are configured, allow access
@@ -149,9 +150,26 @@ func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 			return
 		}
 
-		authHeader := r.Header.Get("Authorization")
-		token := strings.TrimPrefix(authHeader, "Bearer ")
-		if token == "" || token == authHeader {
+		isAnthropic := strings.HasPrefix(r.URL.Path, "/v1/messages")
+
+		token := strings.TrimSpace(r.Header.Get("x-api-key"))
+		if token == "" {
+			authHeader := r.Header.Get("Authorization")
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+			if token == authHeader {
+				token = ""
+			}
+		}
+		token = strings.TrimSpace(token)
+
+		if token == "" {
+			if isAnthropic {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("anthropic-version", "2023-06-01")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"Missing or invalid x-api-key or Bearer token"}}`))
+				return
+			}
 			http.Error(w, `{"error":{"message":"Missing or invalid Bearer token","type":"invalid_request_error"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -166,12 +184,26 @@ func (m *Middleware) ClientAuth(next http.Handler) http.Handler {
 		}
 
 		if matchedKey == nil {
+			if isAnthropic {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("anthropic-version", "2023-06-01")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"authentication_error","message":"Incorrect API key provided"}}`))
+				return
+			}
 			http.Error(w, `{"error":{"message":"Incorrect API key provided","type":"invalid_request_error"}}`, http.StatusUnauthorized)
 			return
 		}
 
 		// Enforce fixed-slot rate limiting if configured
 		if matchedKey.RateLimitRPM > 0 && !m.allowRateLimit(matchedKey.ID, matchedKey.RateLimitRPM) {
+			if isAnthropic {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("anthropic-version", "2023-06-01")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = w.Write([]byte(`{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}`))
+				return
+			}
 			http.Error(w, `{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}`, http.StatusTooManyRequests)
 			return
 		}

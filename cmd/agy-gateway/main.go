@@ -59,6 +59,12 @@ func main() {
 		return
 	}
 
+	// Direct delegation if invoked as 'agy-gateway models [subcommand]'
+	if len(os.Args) > 1 && (os.Args[1] == "models" || os.Args[1] == "model") {
+		runModelsSubcommand(os.Args[2:])
+		return
+	}
+
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
 	healthcheck := flag.Bool("healthcheck", false, "Run local HTTP health check probe and exit")
 	showVersion := flag.Bool("version", false, "Print version and exit")
@@ -154,10 +160,11 @@ func main() {
 
 	// 9. Wire HTTP handlers and server
 	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
+	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, logger)
 	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry)
 	opsHandlers := server.NewOpsHandlers()
 
-	srv := server.NewServer(cfg, openaiHandlers, adminHandlers, opsHandlers, logger)
+	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, logger)
 
 	// 10. Intercept OS shutdown signals
 	sigCh := make(chan os.Signal, 1)
@@ -271,6 +278,44 @@ func runAccountsSubcommand(args []string) {
 
 	accountsCLI := cli.NewAccountsCLI(cfg, mgr, nil, os.Stdin, os.Stdout)
 	if err := accountsCLI.Run(ctx, args); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// @purpose: Runs the Anthropic models management CLI subcommand.
+// @rationale: Provides a CLI interface for inspecting models, rankings, and managing aliases.
+// @preconditions: None.
+// - @param: args ([]string) - Subcommand arguments passed after "models".
+// - @returns: None (terminates or returns upon command completion).
+// - @throws: os.Exit(1) on fatal config or execution failures.
+// - @invariants: Cleans up signal notifications and I/O descriptors. Thread-safe.
+func runModelsSubcommand(args []string) {
+	configPath := "config.yaml"
+	if _, err := os.Stat("/etc/agy-gateway/config.yaml"); err == nil {
+		configPath = "/etc/agy-gateway/config.yaml"
+	}
+	for i, arg := range args {
+		if arg == "-config" && i+1 < len(args) {
+			configPath = args[i+1]
+		}
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: Config load failed: %v\n", err)
+		os.Exit(1)
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+	mgr := auth.NewManager(cfg, logger)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	_ = mgr.Sync(ctx)
+
+	mr := models.NewModelRegistry(cfg, mgr, logger)
+	modelsCLI := cli.NewModelsCLI(cfg, mgr, mr, os.Stdin, os.Stdout)
+	if err := modelsCLI.Run(ctx, args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}

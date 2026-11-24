@@ -558,12 +558,16 @@ func (m *Manager) ExecAgy(ctx context.Context, homeDir string, args ...string) (
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyPath, args...)
-		cmd.Env = append(os.Environ(),
+		env := append(os.Environ(),
 			fmt.Sprintf("HOME=%s", homeDir),
 			fmt.Sprintf("XDG_CONFIG_HOME=%s", filepath.Join(homeDir, ".config")),
 			"DBUS_SESSION_BUS_ADDRESS=",
 			"AGY_AUTH_NO_UPDATE_CHECK=1",
 		)
+		if proxyEnvs := m.cfg.Proxy.EnvSlice(); len(proxyEnvs) > 0 {
+			env = append(env, proxyEnvs...)
+		}
+		cmd.Env = env
 
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -601,11 +605,15 @@ func (m *Manager) execAgyAuth(ctx context.Context, args ...string) ([]byte, erro
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		cmd := exec.CommandContext(ctx, m.cfg.Binaries.AgyAuthPath, args...)
-		cmd.Env = append(os.Environ(),
+		env := append(os.Environ(),
 			fmt.Sprintf("XDG_CONFIG_HOME=%s", m.cfg.Storage.VaultXDGConfigDir),
 			"AGY_AUTH_NO_UPDATE_CHECK=1",
 			"DBUS_SESSION_BUS_ADDRESS=",
 		)
+		if proxyEnvs := m.cfg.Proxy.EnvSlice(); len(proxyEnvs) > 0 {
+			env = append(env, proxyEnvs...)
+		}
+		cmd.Env = env
 
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout

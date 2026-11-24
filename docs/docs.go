@@ -517,6 +517,226 @@ const docTemplate = `{
                 }
             }
         },
+        "/admin/v1/models/anthropic/aliases": {
+            "get": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Returns all manual admin overrides, dynamic synthesized aliases, and family champions (Sonnet, Haiku, Opus, Flash).",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Anthropic Models"
+                ],
+                "summary": "List active Anthropic model aliases and champions",
+                "responses": {
+                    "200": {
+                        "description": "Active model aliases and champion rankings",
+                        "schema": {
+                            "$ref": "#/definitions/server.AnthropicAliasesResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Model registry not initialized",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            },
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Registers a permanent manual alias override in the vault ($VAULT_DIR/anthropic-model-aliases.json). Takes precedence over dynamic synthesized aliases.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Anthropic Models"
+                ],
+                "summary": "Create or override a manual Anthropic model alias",
+                "parameters": [
+                    {
+                        "description": "Alias mapping specification",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/server.SetModelAliasRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Confirmation of saved alias",
+                        "schema": {
+                            "$ref": "#/definitions/server.StatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid request parameters",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Failed to persist alias",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/v1/models/anthropic/aliases/{alias}": {
+            "delete": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Removes a manual alias override from the persistent vault, restoring dynamic capability-based routing for that alias.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Anthropic Models"
+                ],
+                "summary": "Delete a manual Anthropic model alias override",
+                "parameters": [
+                    {
+                        "type": "string",
+                        "description": "Alias identifier to delete (e.g. claude-3-7-sonnet)",
+                        "name": "alias",
+                        "in": "path",
+                        "required": true
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Confirmation of removed alias",
+                        "schema": {
+                            "$ref": "#/definitions/server.StatusResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Missing alias identifier",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Manual alias override not found",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Failed to delete alias",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
+        "/admin/v1/models/anthropic/sync": {
+            "post": {
+                "security": [
+                    {
+                        "AdminBearerAuth": []
+                    }
+                ],
+                "description": "Queries models dynamically from all accounts and refreshes intelligence from models.dev, electing new family champions and updating synthesized aliases.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json"
+                ],
+                "tags": [
+                    "Admin - Anthropic Models"
+                ],
+                "summary": "Trigger dynamic Anthropic model discovery and ranking",
+                "responses": {
+                    "200": {
+                        "description": "Summary of synchronized models and champions",
+                        "schema": {
+                            "$ref": "#/definitions/server.ModelSyncResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Unauthorized: missing or invalid Admin Bearer token",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "403": {
+                        "description": "Forbidden: Admin API key is not configured",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Sync failed",
+                        "schema": {
+                            "$ref": "#/definitions/server.AdminErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/admin/v1/vault/clean": {
             "post": {
                 "security": [
@@ -757,6 +977,76 @@ const docTemplate = `{
                 }
             }
         },
+        "/v1/messages": {
+            "post": {
+                "security": [
+                    {
+                        "ClientBearerAuth": []
+                    }
+                ],
+                "description": "Creates a structured message response for conversational turns. 100% compliant with Anthropic Messages API (2026 standard). Supports streaming SSE (stream: true), multi-turn conversation history, real-time reasoning (extended thinking), client-side tool calling with JIT prompt envelope translation, and automated multi-account failover.",
+                "consumes": [
+                    "application/json"
+                ],
+                "produces": [
+                    "application/json",
+                    "text/event-stream"
+                ],
+                "tags": [
+                    "Anthropic - Messages"
+                ],
+                "summary": "Create message",
+                "parameters": [
+                    {
+                        "description": "Anthropic Messages request parameters including model, messages, tools, and thinking preferences",
+                        "name": "request",
+                        "in": "body",
+                        "required": true,
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.MessageRequest"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Message generated successfully (non-streaming mode)",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.MessageResponse"
+                        }
+                    },
+                    "400": {
+                        "description": "Invalid JSON body, missing parameters, or validation violation",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.ErrorResponse"
+                        }
+                    },
+                    "401": {
+                        "description": "Missing, expired, or invalid API key",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.ErrorResponse"
+                        }
+                    },
+                    "404": {
+                        "description": "Requested model identifier was not found in catalog",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.ErrorResponse"
+                        }
+                    },
+                    "429": {
+                        "description": "Client rate limit exceeded (RPM) or all accounts in cooldown",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.ErrorResponse"
+                        }
+                    },
+                    "500": {
+                        "description": "Internal gateway error or failure executing turn across workers",
+                        "schema": {
+                            "$ref": "#/definitions/anthropic.ErrorResponse"
+                        }
+                    }
+                }
+            }
+        },
         "/v1/models": {
             "get": {
                 "security": [
@@ -848,6 +1138,267 @@ const docTemplate = `{
         }
     },
     "definitions": {
+        "anthropic.ContentBlock": {
+            "type": "object",
+            "properties": {
+                "content": {},
+                "data": {
+                    "type": "string"
+                },
+                "id": {
+                    "type": "string",
+                    "example": "toolu_01Abc..."
+                },
+                "input": {
+                    "type": "object"
+                },
+                "is_error": {
+                    "type": "boolean"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "get_weather"
+                },
+                "signature": {
+                    "type": "string",
+                    "example": "EqQBCgIYAhIM1gbcDa9GJwZA2b3h..."
+                },
+                "source": {
+                    "$ref": "#/definitions/anthropic.ImageSource"
+                },
+                "text": {
+                    "type": "string",
+                    "example": "Hello world"
+                },
+                "thinking": {
+                    "type": "string",
+                    "example": "Let's evaluate the requested operation..."
+                },
+                "tool_use_id": {
+                    "type": "string",
+                    "example": "toolu_01Abc..."
+                },
+                "type": {
+                    "description": "\"text\", \"image\", \"tool_use\", \"tool_result\", \"thinking\", \"redacted_thinking\"",
+                    "type": "string",
+                    "example": "text"
+                }
+            }
+        },
+        "anthropic.ErrorDetails": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "example": "Missing required field: max_tokens"
+                },
+                "type": {
+                    "type": "string",
+                    "example": "invalid_request_error"
+                }
+            }
+        },
+        "anthropic.ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "$ref": "#/definitions/anthropic.ErrorDetails"
+                },
+                "type": {
+                    "type": "string",
+                    "example": "error"
+                }
+            }
+        },
+        "anthropic.ImageSource": {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "string"
+                },
+                "media_type": {
+                    "type": "string",
+                    "example": "image/jpeg"
+                },
+                "type": {
+                    "description": "\"base64\" or \"url\"",
+                    "type": "string",
+                    "example": "base64"
+                },
+                "url": {
+                    "type": "string"
+                }
+            }
+        },
+        "anthropic.Message": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "example": "Hello, Claude!"
+                },
+                "role": {
+                    "description": "\"user\" or \"assistant\"",
+                    "type": "string",
+                    "example": "user"
+                }
+            }
+        },
+        "anthropic.MessageRequest": {
+            "type": "object",
+            "properties": {
+                "max_tokens": {
+                    "type": "integer",
+                    "example": 4096
+                },
+                "messages": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/anthropic.Message"
+                    }
+                },
+                "metadata": {
+                    "$ref": "#/definitions/anthropic.RequestMetadata"
+                },
+                "model": {
+                    "type": "string",
+                    "example": "claude-3-5-sonnet-20241022"
+                },
+                "stop_sequences": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
+                },
+                "stream": {
+                    "type": "boolean",
+                    "example": false
+                },
+                "system": {
+                    "type": "string",
+                    "example": "You are an expert AI architect."
+                },
+                "temperature": {
+                    "type": "number",
+                    "example": 0.7
+                },
+                "thinking": {
+                    "$ref": "#/definitions/anthropic.ThinkingConfig"
+                },
+                "tool_choice": {
+                    "type": "object"
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/anthropic.Tool"
+                    }
+                },
+                "top_k": {
+                    "type": "integer",
+                    "example": 40
+                },
+                "top_p": {
+                    "type": "number",
+                    "example": 0.95
+                }
+            }
+        },
+        "anthropic.MessageResponse": {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/anthropic.ContentBlock"
+                    }
+                },
+                "id": {
+                    "type": "string",
+                    "example": "msg_01XFDUDYJgAACzvnptvVoYEL"
+                },
+                "model": {
+                    "type": "string",
+                    "example": "claude-3-5-sonnet-20241022"
+                },
+                "role": {
+                    "type": "string",
+                    "example": "assistant"
+                },
+                "stop_reason": {
+                    "type": "string",
+                    "example": "end_turn"
+                },
+                "stop_sequence": {
+                    "type": "string"
+                },
+                "type": {
+                    "type": "string",
+                    "example": "message"
+                },
+                "usage": {
+                    "$ref": "#/definitions/anthropic.Usage"
+                }
+            }
+        },
+        "anthropic.RequestMetadata": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "example": "user_12345"
+                }
+            }
+        },
+        "anthropic.ThinkingConfig": {
+            "type": "object",
+            "properties": {
+                "budget_tokens": {
+                    "type": "integer",
+                    "example": 1024
+                },
+                "type": {
+                    "description": "\"enabled\" or \"adaptive\"",
+                    "type": "string",
+                    "example": "enabled"
+                }
+            }
+        },
+        "anthropic.Tool": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "example": "Get the current weather for a given city."
+                },
+                "input_schema": {
+                    "type": "object"
+                },
+                "name": {
+                    "type": "string",
+                    "example": "get_weather"
+                }
+            }
+        },
+        "anthropic.Usage": {
+            "type": "object",
+            "properties": {
+                "cache_creation_input_tokens": {
+                    "type": "integer"
+                },
+                "cache_read_input_tokens": {
+                    "type": "integer"
+                },
+                "input_tokens": {
+                    "type": "integer",
+                    "example": 25
+                },
+                "output_tokens": {
+                    "type": "integer",
+                    "example": 18
+                }
+            }
+        },
         "auth.Account": {
             "type": "object",
             "properties": {
@@ -1203,6 +1754,48 @@ const docTemplate = `{
                 }
             }
         },
+        "models.AliasSource": {
+            "type": "string",
+            "enum": [
+                "admin_override",
+                "auto_synthesized",
+                "fallback"
+            ],
+            "x-enum-varnames": [
+                "SourceAdminOverride",
+                "SourceAutoSynthesized",
+                "SourceFallback"
+            ]
+        },
+        "models.ModelAliasEntry": {
+            "type": "object",
+            "properties": {
+                "alias": {
+                    "type": "string",
+                    "example": "claude-3-7-sonnet"
+                },
+                "description": {
+                    "type": "string",
+                    "example": "Auto-routed to highest ranking Sonnet model in active accounts"
+                },
+                "source": {
+                    "allOf": [
+                        {
+                            "$ref": "#/definitions/models.AliasSource"
+                        }
+                    ],
+                    "example": "auto_synthesized"
+                },
+                "target": {
+                    "type": "string",
+                    "example": "claude-sonnet-4-6"
+                },
+                "updated_at": {
+                    "type": "string",
+                    "example": "2026-11-24T12:00:00Z"
+                }
+            }
+        },
         "openai.ChatCompletionChoice": {
             "type": "object",
             "properties": {
@@ -1548,6 +2141,30 @@ const docTemplate = `{
                 }
             }
         },
+        "server.AnthropicAliasesResponse": {
+            "type": "object",
+            "properties": {
+                "aliases": {
+                    "description": "Active model aliases sorted with manual overrides first",
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/definitions/models.ModelAliasEntry"
+                    }
+                },
+                "champions": {
+                    "description": "Elected family champions mapped to discovered models",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "total": {
+                    "description": "Total count of active model aliases",
+                    "type": "integer",
+                    "example": 12
+                }
+            }
+        },
         "server.LoginCallbackRequest": {
             "type": "object",
             "properties": {
@@ -1633,6 +2250,33 @@ const docTemplate = `{
                 }
             }
         },
+        "server.ModelSyncResponse": {
+            "type": "object",
+            "properties": {
+                "champions": {
+                    "description": "Elected family champions",
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                },
+                "discovered_models": {
+                    "description": "Number of unique models discovered across accounts",
+                    "type": "integer",
+                    "example": 6
+                },
+                "status": {
+                    "description": "Status outcome indicator (e.g. \"synchronized\")",
+                    "type": "string",
+                    "example": "synchronized"
+                },
+                "total_aliases": {
+                    "description": "Total count of active aliases (manual + dynamic)",
+                    "type": "integer",
+                    "example": 12
+                }
+            }
+        },
         "server.OpsHealthResponse": {
             "type": "object",
             "properties": {
@@ -1640,6 +2284,26 @@ const docTemplate = `{
                     "description": "Status health indicator (\"healthy\" or \"ready\")",
                     "type": "string",
                     "example": "healthy"
+                }
+            }
+        },
+        "server.SetModelAliasRequest": {
+            "type": "object",
+            "properties": {
+                "alias": {
+                    "description": "Canonical alias or requested model identifier (e.g. \"claude-3-7-sonnet\")",
+                    "type": "string",
+                    "example": "claude-3-7-sonnet"
+                },
+                "description": {
+                    "description": "Optional description or rationale for this manual mapping override",
+                    "type": "string",
+                    "example": "Manual override pinned to Sonnet 4.6"
+                },
+                "target": {
+                    "description": "Target model discovered from accounts to route requests to (e.g. \"claude-sonnet-4-6\")",
+                    "type": "string",
+                    "example": "claude-sonnet-4-6"
                 }
             }
         },

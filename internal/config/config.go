@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,6 +26,8 @@ type Config struct {
 	Accounts      AccountsConfig  `yaml:"accounts"`
 	Admin         AdminConfig     `yaml:"admin"`
 	OpenAI        OpenAIConfig    `yaml:"openai"`
+	Anthropic     AnthropicConfig `yaml:"anthropic"`
+	Proxy         ProxyConfig     `yaml:"proxy"`
 	MCP           MCPConfig       `yaml:"mcp"`
 	Observability ObsConfig       `yaml:"observability"`
 
@@ -130,6 +133,67 @@ type OpenAIConfig struct {
 	DefaultModel           string `yaml:"default_model"`
 	DefaultReasoningEffort string `yaml:"default_reasoning_effort"`
 	ExposeReasoningContent bool   `yaml:"expose_reasoning_content"`
+}
+
+type AnthropicConfig struct {
+	DefaultModel           string `yaml:"default_model"`
+	DefaultMaxTokens       int    `yaml:"default_max_tokens"`
+	ExposeReasoningContent bool   `yaml:"expose_reasoning_content"`
+}
+
+// ProxyConfig specifies optional outbound HTTP/HTTPS proxy settings for Docker and host environments.
+type ProxyConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	HTTPProxy  string `yaml:"http_proxy"`
+	HTTPSProxy string `yaml:"https_proxy"`
+	NoProxy    string `yaml:"no_proxy"`
+}
+
+// ExportToEnv synchronizes proxy settings to the current process OS environment.
+func (p *ProxyConfig) ExportToEnv() {
+	if p.HTTPProxy != "" {
+		_ = os.Setenv("HTTP_PROXY", p.HTTPProxy)
+		_ = os.Setenv("http_proxy", p.HTTPProxy)
+	}
+	if p.HTTPSProxy != "" {
+		_ = os.Setenv("HTTPS_PROXY", p.HTTPSProxy)
+		_ = os.Setenv("https_proxy", p.HTTPSProxy)
+	}
+	if p.NoProxy != "" {
+		_ = os.Setenv("NO_PROXY", p.NoProxy)
+		_ = os.Setenv("no_proxy", p.NoProxy)
+	}
+}
+
+// RedactedURL returns a copy of the given proxy URL with credentials masked as ***** for safe logging.
+func (p *ProxyConfig) RedactedURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.Redacted()
+}
+
+// EnvSlice returns a slice of environment variable strings ("KEY=VALUE") for child subprocesses.
+func (p *ProxyConfig) EnvSlice() []string {
+	if !p.Enabled && p.HTTPProxy == "" && p.HTTPSProxy == "" {
+		return nil
+	}
+	var envs []string
+	if p.HTTPProxy != "" {
+		envs = append(envs, "HTTP_PROXY="+p.HTTPProxy, "http_proxy="+p.HTTPProxy)
+	}
+	if p.HTTPSProxy != "" {
+		envs = append(envs, "HTTPS_PROXY="+p.HTTPSProxy, "https_proxy="+p.HTTPSProxy)
+	}
+	if p.NoProxy != "" {
+		envs = append(envs, "NO_PROXY="+p.NoProxy, "no_proxy="+p.NoProxy)
+	}
+	envs = append(envs, "NODE_USE_ENV_PROXY=1")
+	return envs
 }
 
 type MCPClientToolCallingConfig struct {
@@ -238,6 +302,17 @@ func DefaultConfig() *Config {
 			DefaultModel:           "gemini-3.8-flash",
 			DefaultReasoningEffort: "medium",
 			ExposeReasoningContent: true,
+		},
+		Anthropic: AnthropicConfig{
+			DefaultModel:           "claude-3-5-sonnet",
+			DefaultMaxTokens:       4096,
+			ExposeReasoningContent: true,
+		},
+		Proxy: ProxyConfig{
+			Enabled:    false,
+			HTTPProxy:  "",
+			HTTPSProxy: "",
+			NoProxy:    "localhost,127.0.0.1,::1,agy-net,agy-gateway",
 		},
 		MCP: MCPConfig{
 			ClientToolCalling: MCPClientToolCallingConfig{
@@ -454,11 +529,49 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AGY_GW_EXPOSE_REASONING_CONTENT"); v != "" {
 		cfg.OpenAI.ExposeReasoningContent = parseBoolEnv(v, cfg.OpenAI.ExposeReasoningContent)
 	}
+
+	// 5b. Anthropic Overrides
+	if v := getFirstEnv("AGY_GW_ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_MODEL"); v != "" {
+		cfg.Anthropic.DefaultModel = v
+	}
+	if v := os.Getenv("AGY_GW_ANTHROPIC_DEFAULT_MAX_TOKENS"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			cfg.Anthropic.DefaultMaxTokens = n
+		}
+	}
+	if v := os.Getenv("AGY_GW_ANTHROPIC_EXPOSE_REASONING_CONTENT"); v != "" {
+		cfg.Anthropic.ExposeReasoningContent = parseBoolEnv(v, cfg.Anthropic.ExposeReasoningContent)
+	}
 	if v := os.Getenv("AGY_GW_MAX_TOOL_ARGUMENT_BYTES"); v != "" {
 		var n int64
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			cfg.MCP.ClientToolCalling.MaxToolArgumentBytes = n
 		}
+	}
+
+	// 5c. Outbound Proxy Overrides (Docker Layer & Host)
+	if v := os.Getenv("AGY_GW_PROXY_ENABLED"); v != "" {
+		cfg.Proxy.Enabled = parseBoolEnv(v, cfg.Proxy.Enabled)
+	}
+	if v := getFirstEnv("AGY_GW_PROXY_HTTP_PROXY", "HTTP_PROXY", "http_proxy"); v != "" {
+		cfg.Proxy.HTTPProxy = strings.TrimSpace(v)
+	}
+	if v := getFirstEnv("AGY_GW_PROXY_HTTPS_PROXY", "HTTPS_PROXY", "https_proxy"); v != "" {
+		cfg.Proxy.HTTPSProxy = strings.TrimSpace(v)
+	}
+	if v := getFirstEnv("AGY_GW_PROXY_NO_PROXY", "NO_PROXY", "no_proxy"); v != "" {
+		cfg.Proxy.NoProxy = strings.TrimSpace(v)
+	}
+	// Fallback to ALL_PROXY / all_proxy if specific http/https proxies are not set
+	if cfg.Proxy.HTTPProxy == "" && cfg.Proxy.HTTPSProxy == "" {
+		if v := getFirstEnv("ALL_PROXY", "all_proxy"); v != "" {
+			cfg.Proxy.HTTPProxy = strings.TrimSpace(v)
+			cfg.Proxy.HTTPSProxy = strings.TrimSpace(v)
+		}
+	}
+	if cfg.Proxy.HTTPProxy != "" || cfg.Proxy.HTTPSProxy != "" {
+		cfg.Proxy.Enabled = true
 	}
 
 	// 6. Observability Overrides
@@ -652,6 +765,47 @@ func validate(cfg *Config) error {
 	}
 	if cfg.MCP.ClientToolCalling.DelimiterTag == "" {
 		cfg.MCP.ClientToolCalling.DelimiterTag = "tool_call"
+	}
+	if cfg.Anthropic.DefaultMaxTokens <= 0 {
+		cfg.Anthropic.DefaultMaxTokens = 4096
+	}
+	if cfg.Anthropic.DefaultModel == "" {
+		cfg.Anthropic.DefaultModel = "claude-3-5-sonnet"
+	}
+
+	// Validate and configure outbound HTTP/HTTPS proxy
+	if cfg.Proxy.Enabled || cfg.Proxy.HTTPProxy != "" || cfg.Proxy.HTTPSProxy != "" {
+		if cfg.Proxy.HTTPProxy != "" {
+			u, err := url.ParseRequestURI(cfg.Proxy.HTTPProxy)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+				return fmt.Errorf("invalid proxy.http_proxy URL %q: scheme must be http or https", cfg.Proxy.HTTPProxy)
+			}
+		}
+		if cfg.Proxy.HTTPSProxy != "" {
+			u, err := url.ParseRequestURI(cfg.Proxy.HTTPSProxy)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+				return fmt.Errorf("invalid proxy.https_proxy URL %q: scheme must be http or https", cfg.Proxy.HTTPSProxy)
+			}
+		}
+
+		// Ensure loopback addresses are included in NoProxy to protect local healthchecks and OAuth callbacks
+		noProxyList := strings.Split(cfg.Proxy.NoProxy, ",")
+		noProxyMap := make(map[string]bool)
+		for _, item := range noProxyList {
+			if trimmed := strings.TrimSpace(item); trimmed != "" {
+				noProxyMap[trimmed] = true
+			}
+		}
+		for _, required := range []string{"localhost", "127.0.0.1", "::1"} {
+			if !noProxyMap[required] {
+				noProxyList = append(noProxyList, required)
+				noProxyMap[required] = true
+			}
+		}
+		cfg.Proxy.NoProxy = strings.Join(noProxyList, ",")
+
+		// Synchronize proxy settings to the process environment so all standard Go/Node/subprocess calls inherit them
+		cfg.Proxy.ExportToEnv()
 	}
 
 	return nil

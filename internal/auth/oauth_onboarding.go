@@ -114,11 +114,15 @@ func (oom *OAuthOnboardingManager) InitLogin(ctx context.Context, alias string) 
 	}
 
 	cmd := exec.Command(oom.cfg.Binaries.AgyAuthPath, args...)
-	cmd.Env = append(os.Environ(),
+	env := append(os.Environ(),
 		fmt.Sprintf("XDG_CONFIG_HOME=%s", oom.cfg.Storage.VaultXDGConfigDir),
 		"AGY_AUTH_NO_UPDATE_CHECK=1",
 		"DBUS_SESSION_BUS_ADDRESS=",
 	)
+	if proxyEnvs := oom.cfg.Proxy.EnvSlice(); len(proxyEnvs) > 0 {
+		env = append(env, proxyEnvs...)
+	}
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 		Pgid:    0,

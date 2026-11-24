@@ -21,7 +21,7 @@ func TestSwaggerUIEndpoints(t *testing.T) {
 
 	opsHandlers := server.NewOpsHandlers()
 	// Create minimal server instance using NewServer
-	srv := server.NewServer(cfg, nil, nil, opsHandlers, nil)
+	srv := server.NewServer(cfg, nil, nil, nil, opsHandlers, nil)
 
 	// 1. Test GET /swagger/index.html
 	t.Run("GET /swagger/index.html", func(t *testing.T) {

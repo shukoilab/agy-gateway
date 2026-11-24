@@ -1,703 +1,364 @@
 # agy-gateway
 
-> High-Performance, Enterprise-Grade OpenAI-Compatible Bridge for Google Antigravity CLI (`agy acp`).
->
-> Maintained & Developed by **ShukoiLab** ([@shukoilab](https://github.com/shukoilab))
+<p align="center">
+  <a href="https://github.com/shukoilab/agy-gateway/actions/workflows/ci-release.yml"><img src="https://github.com/shukoilab/agy-gateway/actions/workflows/ci-release.yml/badge.svg" alt="CI Pipeline"></a>
+  <a href="https://golang.org"><img src="https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go" alt="Go Version"></a>
+  <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker" alt="Docker Ready"></a>
+  <a href="https://github.com/shukoilab/agy-gateway/pkgs/container/agy-gateway"><img src="https://img.shields.io/badge/GHCR-Package-blue?logo=github" alt="GHCR"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
+  <a href="https://github.com/shukoilab/agy-gateway/releases"><img src="https://img.shields.io/badge/Release-v3.5.0-purple.svg" alt="Release"></a>
+</p>
 
-`agy-gateway` is a production-hardened reverse proxy and protocol translator written in Go. It connects OpenAI API consumers (such as code editors, autonomous agents, and LLM applications) directly to Google Antigravity CLI workers via the **Agent Client Protocol (ACP)** over stdio JSON-RPC 2.0.
-
----
-
-## 🌟 Key Features
-
-- **100% OpenAI Wire Compatibility**: Standard endpoints for `/v1/chat/completions`, `/v1/models`, and `/v1/models/{model}` matching OpenAI 2026 specifications.
-- **Strict Google ToS Compliance**:
-  - **Zero Harness Injection**: Eliminates aggressive overrides of `GEMINI.md` or `AGENTS.md`. Antigravity's natural built-in customizations and environment remain untouched.
-  - **Safe System Prompt Wrapping**: Automatically wraps consumer `system` / `developer` instructions inside natural `<important>...</important>` XML tags in the conversation context.
-- **Just-In-Time (JIT) Tool Calling**:
-  - Accepts standard OpenAI `tools` definitions (functions) dynamically per turn.
-  - Automatically deduplicates functions by name.
-  - Translates model output `<tool_call>` envelopes into standard OpenAI `tool_calls` payloads.
-  - Handles multi-turn tool output submissions (`role: "tool"`).
-- **Dynamic Account Model Discovery**:
-  - Real-time model inspection querying `agy models` on provisioned accounts.
-  - Automatic inference of base models and reasoning effort presets (`gemini-3.8-flash`, `gemini-3.8-flash-high/medium/low`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`).
-- **Standard ACP Editor Emulation (Zed Protocol)**:
-  - Worker subprocesses execute standard `agy acp --dangerously-skip-permissions`.
-  - JSON-RPC `initialize` handshake identifies as standard code editor (`zed v0.214.7`) with `fs` and `terminal` capabilities.
-- **Live Multi-Account Quota & Vault Management**:
-  - Central credential vault managed via `@fikrilal/agy-auth`.
-  - Direct live quota tracking via `agy -p "/usage"` reporting exact percentages remaining, rolling 5-hour and weekly bucket limits, and reset timestamps for both Gemini and third-party models.
-  - Dedicated admin endpoints (`GET /admin/v1/accounts/quota` and `GET /admin/v1/accounts/quota/{id}`) for instant quota inspection.
-  - Automated cooldown tracking (`COOLDOWN_5H` and `COOLDOWN_WEEKLY`) with zero-downtime failover rotation.
-  - Headless OAuth onboarding flow (`/admin/v1/accounts/login/init` & `/admin/v1/accounts/login/callback`).
-- **Production-Ready Docker Architecture**:
-  - Runs as isolated non-root user (`10001:10001`).
-  - Memory-backed `tmpfs` mounts (`/tmp:rw,noexec,nosuid,size=512m`).
-  - Docker log rotation (`json-file`, `max-size: 50m`, `max-file: 5`, `compress: true`).
-  - Proper OS signal handling (`STOPSIGNAL SIGTERM` with 30s graceful drain).
+<p align="center">
+  <strong>An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).</strong>
+</p>
 
 ---
 
-## 🏗️ System Architecture
+## Table of Contents
 
-```
-[OpenAI Consumer (e.g. Cline, Cursor, Zed, Python, Curl)]
-                        │
-                        ▼  HTTP REST / SSE Streaming
-              ┌──────────────────┐
-              │   agy-gateway    │  (Go 1.25, HTTP ServeMux)
-              └─────────┬────────┘
-                        │
-       ┌────────────────┴────────────────┐
-       ▼                                 ▼
-┌──────────────┐                 ┌──────────────┐
-│ Worker 0     │                 │ Worker 1     │
-│ [agy acp]    │                 │ [agy acp]    │
-│ (Isolated    │                 │ (Isolated    │
-│  HOME / CWD) │                 │  HOME / CWD) │
-└──────┬───────┘                 └──────┬───────┘
-       │                                 │
-       └────────────────┬────────────────┘
-                        ▼  OAuth2 / Daily Cloud Code API
-        [Google Antigravity Backend (Gemini / Claude / GPT)]
-```
+- [1. Introduction & Research Motivation](#1-introduction--research-motivation)
+  - [The Problem with Conventional Bridges](#the-problem-with-conventional-bridges)
+  - [The Architectural Solution](#the-architectural-solution)
+- [2. Key Features](#2-key-features)
+- [3. Installation & Getting Started](#3-installation--getting-started)
+  - [Method 1: Docker Compose (Recommended)](#method-1-docker-compose-recommended)
+  - [Method 2: Prebuilt Container Image (GHCR)](#method-2-prebuilt-container-image-ghcr)
+  - [Method 3: Build from Source](#method-3-build-from-source)
+- [4. Configuration & Environment Variables](#4-configuration--environment-variables)
+  - [Configuration File (`config.yaml`)](#configuration-file-configyaml)
+  - [Environment Variables (`.env`)](#environment-variables-env)
+  - [Optional Outbound HTTP/HTTPS Proxy](#optional-outbound-httphttps-proxy)
+  - [Interactive Account Management CLI](#interactive-account-management-cli)
+  - [Connecting Client Applications](#connecting-client-applications)
+- [5. Contributing & Development Guidelines](#5-contributing--development-guidelines)
+- [6. Credits & Acknowledgements](#6-credits--acknowledgements)
+- [7. License](#7-license)
+- [8. Disclaimer](#8-disclaimer)
 
 ---
 
-## 🚀 Quick Start (Docker Compose)
+## 1. Introduction & Research Motivation
 
-### 1. Prerequisites
-- Docker Engine 24.0+ & Docker Compose v2.20+
-- At least 1 authenticated Google account for Google Antigravity
+`agy-gateway` is an open-source research project and Proof-of-Concept (PoC) exploring non-invasive protocol translation between standard LLM client interfaces—namely the **OpenAI Chat Completions API** and the **Anthropic Messages API**—and Google's developer tools through the **Agent Client Protocol (ACP)** over stdio JSON-RPC 2.0.
 
-### 2. Launch the Gateway
-Clone the repository and start the container (the Docker build automatically provisions and verifies the official Google Antigravity CLI binary inside the image):
+### The Problem with Conventional Bridges
+A common challenge when bridging developer IDEs and autonomous coding agents (such as Cursor, Roo Code, Cline, Continue.dev, or LiteLLM) to developer ecosystems is integration fragility:
+- **Aggressive File Injection**: Many unofficial tools attempt to overwrite internal harness files (such as `GEMINI.md` or `AGENTS.md`) or inject unauthorized instructions into the agent runtime.
+- **Undocumented Endpoint Scraping**: Conventional reverse-engineering approaches frequently rely on private web session cookies and fragile web scraping, leading to session invalidations, security triggers, and service disruptions.
+- **Account Policy Violations**: Manipulating closed internal endpoints often violates upstream Terms of Service, putting developer credentials at risk.
 
+### The Architectural Solution
+This project explores a sustainable, standards-compliant alternative:
+1. **Standard ACP Emulation**: The gateway emulates a native code editor client (such as Zed) communicating directly with the official Google Antigravity CLI (`agy acp`) using standard JSON-RPC 2.0. The underlying CLI runtime operates in its natural state without file injection or binary tampering.
+2. **Safe Prompt Encapsulation**: Rather than altering core system files, developer instructions and system prompts are safely delineated inside `<important>...</important>` context envelopes.
+3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy /usage`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
+4. **Drop-in Compatibility**: Exposes standards-compliant REST endpoints for both `/v1/chat/completions` and `/v1/messages`, enabling developers to benchmark models like Gemini 3.8 Flash (supporting up to 1M+ token context windows) using existing tooling.
+
+---
+
+## 2. Key Features
+
+- **Dual Wire Protocol Parity**:
+  - **OpenAI 2026 Compatible**: Standard `/v1/chat/completions`, `/v1/models`, and `/v1/models/{model}` endpoints with streaming support.
+  - **Anthropic Messages Compatible**: Complete `/v1/messages` endpoint supporting dual authentication headers (`x-api-key` and `Authorization: Bearer`), polymorphic message payloads (plain strings and typed content blocks), and 7-stage Server-Sent Events (SSE) streaming.
+- **Reasoning & Extended Thinking Streams**:
+  - Captures internal reasoning tokens from upstream thinking models and formats them cleanly as `reasoning_content` (OpenAI format) or `thinking` blocks with cryptographic signatures (Anthropic format).
+- **Dynamic Model Discovery & Live Capability Ranking**:
+  - Queries available models dynamically across authenticated accounts.
+  - Integrates with [models.dev](https://models.dev) to score and rank models by capability, automatically electing "Family Champions" (Sonnet, Haiku, Opus, and Flash) with resilient offline disk caching.
+  - Supports administrative runtime model aliasing and manual overrides through dedicated REST endpoints (`/admin/v1/models/anthropic/*`).
+- **Client-Side Tool Calling (Function Calling)**:
+  - Just-in-Time (JIT) conversion of declared functions into delimiter-protected prompt envelopes (`<tool_call>`), handling multi-turn tool submissions and execution returns transparently.
+- **Live Quota Tracking & Zero-Downtime Failover**:
+  - Real-time account quota polling via `agy /usage`, tracking remaining percentages across rolling 5-hour and weekly bucket limits.
+  - Automatic cooldown scheduling and seamless standby worker rotation upon rate limit detection (`429`).
+- **Headless OAuth Onboarding & Terminal Dashboard**:
+  - Browser-free authentication flow for headless servers and containerized deployments.
+  - Interactive terminal dashboard (`agy-accounts` CLI) for simple account switching, quota inspection, and vault maintenance.
+- **Optional Outbound HTTP/HTTPS Proxy Support**:
+  - Full compatibility with Docker client proxy configurations (`~/.docker/config.json`) and standard `.env` variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`).
+  - Strict proxy routing for all external egress traffic (`agy acp`, `agy-auth`, and `models.dev`), combined with automatic loopback protection for internal container healthchecks.
+- **Resource-Safe Architecture**:
+  - Built with Go 1.25, memory-backed scratch storage, supervised process group lifecycles preventing zombie processes, and zero data races.
+
+---
+
+## 3. Installation & Getting Started
+
+### Method 1: Docker Compose (Recommended)
+
+The easiest way to deploy `agy-gateway` is using Docker Compose.
+
+#### Step 1: Clone the Repository
 ```bash
-docker compose up -d --build
+git clone https://github.com/shukoilab/agy-gateway.git
+cd agy-gateway
 ```
 
-Alternatively, pull the prebuilt package published by our automated CI/CD pipeline from GitHub Container Registry:
+#### Step 2: Configure Environment Variables
+Copy the sample environment file:
+```bash
+cp .env.example .env
+```
+Edit `.env` to configure your API keys, ports, and optional proxy settings:
+```bash
+# Set your desired gateway authorization keys
+AGY_GW_ADMIN_KEY=your-admin-secret-key
+AGY_GW_CLIENT_KEY_1=sk-antigravity-dev-test
+```
 
+#### Step 3: Start the Gateway
+```bash
+docker compose up -d
+```
+Verify that the service is running and healthy:
+```bash
+curl -f http://localhost:8080/healthz
+# Returns: {"status":"healthy"}
+```
+
+#### Step 4: Authenticate Your First Account
+Launch the interactive account manager inside the container:
+```bash
+docker exec -it agy-gateway agy-accounts
+```
+1. Select option `[2] Add New Account (OAuth Login)`.
+2. Open the displayed Google OAuth authorization URL in your browser.
+3. Sign in and paste the resulting redirect URL or code back into the terminal.
+4. Your account is saved to the encrypted vault and immediately available for inference.
+
+---
+
+### Method 2: Prebuilt Container Image (GHCR)
+
+If you prefer using prebuilt container images without cloning the full repository:
+
+#### Step 1: Pull the Image
 ```bash
 docker pull ghcr.io/shukoilab/agy-gateway:latest
 ```
 
-Verify that the service is running and healthy:
-
+#### Step 2: Run the Container
 ```bash
-curl -f http://localhost:8080/healthz
-# {"status":"healthy"}
+docker run -d \
+  --name agy-gateway \
+  -p 8080:8080 \
+  -e AGY_GW_ADMIN_KEY="your-admin-secret-key" \
+  -e AGY_GW_CLIENT_KEY_1="sk-antigravity-dev-test" \
+  -v agy-vault-data:/var/lib/agy-gateway/vault-xdg \
+  -v agy-workspaces:/var/lib/agy-gateway/workspaces \
+  -v agy-workers:/var/lib/agy-gateway/workers \
+  --restart unless-stopped \
+  ghcr.io/shukoilab/agy-gateway:latest
+```
+
+#### Step 3: Onboard Your Account
+```bash
+docker exec -it agy-gateway agy-accounts add
 ```
 
 ---
 
-## ⚙️ Configuration (`config.yaml` & 12-Factor `.env`)
+### Method 3: Build from Source
 
-`agy-gateway` is designed for enterprise flexibility with **zero-hardcoding**, adhering strictly to the 12-factor application configuration hierarchy:
-1. **Production Defaults**: Safe, memory-resident defaults ensuring startup even without external config files.
-2. **YAML Configuration**: Structured configuration in `config.yaml`.
-3. **Environment File (`.env`)**: Zero-dependency local environment file ingestion (see `.env.example`).
-4. **System Environment Variables**: Process and container environment variables take highest priority (`PORT`, `HOST`, `AGY_GW_*`).
+For local development or bare-metal execution:
 
-### Quick Start with `.env`
+#### Prerequisites
+- **Go**: Version 1.25 or higher
+- **Google Antigravity CLI**: `agy` (v1.5.5+) installed and accessible in `$PATH`
+- **Node.js & Auth Helper**: `@fikrilal/agy-auth` installed globally (`npm install -g @fikrilal/agy-auth`)
+
+#### Step 1: Build the Binaries
 ```bash
-cp .env.example .env
-# Customize PORT, AGY_GW_HOST_PORT, AGY_GW_ADMIN_KEY, etc.
-docker compose up -d
+git clone https://github.com/shukoilab/agy-gateway.git
+cd agy-gateway
 
-# Manage accounts interactively inside the container:
-docker exec -it agy-gateway agy-accounts
+go build -trimpath -ldflags="-s -w" -o bin/agy-gateway ./cmd/agy-gateway
+go build -trimpath -ldflags="-s -w" -o bin/agy-accounts ./cmd/agy-accounts
 ```
 
-### Reference `config.yaml`
+#### Step 2: Initialize Configuration
+```bash
+cp config.yaml config.local.yaml
+export AGY_GW_ADMIN_KEY="your-admin-secret-key"
+export AGY_GW_CLIENT_KEY_1="sk-antigravity-dev-test"
+```
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8080
-  read_header_timeout: "10s"
-  idle_timeout: "120s"
-  shutdown_drain_timeout: "30s"
-  max_request_body_bytes: 10485760 # 10 MiB
-  sse_keepalive_interval: "15s"
-
-security:
-  api_keys:
-    - id: "prod-client-1"
-      key_env: "AGY_GW_CLIENT_KEY_1"
-      key: "sk-antigravity-dev-test"
-      rate_limit_rpm: 120
-  admin_api_key_env: "AGY_GW_ADMIN_KEY"
-  admin_api_key: "admin-super-secret-key-change-me"
-  allow_remote_image_urls: false
-
-binaries:
-  agy_path: "/usr/local/bin/agy"
-  agy_min_version: "1.5.5"
-  agy_auth_path: "/usr/local/bin/agy-auth"
-  agy_acp_args:
-    - "acp"
-    - "--dangerously-skip-permissions"
-
-execution:
-  yolo_mode: true
-  acp_session_mode: "accept-edits"
-  auto_approve_permissions: true
-  clean_workspace_between_requests: true
-
-storage:
-  base_data_dir: "/var/lib/agy-gateway"
-  vault_xdg_config_dir: "/var/lib/agy-gateway/vault-xdg"
-  workers_root_dir: "/var/lib/agy-gateway/workers"
-  workers_tmp_dir: "/var/lib/agy-gateway/tmp"
-  workspaces_root_dir: "/var/lib/agy-gateway/workspaces"
-
-pool:
-  worker_count: 2
-  acquire_timeout: "15s"
-  handshake_timeout: "15s"
-  config_switch_timeout: "10s"
-  inference_timeout: "300s"
-  first_token_timeout: "45s"
-  process_kill_grace_period: "5s"
-  max_requests_per_worker: 250
-  max_worker_uptime: "2h"
-  max_scanner_buffer_bytes: 16777216
-
-accounts:
-  auto_rotate_enabled: true
-  allocation_strategy: "dedicated_per_worker"
-  quota_poll_interval: "30s"
-  min_remaining_quota_pct: 5.0
-  default_cooldown_5h: "30m"
-  default_cooldown_weekly: "6h"
-  max_failover_retries: 2
-
-admin:
-  command_timeout: "15s"
-  allow_credential_export: false
-  query_validation_regex: "^[a-zA-Z0-9@._:-]{1,128}$"
-  alias_validation_regex: "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$"
-  runtime_overrides_file: "/var/lib/agy-gateway/vault-xdg/gateway-runtime-overrides.json"
-  oauth_onboarding:
-    enabled: true
-    max_concurrent_logins: 3
-    url_extract_timeout: "10s"
-    login_session_ttl: "5m"
-    loopback_replay_timeout: "15s"
-
-openai:
-  unsupported_param_policy: "strip_and_warn"
-  default_model: "gemini-3.8-flash"
-  default_reasoning_effort: "medium"
-  expose_reasoning_content: true
-
-mcp:
-  client_tool_calling:
-    enabled: true
-    default_parallel: true
-    strict_schema_validation: true
-    max_tool_argument_bytes: 1048576
-    delimiter_tag: "tool_call"
-
-observability:
-  log_level: "info"
-  log_format: "json"
-  metrics_enabled: true
-  metrics_path: "/metrics"
+#### Step 3: Run the Server
+```bash
+./bin/agy-gateway --config config.local.yaml
 ```
 
 ---
 
-## 📡 API Usage & Examples
+## 4. Configuration & Environment Variables
 
-### 📖 Interactive Swagger UI & OpenAPI Specification
+### Configuration File (`config.yaml`)
+`config.yaml` manages system defaults, resource allocations, timeout thresholds, and proxy settings. All values can be overridden dynamically using environment variables without modifying the file.
 
-`agy-gateway` provides an enterprise-grade, fully interactive OpenAPI 2.0 / Swagger documentation UI with built-in client and administrator authentication support:
+Key sections include:
+- `server`: Host address, port, and timeout durations.
+- `security`: API key lists, rate limits, and CORS rules.
+- `pool`: Worker concurrency limits, TTFT timeouts, and buffer ceilings.
+- `accounts`: Quota polling frequency, cooldown intervals, and failover retries.
+- `proxy`: Outbound HTTP/HTTPS proxy rules and exclusions.
 
-- **Swagger UI Interactive Interface**: [http://localhost:8080/swagger/index.html](http://localhost:8080/swagger/index.html) (shortcut: [http://localhost:8080/docs](http://localhost:8080/docs))
-- **Raw OpenAPI Specification (JSON)**: [http://localhost:8080/swagger/doc.json](http://localhost:8080/swagger/doc.json)
+### Environment Variables (`.env`)
+The gateway follows standard 12-factor configuration principles. Key variables:
 
-#### 🔐 Interactive Authentication in Swagger UI
-Click the **Authorize 🔓** button in the upper-right corner of Swagger UI:
-1. **Client Endpoints (`/v1/*`)**: In **`ClientBearerAuth`**, enter `Bearer <your-client-api-key>` (e.g. `Bearer sk-antigravity-dev-test`).
-2. **Admin Control Plane (`/admin/v1/*`)**: In **`AdminBearerAuth`**, enter `Bearer <your-admin-api-key>` (e.g. `Bearer agy-admin-secret-key-12345`).
-3. Session tokens persist across browser refreshes automatically (`persistAuthorization: true`).
+| Variable | Default | Description |
+|---|---|---|
+| `AGY_GW_HOST` | `0.0.0.0` | Server listen address |
+| `AGY_GW_PORT` | `8080` | Server listen port |
+| `AGY_GW_ADMIN_KEY` | - | Bearer token for administrative endpoints |
+| `AGY_GW_CLIENT_KEY_1` | - | Client API key for inference requests |
+| `AGY_GW_POOL_WORKER_COUNT` | `2` | Number of concurrent Antigravity worker processes |
+| `AGY_GW_DEFAULT_MODEL` | `gemini-3.8-flash` | Default model when unspecified by OpenAI clients |
+| `AGY_GW_ANTHROPIC_DEFAULT_MODEL` | `claude-3-5-sonnet` | Default model when unspecified by Anthropic clients |
+| `HTTP_PROXY` / `HTTPS_PROXY` | - | Optional outbound forward proxy URL |
+| `NO_PROXY` | `localhost,127.0.0.1` | Addresses exempt from proxying |
 
-#### 🏷️ Organized Endpoint Categories
-- **`OpenAI - Chat Completions`**: Chat completions with streaming SSE, reasoning thoughts (`reasoning_effort` / `reasoning_content`), and function tool calling.
-- **`OpenAI - Models`**: Dynamic model cataloging and detailed metadata queries.
-- **`Admin - Accounts`**: Credential management, live quota tracking (`agy /usage`), manual switching, and rotation.
-- **`Admin - OAuth Onboarding`**: Out-of-band headless Google OAuth2 flow initialization and loopback completion.
-- **`Admin - Vault`**: Credential vault status inspection and hygiene / cleanup.
-- **`Operations & Telemetry`**: Liveness probe (`/healthz`), readiness probe (`/readyz`), and Prometheus metrics (`/metrics`).
+### Optional Outbound HTTP/HTTPS Proxy
 
----
+`agy-gateway` provides complete support for environments requiring egress traffic to traverse an HTTP or HTTPS forward proxy (with optional Basic Authentication).
 
-### 1. List Available Models (`GET /v1/models`)
-
-```bash
-curl -s -H "Authorization: Bearer sk-antigravity-dev-test" \
-  http://localhost:8080/v1/models | jq .
-```
-
-**Response**:
+#### Option A: Docker Client Layer (`~/.docker/config.json`)
+You can configure your proxy globally at the Docker level. Add the `proxies` block to your host machine's `~/.docker/config.json`:
 ```json
 {
-  "object": "list",
-  "data": [
-    {
-      "id": "gemini-3.8-flash",
-      "object": "model",
-      "created": 1795458000,
-      "owned_by": "google"
-    },
-    {
-      "id": "claude-sonnet-4-6",
-      "object": "model",
-      "created": 1795458000,
-      "owned_by": "anthropic"
+  "proxies": {
+    "default": {
+      "httpProxy": "http://user:password@proxy-host:3128",
+      "httpsProxy": "http://user:password@proxy-host:3128",
+      "noProxy": "localhost,127.0.0.1,::1,agy-net,agy-gateway"
     }
-  ]
+  }
 }
 ```
+Docker CLI automatically propagates these proxy variables into the container during startup.
+
+#### Option B: Environment Configuration (`.env`)
+Alternatively, define standard proxy variables directly in your deployment `.env`:
+```bash
+HTTP_PROXY=http://user:password@proxy-host:3128
+HTTPS_PROXY=http://user:password@proxy-host:3128
+NO_PROXY=localhost,127.0.0.1,::1,agy-net,agy-gateway,.local
+```
+
+**Operational Safeguards:**
+- **Guaranteed Worker Egress**: Worker subprocesses (`agy acp`, `agy-auth`) automatically inherit the proxy settings, routing external Google API and OAuth traffic via HTTP `CONNECT` tunnels.
+- **Loopback Safety**: The gateway automatically ensures `localhost`, `127.0.0.1`, and `::1` are preserved in `NO_PROXY`, preventing internal healthchecks (`/healthz`) and OAuth callbacks from being sent to the proxy.
+- **Password Masking**: Credentials inside proxy URLs are masked as `http://user:*****@host:port` in all system logs.
 
 ---
 
-### 2. Basic Chat Completion with System Prompt
+### Interactive Account Management CLI
 
+The gateway includes an interactive Terminal User Interface (TUI) for account CRUD and health tracking.
+
+Launch the menu:
 ```bash
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-antigravity-dev-test" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.8-flash",
-    "messages": [
-      {"role": "system", "content": "You are a concise mathematics assistant."},
-      {"role": "user", "content": "What is 12 * 12?"}
-    ],
-    "reasoning_effort": "low"
-  }' | jq .
-```
-
----
-
-### 3. JIT Tool Calling (Function Calling)
-
-#### Turn 1: Client sends tool definitions
-```bash
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-antigravity-dev-test" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.8-flash",
-    "messages": [
-      {"role": "user", "content": "What is the weather in Tokyo?"}
-    ],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "description": "Get current weather for a city",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "city": {"type": "string"}
-            },
-            "required": ["city"]
-          }
-        }
-      }
-    ],
-    "tool_choice": "auto"
-  }' | jq .
-```
-
-**Model Output**:
-```json
-{
-  "id": "chatcmpl-bd648810-766c-",
-  "object": "chat.completion",
-  "choices": [
-    {
-      "index": 0,
-      "message": {
-        "role": "assistant",
-        "content": null,
-        "tool_calls": [
-          {
-            "id": "call_get_weather_1",
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "arguments": "{\"city\":\"Tokyo\"}"
-            }
-          }
-        ]
-      },
-      "finish_reason": "tool_calls"
-    }
-  ]
-}
-```
-
-#### Turn 2: Client returns tool execution result
-```bash
-curl -s -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-antigravity-dev-test" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.8-flash",
-    "messages": [
-      {"role": "user", "content": "What is the weather in Tokyo?"},
-      {
-        "role": "assistant",
-        "tool_calls": [
-          {
-            "id": "call_get_weather_1",
-            "type": "function",
-            "function": {
-              "name": "get_weather",
-              "arguments": "{\"city\":\"Tokyo\"}"
-            }
-          }
-        ]
-      },
-      {
-        "role": "tool",
-        "tool_call_id": "call_get_weather_1",
-        "content": "{\"temperature\": \"22°C\", \"condition\": \"Sunny\"}"
-      }
-    ]
-  }' | jq .
-```
-
----
-
-### 4. Server-Sent Events (SSE) Streaming
-
-```bash
-curl -N -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer sk-antigravity-dev-test" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.8-flash",
-    "messages": [
-      {"role": "user", "content": "Count from 1 to 5."}
-    ],
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
-```
-
----
-
-### 5. Admin Quota & Account Inspection
-
-#### Check All Accounts Quota (`GET /admin/v1/accounts/quota`):
-```bash
-curl -s -H "Authorization: Bearer admin-super-secret-key-change-me" \
-  http://localhost:8080/admin/v1/accounts/quota | jq .
-```
-
-#### Check Specific Account Quota (`GET /admin/v1/accounts/quota/{id}` or `?account=`):
-```bash
-curl -s -H "Authorization: Bearer admin-super-secret-key-change-me" \
-  http://localhost:8080/admin/v1/accounts/quota/acct_2a71cc7452 | jq .
-```
-
-**Real Live Response**:
-```json
-{
-  "timestamp": "2026-11-23T19:04:00.050Z",
-  "total": 1,
-  "accounts": [
-    {
-      "id": "acct_2a71cc7452",
-      "email": "user@gmail.com",
-      "alias": "main-account",
-      "plan": "Free",
-      "active": true,
-      "status": "HEALTHY",
-      "quota_available": true,
-      "groups": [
-        {
-          "name": "Gemini Models",
-          "description": "Models within this group: Gemini 3.8 Flash",
-          "buckets": [
-            {
-              "id": "gemini-weekly",
-              "name": "Weekly Limit Remaining",
-              "description": "You have used some of your weekly limit, it will fully refresh in 6 days, 20 hours.",
-              "window": "weekly",
-              "remaining_fraction": 0.9568,
-              "remaining_pct": 95.68,
-              "reset_time": "2026-11-30T15:46:50Z",
-              "is_exhausted": false
-            },
-            {
-              "id": "gemini-5h",
-              "name": "Five Hour Limit Remaining",
-              "description": "You have used some of your 5-hour limit, it will fully refresh in 23 minutes.",
-              "window": "5h",
-              "remaining_fraction": 0.985,
-              "remaining_pct": 98.5,
-              "reset_time": "2026-11-23T22:47:05Z",
-              "is_exhausted": false
-            }
-          ]
-        },
-        {
-          "name": "Claude and GPT models",
-          "description": "Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
-          "buckets": [
-            {
-              "id": "3p-weekly",
-              "name": "Weekly Limit Remaining",
-              "window": "weekly",
-              "remaining_fraction": 1.0,
-              "remaining_pct": 100,
-              "reset_time": "2026-11-30T19:03:59Z",
-              "is_exhausted": false
-            }
-          ]
-        }
-      ],
-      "quotas": {
-        "gemini-weekly": {
-          "name": "Gemini Models - Weekly Limit Remaining",
-          "remaining_pct": 95.68,
-          "reset_time": "2026-11-30T15:46:50Z",
-          "is_exhausted": false
-        },
-        "3p-weekly": {
-          "name": "Claude and GPT models - Weekly Limit Remaining",
-          "remaining_pct": 100,
-          "reset_time": "2026-11-30T19:03:59Z",
-          "is_exhausted": false
-        }
-      },
-      "overview": "Gemini Models\tWeekly Limit Remaining\t96%\t2026-11-30T15:46:50Z\nClaude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-30T19:03:59Z",
-      "last_synced": "2026-11-23T19:04:00.050Z"
-    }
-  ]
-}
-```
-
----
-
-### 6. Interactive Account CRUD CLI (`agy-accounts`)
-
-`agy-gateway` provides a dedicated CLI utility for managing Google Antigravity credentials directly from the command line or inside Docker containers.
-
-#### Running Interactively (TUI Dashboard)
-Launch the interactive dashboard to view live quotas, add accounts via OAuth, switch active accounts, set aliases, or remove accounts:
-
-```bash
-# Inside Docker container:
+# In Docker:
 docker exec -it agy-gateway agy-accounts
 
-# Or using the main binary subcommand:
-docker exec -it agy-gateway agy-gateway accounts
-
-# On host:
+# Or via host binary:
 ./bin/agy-accounts
 ```
 
-**Interactive Menu Interface:**
-```text
-================================================================================
-          GOOGLE ANTIGRAVITY GATEWAY — ACCOUNT MANAGEMENT CLI
-================================================================================
-Config: /var/lib/agy-gateway/vault-xdg | Storage: /var/lib/agy-gateway
+**Available Options:**
+- `[1] List Accounts & Live Quotas`: Inspect all account IDs, tier types, and 5-hour/weekly limits.
+- `[2] Add New Account`: Run the headless Google OAuth login wizard.
+- `[3] Switch Active Account`: Change the primary account in the vault.
+- `[4] Force Account Rotation`: Manually cycle to the next healthy account.
+- `[5] Set Account Alias`: Assign a human-readable name to an account.
+- `[7] Remove Account`: Permanently delete stored credentials.
+- `[8] Clean Vault Cache`: Purge orphaned tokens and temporary files.
+- `[10] Anthropic Model Aliases & Ranking`: View active model mappings, pin manual overrides, and trigger capability recalculations.
 
-[1] List Accounts & Live Quotas     (View all IDs, aliases, health & quotas)
-[2] Add New Account (OAuth Login)   (Initiate headless Google OAuth login flow)
-[3] Switch Active Account           (Set active account in central vault)
-[4] Force Account Rotation          (Cycle active credentials to next healthy account)
-[5] Set Account Alias               (Assign friendly nickname to account ID)
-[6] Clear Account Alias             (Remove friendly nickname from account)
-[7] Remove Account                  (Delete account credentials permanently)
-[8] Clean Vault Cache               (Purge orphaned sessions & stale files)
-[9] View Raw Status / Diagnostics   (Show raw JSON telemetry from agy-auth)
-[0] Exit
---------------------------------------------------------------------------------
-Select an option [0-9]: 
-```
-
-#### Scriptable Non-Interactive Subcommands
-For automation, scripting, and CI/CD pipelines, `agy-accounts` provides subcommands with optional `-json` formatting:
-
+**Non-Interactive Scripting Example:**
 ```bash
-# List all accounts with live quota in aligned table:
+# List accounts in aligned table or JSON
 docker exec agy-gateway agy-accounts list
-
-# List all accounts as machine-readable JSON:
 docker exec agy-gateway agy-accounts list -json
 
-# Switch active account to a specific ID, email, or alias:
-docker exec agy-gateway agy-accounts switch acc_9f3b18e2
-
-# Force immediate account rotation to the next healthy account:
-docker exec agy-gateway agy-accounts rotate
-
-# Assign a friendly alias to an account:
-docker exec agy-gateway agy-accounts alias set acc_9f3b18e2 primary-work
-
-# Clear an assigned alias:
-docker exec agy-gateway agy-accounts alias clear primary-work
-
-# Remove an account permanently from the vault:
-docker exec agy-gateway agy-accounts remove acc_9f3b18e2
-
-# Clean orphaned sessions and temporary files:
-docker exec agy-gateway agy-accounts clean
-
-# View raw agy-auth diagnostics:
-docker exec agy-gateway agy-accounts status -json
-```
-
-#### Adding Accounts Headless via OAuth Wizard
-When selecting `[2]` or running `agy-accounts add`:
-1. The CLI initializes a headless Google OAuth session and outputs an authorization URL.
-2. Open the URL in any web browser and authorize your Google account.
-3. Paste the authorization code (or the full redirect URL) back into the terminal prompt.
-4. The CLI exchanges tokens, mirrors the credentials into the central vault, and updates worker homes automatically.
-
----
-
-## 🔐 Google Antigravity Quota Best Practices
-
-- **Live Upstream Quota Synchronization**: Quota limits and remaining fractions are queried directly via Antigravity's internal command (`agy -p "/usage" --output-format json`), ensuring 100% ground-truth accuracy.
-- **Dual Rolling Windows**: Google Antigravity manages limits across **5-hour rolling windows** (to smooth aggregate traffic) and **weekly tier limits** for both Gemini and third-party models (Claude / GPT).
-- **Automated Failover & Cooldown**: When an account reaches exhausted limits (< 5% remaining), the gateway automatically marks it as `COOLDOWN_5H` or `COOLDOWN_WEEKLY` with exact wakeup scheduled at `reset_time`, rotating seamlessly to healthy standby accounts.
-- **Request Pacing & Anti-Abuse**: Maintain natural pacing (2-4 seconds) between automated calls to remain within standard Cloud Code editor heuristics.
-
----
-
-## 💻 Step-by-Step Development Guide
-
-### 1. Prerequisites
-- **Go**: Version 1.25 or higher
-- **Docker & Docker Compose**: Docker Engine 24.0+ and Compose v2.20+
-- **Google Antigravity CLI**: `agy` binary (v1.5.5+) installed and executable in `$PATH`
-- **Antigravity Auth Helper**: `@fikrilal/agy-auth` installed globally or in path
-
-### 2. Local Environment Setup
-Clone the repository and inspect the default configuration:
-
-```bash
-git clone git@github.com:shukoilab/agy-gateway.git
-cd agy-gateway
-
-# Copy default config if creating local overrides
-cp config.yaml config.local.yaml
-```
-
-Set required environment variables (or keep default values for development):
-
-```bash
-export AGY_GW_CLIENT_KEY_1="sk-antigravity-dev-test"
-export AGY_GW_ADMIN_KEY="admin-super-secret-key-change-me"
-```
-
-### 3. Run Automated Tests & Race Detection
-Execute the comprehensive test suite with the race detector enabled:
-
-```bash
-go test -v -race ./...
-```
-
-Verify formatting and linting:
-
-```bash
-go fmt ./...
-go vet ./...
-```
-
-### 4. Generating & Updating Swagger Documentation
-Install the `swag` CLI tool:
-
-```bash
-go install github.com/swaggo/swag/cmd/swag@latest
-```
-
-Whenever you modify route definitions, handler signatures, or request/response structs, regenerate the OpenAPI assets:
-
-```bash
-swag init -d cmd/agy-gateway,internal/server,internal/openai,internal/auth,internal/models,internal/telemetry,internal/mcp -g main.go --parseInternal
-```
-
-### 5. Running Locally
-Run the gateway service directly on your host machine:
-
-```bash
-go run ./cmd/agy-gateway
-```
-
-The gateway starts on `http://localhost:8080`, and the interactive Swagger UI is available at `http://localhost:8080/swagger/index.html` or `http://localhost:8080/docs`.
-
-### 6. Running with Docker Compose
-To run in the production-mode container environment with non-root security and log rotation:
-
-```bash
-docker compose up -d --build
-docker compose logs -f
+# Manage model aliases
+docker exec agy-gateway agy-gateway models list
+docker exec agy-gateway agy-gateway models set claude-3-7-sonnet claude-sonnet-4-6
 ```
 
 ---
 
-## 🤖 Automated CI/CD & GitHub Container Registry
+### Connecting Client Applications
 
-The repository is equipped with a fully automated, production-grade GitHub Actions pipeline (`.github/workflows/ci-release.yml`):
+Configure your favorite development tools and agent frameworks to connect to `agy-gateway`:
 
-1. **Continuous Integration Gate (`ci`)**:
-   - Runs on every push and pull request to `main`.
-   - Verifies Go module dependencies, runs `go vet`, executes the full test suite with data race detection (`go test -v -race ./...`), and tests binary compilation.
-2. **Automated Semantic Version Bumping & Git Tagging**:
-   - Analyzes commit messages upon push to `main` (supporting `#major`, `#minor`, `#patch` or Conventional Commits like `feat:` / `fix:`).
-   - Generates the next semver tag automatically (e.g. `v3.3.1`), creates an annotated Git tag, and generates automated changelogs.
-3. **Automated GitHub Release**:
-   - Publishes a formal GitHub Release corresponding to the new version tag.
-4. **Automated Docker Package Publishing (GHCR)**:
-   - Builds the production multi-stage container with target version branding (`-ldflags="-X main.version=${VERSION}"`).
-   - Automatically publishes tagged images and `:latest` to GitHub Container Registry:
-     ```bash
-     docker pull ghcr.io/shukoilab/agy-gateway:latest
-     docker pull ghcr.io/shukoilab/agy-gateway:v3.3.1
-     ```
+#### Cursor / Continue.dev / Cline (OpenAI Mode)
+- **Base URL**: `http://localhost:8080/v1`
+- **API Key**: Value of your `AGY_GW_CLIENT_KEY_1`
+- **Model**: `gemini-3.8-flash` (or `gemini-3.8-flash-high`)
+
+#### Roo Code / Continue.dev / SDKs (Anthropic Mode)
+- **Base URL**: `http://localhost:8080` (or `http://localhost:8080/v1`)
+- **API Key (`x-api-key`)**: Value of your `AGY_GW_CLIENT_KEY_1`
+- **Model**: `claude-3-5-sonnet` (or `claude-3-7-sonnet`)
+
+#### Interactive OpenAPI / Swagger Documentation
+Explore live endpoints and schemas in your browser:
+```text
+http://localhost:8080/swagger/index.html
+```
 
 ---
 
-## 🤝 Open Contribution & Community
+## 5. Contributing & Development Guidelines
 
-We warmly welcome contributions from the community! `agy-gateway` is actively maintained by **ShukoiLab** and open to bug fixes, feature proposals, and architectural enhancements.
+Contributions, bug reports, and research discussions are welcome. This project is maintained as an open community research effort.
 
-### How to Contribute:
-1. **Fork the Repository**: Create your personal fork on GitHub.
-2. **Create a Feature Branch**:
+### Development Workflow
+1. Fork and clone the repository.
+2. Ensure you have **Go 1.25+** installed.
+3. Run tests with race detection before submitting changes:
    ```bash
-   git checkout -b feature/amazing-feature
+   go test -v -count=1 -race ./...
    ```
-3. **Adhere to Core Invariants**:
-   - **Google ToS Invariant**: Never add external harness prompt overrides (`GEMINI.md`/`AGENTS.md`). Always encapsulate system prompts in `<important>` XML tags.
-   - **Zero Hardcoding**: Pass configurations through `config.yaml` or environment variables.
-   - **Concurrency Safety**: Guard all shared mutable states with mutexes; ensure clean goroutine lifecycles.
-   - **Documentation**: Document modified functions with clear JSDoc / GoDoc comments.
-4. **Run Tests**:
-   Ensure all tests pass with zero race conditions:
+4. Verify code formatting and static analysis:
    ```bash
-   go test -v -race ./...
+   go fmt ./...
+   go vet ./...
    ```
-5. **Open a Pull Request**: Submit your PR with a concise description of your changes and verification logs.
+5. Regenerate Swagger schemas if endpoint contracts or docs are modified:
+   ```bash
+   swag init -g cmd/agy-gateway/main.go -o docs
+   ```
+
+### Contribution Rules
+- **No Hardcoded Secrets or Paths**: All configuration must remain 12-factor and environment-driven.
+- **Thread Safety & Zero Race Invariant**: All shared state must be protected with appropriate synchronization primitives (`sync.RWMutex`, atomic variables).
+- **Graceful Lifecycle Teardown**: Sockets, streams, and subprocess handles must terminate cleanly upon `SIGTERM` or context cancellation.
 
 ---
 
-## 📄 License & Attribution
+## 6. Credits & Acknowledgements
 
-This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for full details.
+`agy-gateway` is built upon concepts and protocol standards developed across the developer community:
+- **[Google Antigravity CLI](https://antigravity.google)**: The core desktop and CLI developer environment providing ACP support.
+- **[@fikrilal/agy-auth](https://github.com/fikrilal/agy-auth)** by [@fikrilal](https://github.com/fikrilal): Essential research foundation for credential vault management, OAuth token flow, and usage telemetry.
+- **[Agent Client Protocol (ACP)](https://zed.dev)**: The standardized editor-to-agent protocol developed by the Zed team.
+- **[models.dev](https://models.dev)**: Real-time model intelligence and capability indexing catalog.
 
-Developed & Maintained with ❤️ by **[ShukoiLab](https://github.com/shukoilab)**.
+---
+
+## 7. License
+
+Distributed under the terms of the **MIT License**. See [LICENSE](./LICENSE) for full details.
+
+---
+
+## 8. Disclaimer
+
+This software is an independent open-source research Proof-of-Concept (PoC) developed strictly for educational, experimental, and protocol interoperability research. 
+
+It is **not** an official product of, maintained by, affiliated with, sponsored by, or endorsed by Google LLC, Anthropic PBC, OpenAI Inc., or any of their respective affiliates or subsidiaries. All trademarks, service marks, model names, and registered product references belong exclusively to their respective owners.
+
+The software is provided **"as is"**, without warranty of any kind, express or implied. Users assume sole responsibility for their local configurations, network environments, and compliance with all applicable third-party terms of service and acceptable use policies.

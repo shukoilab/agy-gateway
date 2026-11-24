@@ -123,3 +123,81 @@ claude-sonnet-4-6	Claude Sonnet 4.6 (Thinking)
 		<-done
 	}
 }
+
+func TestModelRegistryFindModelAliasing(t *testing.T) {
+	cfg := &config.Config{
+		Anthropic: config.AnthropicConfig{
+			DefaultModel: "",
+		},
+	}
+	authMgr := auth.NewManager(cfg, nil)
+	mr := NewModelRegistry(cfg, authMgr, nil)
+
+	mr.mu.Lock()
+	mr.models = map[string]*ModelInfo{
+		"gemini-3.8-flash":  {ID: "gemini-3.8-flash", OwnedBy: "google"},
+		"claude-sonnet-4-6": {ID: "claude-sonnet-4-6", OwnedBy: "anthropic"},
+	}
+	mr.champions = map[string]*ModelInfo{
+		"claude-sonnet": mr.models["claude-sonnet-4-6"],
+		"gemini-flash":  mr.models["gemini-3.8-flash"],
+	}
+	mr.mu.Unlock()
+
+	mr.AliasStore().SetDynamicAliases(map[string]string{
+		"claude-3-7-sonnet": "claude-sonnet-4-6",
+		"claude-3-5-sonnet": "claude-sonnet-4-6",
+	})
+
+	// Test dynamic alias resolution
+	m, found := mr.FindModel("claude-3-7-sonnet")
+	if !found || m.ID != "claude-sonnet-4-6" {
+		t.Fatalf("expected claude-sonnet-4-6, got %+v (found=%v)", m, found)
+	}
+
+	// Test normalized dot resolution
+	m, found = mr.FindModel("claude.3.7.sonnet")
+	if !found || m.ID != "claude-sonnet-4-6" {
+		t.Fatalf("expected claude-sonnet-4-6 for dot-normalized, got %+v (found=%v)", m, found)
+	}
+
+	// Test admin manual override taking precedence
+	if err := mr.AliasStore().SetManual("claude-3-7-sonnet", "gemini-3.8-flash", "test override"); err != nil {
+		t.Fatalf("SetManual failed: %v", err)
+	}
+
+	m, found = mr.FindModel("claude-3-7-sonnet")
+	if !found || m.ID != "gemini-3.8-flash" {
+		t.Fatalf("expected gemini-3.8-flash after manual override, got %+v", m)
+	}
+
+	// Test AnthropicDefaultModel
+	def := mr.AnthropicDefaultModel()
+	if def != "claude-sonnet-4-6" {
+		t.Errorf("expected default to be claude-sonnet-4-6, got %s", def)
+	}
+}
+
+func TestModelRegistryCrossFamilyFallback(t *testing.T) {
+	cfg := &config.Config{}
+	authMgr := auth.NewManager(cfg, nil)
+	mr := NewModelRegistry(cfg, authMgr, nil)
+
+	mr.mu.Lock()
+	mr.models = map[string]*ModelInfo{
+		"gemini-3.8-flash": {ID: "gemini-3.8-flash", OwnedBy: "google"},
+	}
+	mr.champions = map[string]*ModelInfo{
+		"gemini-flash": mr.models["gemini-3.8-flash"],
+	}
+	mr.mu.Unlock()
+
+	// Requesting claude-3-7-sonnet with NO Claude models available
+	m, found := mr.FindModel("claude-3-7-sonnet")
+	if !found {
+		t.Fatal("expected cross-family fallback to succeed, got not found")
+	}
+	if m.ID != "gemini-3.8-flash" {
+		t.Errorf("expected cross-family fallback to gemini-3.8-flash, got %s", m.ID)
+	}
+}

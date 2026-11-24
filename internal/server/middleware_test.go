@@ -130,3 +130,63 @@ func TestMiddleware_MaxBytes_100MiBDefault(t *testing.T) {
 		t.Fatalf("expected 15 MiB payload to be accepted under 100 MiB ceiling, got status %d", rec.Code)
 	}
 }
+
+func TestMiddleware_ClientAuth_DualHeader(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			APIKeys: []config.APIKeyConfig{
+				{
+					ID:        "test-client-key",
+					KeySecret: "sk-anthropic-secret-12345",
+				},
+			},
+		},
+	}
+	mw := server.NewMiddleware(cfg)
+
+	handler := mw.ClientAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("authorized"))
+	}))
+
+	// 1. Anthropic x-api-key valid
+	req1 := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	req1.Header.Set("x-api-key", "sk-anthropic-secret-12345")
+	rec1 := httptest.NewRecorder()
+	handler.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid x-api-key, got %d", rec1.Code)
+	}
+
+	// 2. Anthropic x-api-key missing -> Anthropic JSON error format
+	req2 := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for missing x-api-key, got %d", rec2.Code)
+	}
+	if !strings.Contains(rec2.Body.String(), "authentication_error") {
+		t.Errorf("expected Anthropic authentication_error format, got %s", rec2.Body.String())
+	}
+
+	// 3. OpenAI Bearer valid
+	req3 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	req3.Header.Set("Authorization", "Bearer sk-anthropic-secret-12345")
+	rec3 := httptest.NewRecorder()
+	handler.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Errorf("expected 200 for valid Bearer token, got %d", rec3.Code)
+	}
+
+	// 4. OpenAI Bearer invalid -> OpenAI JSON error format
+	req4 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader("{}"))
+	req4.Header.Set("Authorization", "Bearer wrong-key")
+	rec4 := httptest.NewRecorder()
+	handler.ServeHTTP(rec4, req4)
+	if rec4.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong Bearer key, got %d", rec4.Code)
+	}
+	if !strings.Contains(rec4.Body.String(), "invalid_request_error") {
+		t.Errorf("expected OpenAI invalid_request_error format, got %s", rec4.Body.String())
+	}
+}

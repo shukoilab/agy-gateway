@@ -1,5 +1,188 @@
 basePath: /
 definitions:
+  anthropic.ContentBlock:
+    properties:
+      content: {}
+      data:
+        type: string
+      id:
+        example: toolu_01Abc...
+        type: string
+      input:
+        type: object
+      is_error:
+        type: boolean
+      name:
+        example: get_weather
+        type: string
+      signature:
+        example: EqQBCgIYAhIM1gbcDa9GJwZA2b3h...
+        type: string
+      source:
+        $ref: '#/definitions/anthropic.ImageSource'
+      text:
+        example: Hello world
+        type: string
+      thinking:
+        example: Let's evaluate the requested operation...
+        type: string
+      tool_use_id:
+        example: toolu_01Abc...
+        type: string
+      type:
+        description: '"text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"'
+        example: text
+        type: string
+    type: object
+  anthropic.ErrorDetails:
+    properties:
+      message:
+        example: 'Missing required field: max_tokens'
+        type: string
+      type:
+        example: invalid_request_error
+        type: string
+    type: object
+  anthropic.ErrorResponse:
+    properties:
+      error:
+        $ref: '#/definitions/anthropic.ErrorDetails'
+      type:
+        example: error
+        type: string
+    type: object
+  anthropic.ImageSource:
+    properties:
+      data:
+        type: string
+      media_type:
+        example: image/jpeg
+        type: string
+      type:
+        description: '"base64" or "url"'
+        example: base64
+        type: string
+      url:
+        type: string
+    type: object
+  anthropic.Message:
+    properties:
+      content:
+        example: Hello, Claude!
+        type: string
+      role:
+        description: '"user" or "assistant"'
+        example: user
+        type: string
+    type: object
+  anthropic.MessageRequest:
+    properties:
+      max_tokens:
+        example: 4096
+        type: integer
+      messages:
+        items:
+          $ref: '#/definitions/anthropic.Message'
+        type: array
+      metadata:
+        $ref: '#/definitions/anthropic.RequestMetadata'
+      model:
+        example: claude-3-5-sonnet-20241022
+        type: string
+      stop_sequences:
+        items:
+          type: string
+        type: array
+      stream:
+        example: false
+        type: boolean
+      system:
+        example: You are an expert AI architect.
+        type: string
+      temperature:
+        example: 0.7
+        type: number
+      thinking:
+        $ref: '#/definitions/anthropic.ThinkingConfig'
+      tool_choice:
+        type: object
+      tools:
+        items:
+          $ref: '#/definitions/anthropic.Tool'
+        type: array
+      top_k:
+        example: 40
+        type: integer
+      top_p:
+        example: 0.95
+        type: number
+    type: object
+  anthropic.MessageResponse:
+    properties:
+      content:
+        items:
+          $ref: '#/definitions/anthropic.ContentBlock'
+        type: array
+      id:
+        example: msg_01XFDUDYJgAACzvnptvVoYEL
+        type: string
+      model:
+        example: claude-3-5-sonnet-20241022
+        type: string
+      role:
+        example: assistant
+        type: string
+      stop_reason:
+        example: end_turn
+        type: string
+      stop_sequence:
+        type: string
+      type:
+        example: message
+        type: string
+      usage:
+        $ref: '#/definitions/anthropic.Usage'
+    type: object
+  anthropic.RequestMetadata:
+    properties:
+      user_id:
+        example: user_12345
+        type: string
+    type: object
+  anthropic.ThinkingConfig:
+    properties:
+      budget_tokens:
+        example: 1024
+        type: integer
+      type:
+        description: '"enabled" or "adaptive"'
+        example: enabled
+        type: string
+    type: object
+  anthropic.Tool:
+    properties:
+      description:
+        example: Get the current weather for a given city.
+        type: string
+      input_schema:
+        type: object
+      name:
+        example: get_weather
+        type: string
+    type: object
+  anthropic.Usage:
+    properties:
+      cache_creation_input_tokens:
+        type: integer
+      cache_read_input_tokens:
+        type: integer
+      input_tokens:
+        example: 25
+        type: integer
+      output_tokens:
+        example: 18
+        type: integer
+    type: object
   auth.Account:
     properties:
       alias:
@@ -252,6 +435,35 @@ definitions:
         example: function
         type: string
     type: object
+  models.AliasSource:
+    enum:
+    - admin_override
+    - auto_synthesized
+    - fallback
+    type: string
+    x-enum-varnames:
+    - SourceAdminOverride
+    - SourceAutoSynthesized
+    - SourceFallback
+  models.ModelAliasEntry:
+    properties:
+      alias:
+        example: claude-3-7-sonnet
+        type: string
+      description:
+        example: Auto-routed to highest ranking Sonnet model in active accounts
+        type: string
+      source:
+        allOf:
+        - $ref: '#/definitions/models.AliasSource'
+        example: auto_synthesized
+      target:
+        example: claude-sonnet-4-6
+        type: string
+      updated_at:
+        example: "2026-11-24T12:00:00Z"
+        type: string
+    type: object
   openai.ChatCompletionChoice:
     properties:
       finish_reason:
@@ -500,6 +712,23 @@ definitions:
         example: work-account
         type: string
     type: object
+  server.AnthropicAliasesResponse:
+    properties:
+      aliases:
+        description: Active model aliases sorted with manual overrides first
+        items:
+          $ref: '#/definitions/models.ModelAliasEntry'
+        type: array
+      champions:
+        additionalProperties:
+          type: string
+        description: Elected family champions mapped to discovered models
+        type: object
+      total:
+        description: Total count of active model aliases
+        example: 12
+        type: integer
+    type: object
   server.LoginCallbackRequest:
     properties:
       code:
@@ -569,11 +798,47 @@ definitions:
         example: "43125"
         type: string
     type: object
+  server.ModelSyncResponse:
+    properties:
+      champions:
+        additionalProperties:
+          type: string
+        description: Elected family champions
+        type: object
+      discovered_models:
+        description: Number of unique models discovered across accounts
+        example: 6
+        type: integer
+      status:
+        description: Status outcome indicator (e.g. "synchronized")
+        example: synchronized
+        type: string
+      total_aliases:
+        description: Total count of active aliases (manual + dynamic)
+        example: 12
+        type: integer
+    type: object
   server.OpsHealthResponse:
     properties:
       status:
         description: Status health indicator ("healthy" or "ready")
         example: healthy
+        type: string
+    type: object
+  server.SetModelAliasRequest:
+    properties:
+      alias:
+        description: Canonical alias or requested model identifier (e.g. "claude-3-7-sonnet")
+        example: claude-3-7-sonnet
+        type: string
+      description:
+        description: Optional description or rationale for this manual mapping override
+        example: Manual override pinned to Sonnet 4.6
+        type: string
+      target:
+        description: Target model discovered from accounts to route requests to (e.g.
+          "claude-sonnet-4-6")
+        example: claude-sonnet-4-6
         type: string
     type: object
   server.StatusResponse:
@@ -945,6 +1210,150 @@ paths:
       summary: Get raw agy usage JSON
       tags:
       - Admin - Accounts
+  /admin/v1/models/anthropic/aliases:
+    get:
+      consumes:
+      - application/json
+      description: Returns all manual admin overrides, dynamic synthesized aliases,
+        and family champions (Sonnet, Haiku, Opus, Flash).
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Active model aliases and champion rankings
+          schema:
+            $ref: '#/definitions/server.AnthropicAliasesResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Model registry not initialized
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: List active Anthropic model aliases and champions
+      tags:
+      - Admin - Anthropic Models
+    post:
+      consumes:
+      - application/json
+      description: Registers a permanent manual alias override in the vault ($VAULT_DIR/anthropic-model-aliases.json).
+        Takes precedence over dynamic synthesized aliases.
+      parameters:
+      - description: Alias mapping specification
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/server.SetModelAliasRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Confirmation of saved alias
+          schema:
+            $ref: '#/definitions/server.StatusResponse'
+        "400":
+          description: Invalid request parameters
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to persist alias
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Create or override a manual Anthropic model alias
+      tags:
+      - Admin - Anthropic Models
+  /admin/v1/models/anthropic/aliases/{alias}:
+    delete:
+      consumes:
+      - application/json
+      description: Removes a manual alias override from the persistent vault, restoring
+        dynamic capability-based routing for that alias.
+      parameters:
+      - description: Alias identifier to delete (e.g. claude-3-7-sonnet)
+        in: path
+        name: alias
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Confirmation of removed alias
+          schema:
+            $ref: '#/definitions/server.StatusResponse'
+        "400":
+          description: Missing alias identifier
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "404":
+          description: Manual alias override not found
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Failed to delete alias
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Delete a manual Anthropic model alias override
+      tags:
+      - Admin - Anthropic Models
+  /admin/v1/models/anthropic/sync:
+    post:
+      consumes:
+      - application/json
+      description: Queries models dynamically from all accounts and refreshes intelligence
+        from models.dev, electing new family champions and updating synthesized aliases.
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: Summary of synchronized models and champions
+          schema:
+            $ref: '#/definitions/server.ModelSyncResponse'
+        "401":
+          description: 'Unauthorized: missing or invalid Admin Bearer token'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "403":
+          description: 'Forbidden: Admin API key is not configured'
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+        "500":
+          description: Sync failed
+          schema:
+            $ref: '#/definitions/server.AdminErrorResponse'
+      security:
+      - AdminBearerAuth: []
+      summary: Trigger dynamic Anthropic model discovery and ranking
+      tags:
+      - Admin - Anthropic Models
   /admin/v1/vault/clean:
     post:
       consumes:
@@ -1110,6 +1519,56 @@ paths:
       summary: Create chat completion
       tags:
       - OpenAI - Chat Completions
+  /v1/messages:
+    post:
+      consumes:
+      - application/json
+      description: 'Creates a structured message response for conversational turns.
+        100% compliant with Anthropic Messages API (2026 standard). Supports streaming
+        SSE (stream: true), multi-turn conversation history, real-time reasoning (extended
+        thinking), client-side tool calling with JIT prompt envelope translation,
+        and automated multi-account failover.'
+      parameters:
+      - description: Anthropic Messages request parameters including model, messages,
+          tools, and thinking preferences
+        in: body
+        name: request
+        required: true
+        schema:
+          $ref: '#/definitions/anthropic.MessageRequest'
+      produces:
+      - application/json
+      - text/event-stream
+      responses:
+        "200":
+          description: Message generated successfully (non-streaming mode)
+          schema:
+            $ref: '#/definitions/anthropic.MessageResponse'
+        "400":
+          description: Invalid JSON body, missing parameters, or validation violation
+          schema:
+            $ref: '#/definitions/anthropic.ErrorResponse'
+        "401":
+          description: Missing, expired, or invalid API key
+          schema:
+            $ref: '#/definitions/anthropic.ErrorResponse'
+        "404":
+          description: Requested model identifier was not found in catalog
+          schema:
+            $ref: '#/definitions/anthropic.ErrorResponse'
+        "429":
+          description: Client rate limit exceeded (RPM) or all accounts in cooldown
+          schema:
+            $ref: '#/definitions/anthropic.ErrorResponse'
+        "500":
+          description: Internal gateway error or failure executing turn across workers
+          schema:
+            $ref: '#/definitions/anthropic.ErrorResponse'
+      security:
+      - ClientBearerAuth: []
+      summary: Create message
+      tags:
+      - Anthropic - Messages
   /v1/models:
     get:
       consumes:
