@@ -221,6 +221,10 @@ func (c *AgyAuthClient) DownloadAndInstall(ctx context.Context, downloadURL stri
 							break
 						}
 					}
+					if scanErr := scanner.Err(); scanErr != nil {
+						_ = chkResp.Body.Close()
+						return "", fmt.Errorf("error reading checksums from %s: %w", checksumsURL, scanErr)
+					}
 				}
 				_ = chkResp.Body.Close()
 			}
