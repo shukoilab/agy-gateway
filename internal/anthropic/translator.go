@@ -140,11 +140,50 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) (string, [
 	}
 }
 
+// cleanAnthropicToolContent sanitizes tool execution result text and strips duplicate turn headers.
+func cleanAnthropicToolContent(content, toolUseID string) string {
+	s := strings.TrimSpace(content)
+	for {
+		if strings.HasPrefix(s, "User: [Tool Execution Results]") {
+			s = strings.TrimSpace(strings.TrimPrefix(s, "User: [Tool Execution Results]"))
+		} else if strings.HasPrefix(s, "[Tool Execution Results]") {
+			s = strings.TrimSpace(strings.TrimPrefix(s, "[Tool Execution Results]"))
+		} else {
+			break
+		}
+	}
+	if toolUseID != "" {
+		expectedPrefix := fmt.Sprintf("Tool Output (id: %s):", toolUseID)
+		if strings.HasPrefix(s, expectedPrefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, expectedPrefix))
+		}
+		expectedErrPrefix := fmt.Sprintf("Tool Error (id: %s):", toolUseID)
+		if strings.HasPrefix(s, expectedErrPrefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, expectedErrPrefix))
+		}
+	}
+	if strings.HasPrefix(s, "Tool Output:") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Output:"))
+	}
+	return s
+}
+
 // formatUserMessage formats user turns, handling text, images, and tool_result blocks.
 // Returns true if the message contained tool_result blocks.
 func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) bool {
 	if len(msg.Content.Blocks) == 0 {
 		if msg.Content.Text != "" {
+			trimmed := strings.TrimSpace(msg.Content.Text)
+			if strings.HasPrefix(trimmed, "User: [Tool Execution Results]") || strings.HasPrefix(trimmed, "[Tool Execution Results]") {
+				cleaned := cleanAnthropicToolContent(trimmed, "")
+				curr := strings.TrimSpace(sb.String())
+				if !strings.HasSuffix(curr, "[Tool Execution Results]") {
+					sb.WriteString("User: [Tool Execution Results]\n")
+				}
+				sb.WriteString(cleaned)
+				sb.WriteString("\n\n")
+				return true
+			}
 			fmt.Fprintf(sb, "User: %s\n\n", msg.Content.Text)
 		}
 		return false
@@ -170,6 +209,7 @@ func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) bool {
 				raw, _ := json.Marshal(c)
 				resStr = string(raw)
 			}
+			resStr = cleanAnthropicToolContent(resStr, block.ToolUseID)
 			if block.IsError {
 				toolResults = append(toolResults, fmt.Sprintf("Tool Error (id: %s): %s", block.ToolUseID, resStr))
 			} else {

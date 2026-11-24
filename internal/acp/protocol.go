@@ -2,7 +2,11 @@
 // for communication with the Google Antigravity CLI (agy acp).
 package acp
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
 
 // JSON-RPC 2.0 constants
 const (
@@ -121,8 +125,81 @@ type SessionUpdateParams struct {
 }
 
 // ContentChunk represents inner text content within a session update.
+//
+// @purpose Encapsulates polymorphic content payloads received in ACP session/update notifications.
+// @rationale Supports both single object and array representation (e.g. [{"type": "text", "text": "..."}])
+// sent by diverse upstream agy acp agent runtimes without unmarshaling failures.
+// @preconditions Valid JSON input bytes representing an object, an array of objects/strings, or a plain string.
+// @invariants Thread-safe, deterministic concatenation of array chunks.
 type ContentChunk struct {
+	Type string `json:"type,omitempty"`
 	Text string `json:"text,omitempty"`
+}
+
+// UnmarshalJSON deserializes ContentChunk from either an object, an array of chunks, or a plain string.
+func (c *ContentChunk) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+
+	// 1. JSON Array: [{"type":"text","text":"..."}, ...] or ["...", ...]
+	if trimmed[0] == '[' {
+		var rawItems []json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawItems); err != nil {
+			return err
+		}
+		var sb strings.Builder
+		for _, rawItem := range rawItems {
+			itemTrimmed := bytes.TrimSpace(rawItem)
+			if len(itemTrimmed) == 0 || bytes.Equal(itemTrimmed, []byte("null")) {
+				continue
+			}
+			if itemTrimmed[0] == '{' {
+				var obj struct {
+					Type string `json:"type,omitempty"`
+					Text string `json:"text,omitempty"`
+				}
+				if err := json.Unmarshal(itemTrimmed, &obj); err == nil {
+					sb.WriteString(obj.Text)
+					if c.Type == "" && obj.Type != "" {
+						c.Type = obj.Type
+					}
+					continue
+				}
+			}
+			var str string
+			if err := json.Unmarshal(itemTrimmed, &str); err == nil {
+				sb.WriteString(str)
+				continue
+			}
+		}
+		c.Text = sb.String()
+		return nil
+	}
+
+	// 2. JSON Object: {"type": "text", "text": "..."} or {"text": "..."}
+	if trimmed[0] == '{' {
+		var obj struct {
+			Type string `json:"type,omitempty"`
+			Text string `json:"text,omitempty"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return err
+		}
+		c.Type = obj.Type
+		c.Text = obj.Text
+		return nil
+	}
+
+	// 3. Plain JSON String: "text chunk"
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err == nil {
+		c.Text = str
+		return nil
+	}
+
+	return nil
 }
 
 // SessionUpdate contains details of live turn streaming from the agent.

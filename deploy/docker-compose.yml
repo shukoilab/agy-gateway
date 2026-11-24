@@ -10,6 +10,8 @@ services:
     stop_grace_period: 30s
     ports:
       - "${AGY_GW_HOST_PORT:-${PORT:-8080}}:${AGY_GW_PORT:-${PORT:-8080}}"
+    env_file:
+      - .env
     environment:
       - AGY_GW_PORT=${AGY_GW_PORT:-${PORT:-8080}}
       - AGY_GW_HOST=${AGY_GW_HOST:-0.0.0.0}

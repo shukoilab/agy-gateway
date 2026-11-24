@@ -269,6 +269,7 @@ func (t *Transport) dispatchResponse(resp *Response) {
 }
 
 func (t *Transport) handleIncomingRequest(req *Request) {
+	t.logger.Debug("acp incoming request received", "method", req.Method, "id", req.ID)
 	if req.Method == "session/request_permission" {
 		t.handlePermissionRequest(req)
 		return
@@ -341,12 +342,20 @@ func (t *Transport) handlePermissionRequest(req *Request) {
 }
 
 func (t *Transport) handleIncomingNotification(notif *Notification) {
+	t.logger.Debug("acp incoming notification received", "method", notif.Method, "rawBytes", len(notif.Params))
 	if notif.Method == "session/update" {
 		var params SessionUpdateParams
 		if err := json.Unmarshal(notif.Params, &params); err != nil {
-			t.logger.Warn("failed to parse session/update notification", "error", err)
+			t.logger.Warn("failed to parse session/update notification", "error", err, "raw", string(notif.Params))
 			return
 		}
+
+		t.logger.Debug("acp session/update parsed",
+			"sessionId", params.SessionID,
+			"sessionUpdate", params.Update.SessionUpdate,
+			"hasContent", params.Update.Content != nil,
+			"toolCallId", params.Update.ToolCallID,
+		)
 
 		t.updateListenerMu.RLock()
 		listener := t.updateListener

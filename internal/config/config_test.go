@@ -161,3 +161,60 @@ func TestConfig_1MContextDefaults(t *testing.T) {
 		t.Errorf("expected 16 MiB (16777216) MaxToolArgumentBytes, got %d", cfg.MCP.ClientToolCalling.MaxToolArgumentBytes)
 	}
 }
+
+func TestConfig_ParseDurationEnv(t *testing.T) {
+	defaultDur := 30 * time.Second
+
+	tests := []struct {
+		input    string
+		expected time.Duration
+	}{
+		{"1800s", 1800 * time.Second},
+		{"30m", 30 * time.Minute},
+		{"1h", 1 * time.Hour},
+		{"1800", 1800 * time.Second}, // raw number without unit treated as seconds
+		{"45.5", 45500 * time.Millisecond},
+		{"", defaultDur},
+		{"invalid", defaultDur},
+		{"0", defaultDur},
+		{"-10s", defaultDur},
+	}
+
+	for _, tt := range tests {
+		got := parseDurationEnv(tt.input, defaultDur)
+		if got != tt.expected {
+			t.Errorf("parseDurationEnv(%q) = %v; want %v", tt.input, got, tt.expected)
+		}
+	}
+}
+
+func TestConfig_NewEnvOverrides(t *testing.T) {
+	t.Setenv("AGY_GW_QUOTA_POLL_INTERVAL", "1800s")
+	t.Setenv("AGY_GW_UNSUPPORTED_PARAM_POLICY", "reject")
+	t.Setenv("AGY_GW_ALLOW_REMOTE_IMAGE_URLS", "true")
+	t.Setenv("AGY_GW_CLEAN_WORKSPACE", "false")
+	t.Setenv("AGY_GW_DEFAULT_COOLDOWN_5H", "45m")
+	t.Setenv("AGY_GW_DEFAULT_COOLDOWN_WEEKLY", "12h")
+
+	cfg := DefaultConfig()
+	applyEnvOverrides(cfg)
+
+	if cfg.Accounts.QuotaPollInterval != 1800*time.Second {
+		t.Errorf("expected QuotaPollInterval 1800s, got %v", cfg.Accounts.QuotaPollInterval)
+	}
+	if cfg.OpenAI.UnsupportedParamPolicy != "reject" {
+		t.Errorf("expected UnsupportedParamPolicy 'reject', got %v", cfg.OpenAI.UnsupportedParamPolicy)
+	}
+	if !cfg.Security.AllowRemoteImageURLs {
+		t.Errorf("expected AllowRemoteImageURLs true, got %v", cfg.Security.AllowRemoteImageURLs)
+	}
+	if cfg.Execution.CleanWorkspaceBetweenRequests {
+		t.Errorf("expected CleanWorkspaceBetweenRequests false, got %v", cfg.Execution.CleanWorkspaceBetweenRequests)
+	}
+	if cfg.Accounts.DefaultCooldown5h != 45*time.Minute {
+		t.Errorf("expected DefaultCooldown5h 45m, got %v", cfg.Accounts.DefaultCooldown5h)
+	}
+	if cfg.Accounts.DefaultCooldownWeekly != 12*time.Hour {
+		t.Errorf("expected DefaultCooldownWeekly 12h, got %v", cfg.Accounts.DefaultCooldownWeekly)
+	}
+}

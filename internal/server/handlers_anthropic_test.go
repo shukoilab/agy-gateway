@@ -454,3 +454,105 @@ func TestAnthropicHandlers_EndToEnd_Streaming(t *testing.T) {
 		t.Errorf("expected stream to contain text_delta with message text")
 	}
 }
+
+func TestAnthropicHandlers_EndToEnd_StreamingToolUse(t *testing.T) {
+	handlers, cfg, _, _, _, _ := setupAnthropicTestEnvironment(t)
+
+	mockWorker := createMockWorkerWithPipe(t, 0, cfg, func(method string, params json.RawMessage, inWriter io.Writer) {
+		// Emit tool call in message chunk
+		textUpdate := map[string]any{
+			"jsonrpc": "2.0",
+			"method":  "session/update",
+			"params": map[string]any{
+				"sessionId": "mock_sess_tool_use",
+				"update": map[string]any{
+					"sessionUpdate": acp.UpdateAgentMessageChunk,
+					"content": map[string]any{
+						"type": "text",
+						"text": `<tool_call>{"id": "call_123", "name": "write", "arguments": {"command": "pwd && git status --porcelain"}}</tool_call>`,
+					},
+				},
+			},
+		}
+		rawText, _ := json.Marshal(textUpdate)
+		_, _ = inWriter.Write(append(rawText, '\n'))
+	})
+
+	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
+	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil)
+
+	payload := `{
+		"model": "claude-3-5-sonnet",
+		"max_tokens": 1024,
+		"stream": true,
+		"messages": [
+			{"role": "user", "content": "Run git status"}
+		],
+		"tools": [
+			{
+				"name": "write",
+				"description": "Execute write command",
+				"input_schema": {
+					"type": "object",
+					"properties": {
+						"command": {"type": "string"}
+					},
+					"required": ["command"]
+				}
+			}
+		]
+	}`
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(payload))
+	rec := httptest.NewRecorder()
+
+	handlers.HandleMessages(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	body := rec.Body.String()
+
+	// 1. Verify content_block_start has input: {} (empty JSON object as mandated by Anthropic spec)
+	if !strings.Contains(body, `"type":"tool_use"`) {
+		t.Fatalf("expected stream to contain tool_use content block start:\n%s", body)
+	}
+	if !strings.Contains(body, `"input":{}`) {
+		t.Errorf("expected content_block_start to have empty 'input:{}' object to prevent client duplication, got:\n%s", body)
+	}
+
+	// 2. Verify input_json_delta delivers arguments
+	if !strings.Contains(body, `"type":"input_json_delta"`) {
+		t.Errorf("expected stream to contain input_json_delta event")
+	}
+
+	// 3. Simulate client parsing (e.g. OpenCode / @anthropic-ai/sdk)
+	var accumulatedJSON string
+	lines := strings.Split(body, "\n")
+	for _, l := range lines {
+		if strings.HasPrefix(l, "data: ") {
+			dataStr := strings.TrimPrefix(l, "data: ")
+			var evt map[string]any
+			if err := json.Unmarshal([]byte(dataStr), &evt); err == nil {
+				if delta, ok := evt["delta"].(map[string]any); ok {
+					if delta["type"] == "input_json_delta" {
+						if pj, ok := delta["partial_json"].(string); ok {
+							accumulatedJSON += pj
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var parsedArgs map[string]any
+	if err := json.Unmarshal([]byte(accumulatedJSON), &parsedArgs); err != nil {
+		t.Fatalf("client failed to parse accumulated tool JSON arguments: %v (raw: %q)", err, accumulatedJSON)
+	}
+
+	if cmd, ok := parsedArgs["command"].(string); !ok || cmd != "pwd && git status --porcelain" {
+		t.Errorf("expected command 'pwd && git status --porcelain', got %v", parsedArgs["command"])
+	}
+}

@@ -171,3 +171,43 @@ func TestStreamParser_ByteByByteStreaming(t *testing.T) {
 		t.Fatalf("Byte-by-byte: expected text 'Intro  Outro', got %q", collectedText)
 	}
 }
+
+func TestStreamParser_StripHallucinatedPrefix(t *testing.T) {
+	t.Run("Assistant prefix stripped in single chunk", func(t *testing.T) {
+		parser := NewStreamParser("tool_call")
+		d, tc := parser.ParseChunk("Assistant: Here is the plan.")
+		fd, _ := parser.Flush()
+		total := d + fd
+		if total != "Here is the plan." || len(tc) != 0 {
+			t.Fatalf("expected 'Here is the plan.', got %q", total)
+		}
+	})
+
+	t.Run("User tool results prefix stripped", func(t *testing.T) {
+		parser := NewStreamParser("tool_call")
+		d, tc := parser.ParseChunk("User: [Tool Execution Results]\n<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"foo.txt\"}}</tool_call>")
+		fd, ftc := parser.Flush()
+		total := d + fd
+		allTools := append(tc, ftc...)
+		if total != "" {
+			t.Fatalf("expected empty text, got %q", total)
+		}
+		if len(allTools) != 1 || allTools[0].Function.Name != "read" {
+			t.Fatalf("expected 1 read tool, got %+v", allTools)
+		}
+	})
+
+	t.Run("Prefix split across chunks", func(t *testing.T) {
+		parser := NewStreamParser("tool_call")
+		d1, _ := parser.ParseChunk("Assis")
+		if d1 != "" {
+			t.Fatalf("expected empty delta while buffering prefix, got %q", d1)
+		}
+		d2, _ := parser.ParseChunk("tant: Hello world!")
+		fd, _ := parser.Flush()
+		total := d1 + d2 + fd
+		if total != "Hello world!" {
+			t.Fatalf("expected 'Hello world!', got %q", total)
+		}
+	})
+}

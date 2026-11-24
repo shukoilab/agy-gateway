@@ -22,6 +22,47 @@ type StreamParser struct {
 	toolJSONBuf  strings.Builder
 	activeCallID string
 	activeName   string
+	started      bool
+}
+
+// cleanLeadingHallucinatedPrefix strips model-echoed turn markers (e.g. "Assistant:", "User: [Tool Execution Results]")
+// from the beginning of assistant generation.
+func cleanLeadingHallucinatedPrefix(s string) (string, bool) {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	matched := false
+	for {
+		if strings.HasPrefix(trimmed, "Assistant:") {
+			trimmed = strings.TrimPrefix(trimmed, "Assistant:")
+			trimmed = strings.TrimLeft(trimmed, " \t\r\n")
+			matched = true
+		} else if strings.HasPrefix(trimmed, "User: [Tool Execution Results]") {
+			trimmed = strings.TrimPrefix(trimmed, "User: [Tool Execution Results]")
+			trimmed = strings.TrimLeft(trimmed, " \t\r\n")
+			matched = true
+		} else if strings.HasPrefix(trimmed, "[Tool Execution Results]") {
+			trimmed = strings.TrimPrefix(trimmed, "[Tool Execution Results]")
+			trimmed = strings.TrimLeft(trimmed, " \t\r\n")
+			matched = true
+		} else {
+			break
+		}
+	}
+	return trimmed, matched
+}
+
+// isPotentialPrefix checks if a string is a partial prefix of known hallucinated role markers.
+func isPotentialPrefix(s string) bool {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	if len(trimmed) == 0 {
+		return true // purely leading whitespace, hold until text arrives
+	}
+	candidates := []string{"Assistant:", "User: [Tool Execution Results]", "[Tool Execution Results]"}
+	for _, cand := range candidates {
+		if len(trimmed) < len(cand) && strings.HasPrefix(cand, trimmed) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewStreamParser creates a parser instance.
@@ -43,6 +84,19 @@ func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolCalls []
 
 	sp.buffer.WriteString(chunk)
 	current := sp.buffer.String()
+
+	if !sp.started {
+		if isPotentialPrefix(current) && len(current) < 32 {
+			return "", nil
+		}
+		cleaned, wasStripped := cleanLeadingHallucinatedPrefix(current)
+		if wasStripped {
+			current = cleaned
+			sp.buffer.Reset()
+			sp.buffer.WriteString(current)
+		}
+		sp.started = true
+	}
 
 	for len(current) > 0 {
 		if !sp.inTool {
@@ -157,6 +211,15 @@ func (sp *StreamParser) Flush() (textDelta string, toolCalls []ToolCall) {
 	sp.mu.Lock()
 	defer sp.mu.Unlock()
 
+	if !sp.started {
+		cleaned, wasStripped := cleanLeadingHallucinatedPrefix(sp.buffer.String())
+		if wasStripped {
+			sp.buffer.Reset()
+			sp.buffer.WriteString(cleaned)
+		}
+		sp.started = true
+	}
+
 	if sp.inTool {
 		fullJSON := strings.TrimSpace(sp.toolJSONBuf.String() + sp.buffer.String())
 		// Resilient recovery: strip any trailing complete or partial close tag that was buffered or swallowed
@@ -262,5 +325,6 @@ func ParseCompleteResponse(rawText, delimiter string) (string, []ToolCall, bool)
 	}
 
 	cleanText := strings.TrimSpace(pattern.ReplaceAllString(rawText, ""))
+	cleanText, _ = cleanLeadingHallucinatedPrefix(cleanText)
 	return cleanText, toolCalls, len(toolCalls) > 0
 }

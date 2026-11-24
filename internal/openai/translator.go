@@ -21,6 +21,30 @@ func NewTranslator() *Translator {
 	}
 }
 
+// cleanToolOutputContent sanitizes tool execution result text and strips duplicate turn headers.
+func cleanToolOutputContent(content, toolCallID string) string {
+	s := strings.TrimSpace(content)
+	for {
+		if strings.HasPrefix(s, "User: [Tool Execution Results]") {
+			s = strings.TrimSpace(strings.TrimPrefix(s, "User: [Tool Execution Results]"))
+		} else if strings.HasPrefix(s, "[Tool Execution Results]") {
+			s = strings.TrimSpace(strings.TrimPrefix(s, "[Tool Execution Results]"))
+		} else {
+			break
+		}
+	}
+	if toolCallID != "" {
+		expectedPrefix := fmt.Sprintf("Tool Output (id: %s):", toolCallID)
+		if strings.HasPrefix(s, expectedPrefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, expectedPrefix))
+		}
+	}
+	if strings.HasPrefix(s, "Tool Output:") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Output:"))
+	}
+	return s
+}
+
 // Translate extracts system instructions and formats the multi-turn conversational history.
 // Consumer system instructions and tool calling directives are extracted into a dedicated systemPrompt
 // string for native injection into ACP session/new via _meta.antigravity.systemPrompt.append.
@@ -99,7 +123,18 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (st
 
 		switch role {
 		case "user":
-			fmt.Fprintf(&historyBuilder, "User: %s\n\n", content)
+			trimmed := strings.TrimSpace(content)
+			if strings.HasPrefix(trimmed, "User: [Tool Execution Results]") || strings.HasPrefix(trimmed, "[Tool Execution Results]") {
+				cleaned := cleanToolOutputContent(trimmed, "")
+				currHistory := strings.TrimSpace(historyBuilder.String())
+				if !strings.HasSuffix(currHistory, "[Tool Execution Results]") {
+					historyBuilder.WriteString("User: [Tool Execution Results]\n")
+				}
+				historyBuilder.WriteString(cleaned)
+				historyBuilder.WriteString("\n\n")
+			} else {
+				fmt.Fprintf(&historyBuilder, "User: %s\n\n", content)
+			}
 		case "assistant":
 			if len(msg.ToolCalls) > 0 {
 				var calls []string
@@ -120,11 +155,14 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (st
 				fmt.Fprintf(&historyBuilder, "Assistant: %s\n\n", content)
 			}
 		case "tool":
-			// Group consecutive tool outputs under a single User turn
-			if i == 0 || strings.ToLower(nonSysMessages[i-1].Role) != "tool" {
-				historyBuilder.WriteString("User: [Tool Execution Results]\n")
+			cleaned := cleanToolOutputContent(content, msg.ToolCallID)
+			currHistory := strings.TrimSpace(historyBuilder.String())
+			if !strings.HasSuffix(currHistory, "[Tool Execution Results]") {
+				if i == 0 || strings.ToLower(nonSysMessages[i-1].Role) != "tool" {
+					historyBuilder.WriteString("User: [Tool Execution Results]\n")
+				}
 			}
-			fmt.Fprintf(&historyBuilder, "Tool Output (id: %s): %s\n", msg.ToolCallID, content)
+			fmt.Fprintf(&historyBuilder, "Tool Output (id: %s): %s\n", msg.ToolCallID, cleaned)
 			if i+1 == len(nonSysMessages) || strings.ToLower(nonSysMessages[i+1].Role) != "tool" {
 				historyBuilder.WriteString("\n")
 			}

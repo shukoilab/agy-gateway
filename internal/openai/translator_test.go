@@ -152,3 +152,32 @@ func TestTranslator_ToolExecutionResultsGroupingAndContinuation(t *testing.T) {
 		t.Fatalf("expected prompt to end with 'Assistant: ', got:\n%s", prompt)
 	}
 }
+
+func TestTranslator_ToolOutputDeduplication(t *testing.T) {
+	translator := NewTranslator()
+
+	// Simulating client harness sending tool result that already has "User: [Tool Execution Results]"
+	req := &ChatCompletionRequest{
+		Model: "gemini-3.8-flash",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "read the file"},
+			{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_read_1", Function: FunctionCallData{Name: "read", Arguments: `{"path":"main.go"}`}}}},
+			{Role: "tool", ToolCallID: "call_read_1", Content: "User: [Tool Execution Results]\nTool Output (id: call_read_1): package main\nfunc main() {}"},
+		},
+	}
+
+	_, promptBlocks := translator.Translate(req, "tool_call")
+	prompt := promptBlocks[0].Text
+
+	// Count occurrences of "User: [Tool Execution Results]"
+	count := strings.Count(prompt, "User: [Tool Execution Results]")
+	if count != 1 {
+		t.Fatalf("expected exactly 1 'User: [Tool Execution Results]', got %d in prompt:\n%s", count, prompt)
+	}
+
+	// Ensure "Tool Output (id: call_read_1):" is not duplicated
+	callPrefixCount := strings.Count(prompt, "Tool Output (id: call_read_1):")
+	if callPrefixCount != 1 {
+		t.Fatalf("expected exactly 1 'Tool Output (id: call_read_1):', got %d in prompt:\n%s", callPrefixCount, prompt)
+	}
+}

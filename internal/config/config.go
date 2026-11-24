@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -448,19 +449,13 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("AGY_GW_READ_HEADER_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Server.ReadHeaderTimeout = d
-		}
+		cfg.Server.ReadHeaderTimeout = parseDurationEnv(v, cfg.Server.ReadHeaderTimeout)
 	}
 	if v := os.Getenv("AGY_GW_IDLE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Server.IdleTimeout = d
-		}
+		cfg.Server.IdleTimeout = parseDurationEnv(v, cfg.Server.IdleTimeout)
 	}
 	if v := os.Getenv("AGY_GW_SHUTDOWN_DRAIN_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Server.ShutdownDrainTimeout = d
-		}
+		cfg.Server.ShutdownDrainTimeout = parseDurationEnv(v, cfg.Server.ShutdownDrainTimeout)
 	}
 	if v := os.Getenv("AGY_GW_MAX_REQUEST_BODY_BYTES"); v != "" {
 		var n int64
@@ -469,9 +464,7 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("AGY_GW_SSE_KEEPALIVE_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Server.SSEKeepaliveInterval = d
-		}
+		cfg.Server.SSEKeepaliveInterval = parseDurationEnv(v, cfg.Server.SSEKeepaliveInterval)
 	}
 
 	// 2. Pool Overrides
@@ -482,24 +475,16 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("AGY_GW_POOL_ACQUIRE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Pool.AcquireTimeout = d
-		}
+		cfg.Pool.AcquireTimeout = parseDurationEnv(v, cfg.Pool.AcquireTimeout)
 	}
 	if v := os.Getenv("AGY_GW_POOL_HANDSHAKE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Pool.HandshakeTimeout = d
-		}
+		cfg.Pool.HandshakeTimeout = parseDurationEnv(v, cfg.Pool.HandshakeTimeout)
 	}
 	if v := os.Getenv("AGY_GW_POOL_INFERENCE_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Pool.InferenceTimeout = d
-		}
+		cfg.Pool.InferenceTimeout = parseDurationEnv(v, cfg.Pool.InferenceTimeout)
 	}
 	if v := os.Getenv("AGY_GW_POOL_FIRST_TOKEN_TIMEOUT"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Pool.FirstTokenTimeout = d
-		}
+		cfg.Pool.FirstTokenTimeout = parseDurationEnv(v, cfg.Pool.FirstTokenTimeout)
 	}
 	if v := os.Getenv("AGY_GW_POOL_MAX_REQUESTS_PER_WORKER"); v != "" {
 		var n int
@@ -508,9 +493,7 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("AGY_GW_POOL_MAX_WORKER_UPTIME"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Pool.MaxWorkerUptime = d
-		}
+		cfg.Pool.MaxWorkerUptime = parseDurationEnv(v, cfg.Pool.MaxWorkerUptime)
 	}
 	if v := os.Getenv("AGY_GW_POOL_MAX_SCANNER_BUFFER_BYTES"); v != "" {
 		var n int
@@ -553,15 +536,19 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.Accounts.AutoRotateEnabled = parseBoolEnv(v, cfg.Accounts.AutoRotateEnabled)
 	}
 	if v := os.Getenv("AGY_GW_QUOTA_POLL_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			cfg.Accounts.QuotaPollInterval = d
-		}
+		cfg.Accounts.QuotaPollInterval = parseDurationEnv(v, cfg.Accounts.QuotaPollInterval)
 	}
 	if v := os.Getenv("AGY_GW_MIN_REMAINING_QUOTA_PCT"); v != "" {
 		var pct float64
 		if _, err := fmt.Sscanf(v, "%f", &pct); err == nil && pct >= 0 {
 			cfg.Accounts.MinRemainingQuotaPct = pct
 		}
+	}
+	if v := os.Getenv("AGY_GW_DEFAULT_COOLDOWN_5H"); v != "" {
+		cfg.Accounts.DefaultCooldown5h = parseDurationEnv(v, cfg.Accounts.DefaultCooldown5h)
+	}
+	if v := os.Getenv("AGY_GW_DEFAULT_COOLDOWN_WEEKLY"); v != "" {
+		cfg.Accounts.DefaultCooldownWeekly = parseDurationEnv(v, cfg.Accounts.DefaultCooldownWeekly)
 	}
 	if v := getFirstEnv("AGY_GW_MAX_RETRIES", "MAX_RETRIES"); v != "" {
 		var retries int
@@ -578,14 +565,13 @@ func applyEnvOverrides(cfg *Config) {
 		}
 	}
 	if v := os.Getenv("AGY_GW_RETRY_INITIAL_BACKOFF"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.Execution.RetryInitialBackoff = d
-		}
+		cfg.Execution.RetryInitialBackoff = parseDurationEnv(v, cfg.Execution.RetryInitialBackoff)
 	}
 	if v := os.Getenv("AGY_GW_RETRY_MAX_BACKOFF"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.Execution.RetryMaxBackoff = d
-		}
+		cfg.Execution.RetryMaxBackoff = parseDurationEnv(v, cfg.Execution.RetryMaxBackoff)
+	}
+	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
+		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
 	}
 
 	// 5. OpenAI & Models Overrides
@@ -597,6 +583,12 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AGY_GW_EXPOSE_REASONING_CONTENT"); v != "" {
 		cfg.OpenAI.ExposeReasoningContent = parseBoolEnv(v, cfg.OpenAI.ExposeReasoningContent)
+	}
+	if v := os.Getenv("AGY_GW_UNSUPPORTED_PARAM_POLICY"); v != "" {
+		cfg.OpenAI.UnsupportedParamPolicy = v
+	}
+	if v := os.Getenv("AGY_GW_ALLOW_REMOTE_IMAGE_URLS"); v != "" {
+		cfg.Security.AllowRemoteImageURLs = parseBoolEnv(v, cfg.Security.AllowRemoteImageURLs)
 	}
 
 	// 5b. Anthropic Overrides
@@ -766,9 +758,7 @@ func applyEnvOverrides(cfg *Config) {
 		cfg.AutoUpdate.Enabled = parseBoolEnv(v, cfg.AutoUpdate.Enabled)
 	}
 	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_INTERVAL", "AUTO_UPDATE_INTERVAL"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.AutoUpdate.Interval = d
-		}
+		cfg.AutoUpdate.Interval = parseDurationEnv(v, cfg.AutoUpdate.Interval)
 	}
 	if v := getFirstEnv("AGY_GW_AUTO_UPDATE_ON_STARTUP", "AUTO_UPDATE_ON_STARTUP"); v != "" {
 		cfg.AutoUpdate.CheckOnStartup = parseBoolEnv(v, cfg.AutoUpdate.CheckOnStartup)
@@ -822,6 +812,26 @@ func parseBoolEnv(val string, defaultVal bool) bool {
 	default:
 		return defaultVal
 	}
+}
+
+// parseDurationEnv parses duration strings ("1800s", "30m", "1h") or raw integer/float
+// numbers ("1800", "60") which are treated as seconds. If parsing fails, defaultVal is returned.
+//
+// @purpose Provides foolproof, fail-soft duration parsing across 12-factor environment variables.
+// @rationale Users frequently omit unit suffixes (e.g. AGY_GW_QUOTA_POLL_INTERVAL=1800 vs 1800s).
+// Supporting both eliminates silent configuration failures.
+func parseDurationEnv(val string, defaultVal time.Duration) time.Duration {
+	s := strings.TrimSpace(val)
+	if s == "" {
+		return defaultVal
+	}
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 {
+		return time.Duration(secs * float64(time.Second))
+	}
+	return defaultVal
 }
 
 func validate(cfg *Config) error {

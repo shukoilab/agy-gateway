@@ -49,3 +49,74 @@ func TestTransport_YOLOAutoApprovalPriority(t *testing.T) {
 		t.Fatalf("expected always_opt to be selected, got %q", result.Outcome.OptionID)
 	}
 }
+
+func TestSessionUpdate_PolymorphicContentChunk(t *testing.T) {
+	tests := []struct {
+		name         string
+		jsonPayload  string
+		expectedText string
+		expectedType string
+	}{
+		{
+			name:         "Single object content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello world"}}}`,
+			expectedText: "hello world",
+			expectedType: "text",
+		},
+		{
+			name:         "Array of objects content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"part 1 - "},{"type":"text","text":"part 2"}]}}`,
+			expectedText: "part 1 - part 2",
+			expectedType: "text",
+		},
+		{
+			name:         "Array of raw strings content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":["thinking chunk 1, ", "thinking chunk 2"]}}`,
+			expectedText: "thinking chunk 1, thinking chunk 2",
+			expectedType: "",
+		},
+		{
+			name:         "Plain string content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":"single string value"}}`,
+			expectedText: "single string value",
+			expectedType: "",
+		},
+		{
+			name:         "Null content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"call_123","content":null}}`,
+			expectedText: "",
+			expectedType: "",
+		},
+		{
+			name:         "Missing content",
+			jsonPayload:  `{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"call_123"}}`,
+			expectedText: "",
+			expectedType: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var params SessionUpdateParams
+			if err := json.Unmarshal([]byte(tt.jsonPayload), &params); err != nil {
+				t.Fatalf("failed to unmarshal JSON: %v", err)
+			}
+
+			if tt.expectedText == "" {
+				if params.Update.Content != nil && params.Update.Content.Text != "" {
+					t.Fatalf("expected empty content text, got %q", params.Update.Content.Text)
+				}
+			} else {
+				if params.Update.Content == nil {
+					t.Fatalf("expected content not to be nil")
+				}
+				if params.Update.Content.Text != tt.expectedText {
+					t.Errorf("expected text %q, got %q", tt.expectedText, params.Update.Content.Text)
+				}
+				if tt.expectedType != "" && params.Update.Content.Type != tt.expectedType {
+					t.Errorf("expected type %q, got %q", tt.expectedType, params.Update.Content.Type)
+				}
+			}
+		})
+	}
+}

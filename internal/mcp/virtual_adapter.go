@@ -81,7 +81,7 @@ func (va *VirtualAdapter) BuildActiveContinuationCue(hasToolOutputs bool, delimi
 		delimiter = "tool_call"
 	}
 	if hasToolOutputs {
-		return fmt.Sprintf("[SYSTEM DIRECTIVE: You are in an active execution loop. The runtime environment has returned the tool execution results above. Proceed immediately with your next actions by emitting <%s>...</%s>, or provide your final response if the task is complete.]\n\nAssistant: ", delimiter, delimiter)
+		return fmt.Sprintf("[SYSTEM DIRECTIVE: You are in an active execution loop. The runtime environment has returned the tool execution results above. Proceed immediately with your next actions by emitting <%s>...</%s>, or provide your final response if the task is complete. Do not echo prompt headers, role markers, or transcript labels.]\n\nAssistant: ", delimiter, delimiter)
 	}
 	return "Assistant: "
 }

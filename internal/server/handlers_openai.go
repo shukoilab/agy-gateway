@@ -101,6 +101,15 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
 
+	h.logger.Debug("openai completion request received",
+		"model", req.Model,
+		"stream", req.Stream,
+		"messagesCount", len(req.Messages),
+		"toolsCount", len(req.Tools),
+		"systemPromptLen", len(systemPrompt),
+		"promptBlocksCount", len(promptBlocks),
+	)
+
 	effort := req.ReasoningEffort
 	if effort == "" && modelEntry.PresetEffort != "" {
 		effort = modelEntry.PresetEffort
@@ -399,6 +408,7 @@ func (h *OpenAIHandlers) handleStreaming(
 	}
 
 	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+		turnStartTime := time.Now()
 		totalText.Reset()
 		totalThoughts.Reset()
 		streamParser = openai.NewStreamParser(delimiter)
@@ -484,6 +494,7 @@ func (h *OpenAIHandlers) handleStreaming(
 			if !ttftDisarmed.Load() {
 				ttftDisarmed.Store(true)
 				ttftTimer.Stop()
+				h.logger.Debug("openai stream first token received", "workerId", worker.ID, "ttft", time.Since(turnStartTime))
 			}
 			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
 				textChunk := update.Update.Content.Text
@@ -493,6 +504,9 @@ func (h *OpenAIHandlers) handleStreaming(
 
 				if len(toolCalls) > 0 {
 					hasToolCalls = true
+					for _, tc := range toolCalls {
+						h.logger.Debug("openai stream tool call parsed", "workerId", worker.ID, "toolCallId", tc.ID, "name", tc.Function.Name)
+					}
 				}
 
 				if textDelta != "" || len(toolCalls) > 0 {

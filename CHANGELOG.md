@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.9.4] - 2026-11-24
+
+### Added
+- **Polymorphic ACP Content Chunk Unmarshaling (`internal/acp`)**:
+  - Implemented custom `UnmarshalJSON` on `ContentChunk` supporting single JSON objects (`{"type":"text","text":"..."}`), JSON arrays of objects (`[{"type":"text","text":"..."}, ...]`), arrays of raw strings (`["..."]`), and primitive JSON strings.
+  - Flattens and deterministically concatenates multi-chunk text payloads, eliminating all `json: cannot unmarshal array into Go struct field SessionUpdate.update.content of type acp.ContentChunk` deserialization failures.
+  - Added full test coverage in `internal/acp/protocol_test.go` (`TestSessionUpdate_PolymorphicContentChunk`).
+- **Comprehensive Debug Observability (`internal/acp`, `internal/server`)**:
+  - Added structured debug logging when `AGY_GW_LOG_LEVEL=debug` for incoming ACP notifications (`session/update`, `session/request_permission`) with raw parameter size and parsed chunk types.
+  - Added detailed request metrics logging across OpenAI and Anthropic handlers (translated prompt blocks, system prompt length, time-to-first-token latency, and detected tool calls).
+- **Enterprise Concurrent Multi-Adapter Stress Test Suite (`tests/e2e_stress_test.py`)**:
+  - Implemented high-concurrency multi-adapter test runner (`ThreadPoolExecutor`) testing parallel autonomous sessions simultaneously across both OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) protocols in both streaming and non-streaming modes.
+  - Validates isolated per-worker project workspaces (`/tmp/stress-workspaces/worker_*`), multi-turn tool calling, assertion execution via bash, zero turn header leakage, and sustained container health under load.
+- **Automated End-to-End Code Editor Verification Suite (`tests/e2e_code_editor_test.py`)**:
+  - Built an autonomous multi-turn test runner operating on `/tmp/test-project` that exercises basic code editor tools (`write_file`, `read_file`, `edit_file`, and `bash`).
+  - Verifies multi-turn tool calling, disk state mutation, assertion execution, absence of turn header leakage, and clean zero-error gateway streaming.
+
+### Fixed
+- **Multi-Turn Tool Turn Deduplication & Continuation Sanitization (`internal/openai`, `internal/anthropic`, `internal/mcp`)**:
+  - Implemented `cleanToolOutputContent` / `cleanAnthropicToolContent` in request translators to strip redundant `[Tool Execution Results]` and `User: [Tool Execution Results]` prefixes from incoming messages.
+  - Guarded against consecutive duplicate `User: [Tool Execution Results]` turn headers, completely preventing echo loops.
+  - Clarified continuation cue directives in `VirtualAdapter.BuildActiveContinuationCue` to explicitly instruct the model: `Do not echo prompt headers, role markers, or transcript labels.`
+- **Defensive Stream Parser Role Prefix Stripping (`internal/openai`, `internal/anthropic`)**:
+  - Enhanced `StreamParser` in both OpenAI and Anthropic streaming pipelines to detect and strip leading hallucinated turn markers (`Assistant:`, `User: [Tool Execution Results]`) from the initial text delta, preventing model-simulated turn labels from leaking into client agent harness UIs.
+  - Added unit test suites verifying full and chunk-split prefix stripping (`TestStreamParser_StripHallucinatedPrefix`).
+
+---
+
 ## [3.9.3] - 2026-11-24
 
 ### Added
@@ -15,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Replaced artificial prompt-level `<important>` wrapper injection with native upstream system prompt appending, eliminating Claude Sonnet prompt-injection heuristic false positives and ensuring universal compliance across all agent harnesses.
 
 ### Fixed
+- **Anthropic Streaming Tool-Calling Wire Specification Compliance (`internal/server`, `internal/anthropic`)**:
+  - Ensured `content_block_start` for `tool_use` emits an empty input object (`input: {}`) per Anthropic's official streaming specification, delivering arguments exclusively via `input_json_delta`. Completely resolves duplicated argument concatenation (`{"command":"..."}{"command":"..."}`) in OpenCode and Anthropic SDKs.
+  - Implemented polymorphic string/object normalization in `internal/anthropic/parser_stream.go` (`normalizeToolInput`), seamlessly supporting both raw JSON objects and stringified JSON payloads.
+- **Docker Compose `.env` Dynamic Configuration Ingestion & Duration Parsing Hardening (`docker-compose.yml`, `internal/config`)**:
+  - Added `env_file: .env` to `docker-compose.yml` (and `deploy/docker-compose.yml`), ensuring all 12-factor `.env` variables (`AGY_GW_QUOTA_POLL_INTERVAL`, `AGY_GW_POOL_INFERENCE_TIMEOUT`, `AGY_GW_MIN_REMAINING_QUOTA_PCT`, etc.) are automatically injected into the container.
+  - Implemented `parseDurationEnv` supporting both standard duration strings (`1800s`, `30m`) and raw integer/float numeric values (`1800`, `60`).
+  - Added missing environment variable bindings for `AGY_GW_UNSUPPORTED_PARAM_POLICY`, `AGY_GW_ALLOW_REMOTE_IMAGE_URLS`, `AGY_GW_CLEAN_WORKSPACE`, `AGY_GW_DEFAULT_COOLDOWN_5H`, and `AGY_GW_DEFAULT_COOLDOWN_WEEKLY`.
 - **Universal Streaming Parser Tag Fragmentation Protection (`internal/openai`, `internal/anthropic`)**:
   - Implemented closing tag (`</tool_call>`) prefix buffering in `StreamParser.ParseChunk`, preventing partial closing tags split across network chunks from getting swallowed into the tool JSON buffer.
   - Implemented resilient trailing tag recovery in `Flush()`, preventing valid tool calls from leaking as raw plain text into `textDelta` when streams terminate abruptly.

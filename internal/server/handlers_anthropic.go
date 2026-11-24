@@ -116,6 +116,15 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 	}
 	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
 
+	h.logger.Debug("anthropic message request received",
+		"model", req.Model,
+		"stream", req.Stream,
+		"messagesCount", len(req.Messages),
+		"toolsCount", len(req.Tools),
+		"systemPromptLen", len(systemPrompt),
+		"promptBlocksCount", len(promptBlocks),
+	)
+
 	// Map Anthropic thinking config to ACP thought level
 	effort := ""
 	if req.Thinking != nil {
@@ -595,9 +604,12 @@ func (h *AnthropicHandlers) handleStreaming(
 					}
 
 					for _, tc := range toolCalls {
+						h.logger.Debug("anthropic stream tool call parsed", "workerId", worker.ID, "toolUseId", tc.ID, "name", tc.Name)
 						toolIdx := blockIndex
 						blockIndex++
-						_ = sseWriter.WriteContentBlockStart(toolIdx, tc)
+						startBlock := tc
+						startBlock.Input = json.RawMessage("{}")
+						_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
 						_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
 							Type:        "input_json_delta",
 							PartialJSON: string(tc.Input),
@@ -650,7 +662,9 @@ func (h *AnthropicHandlers) handleStreaming(
 			for _, tc := range flushTools {
 				toolIdx := blockIndex
 				blockIndex++
-				_ = sseWriter.WriteContentBlockStart(toolIdx, tc)
+				startBlock := tc
+				startBlock.Input = json.RawMessage("{}")
+				_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
 				_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
 					Type:        "input_json_delta",
 					PartialJSON: string(tc.Input),

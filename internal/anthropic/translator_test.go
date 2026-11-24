@@ -116,3 +116,56 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 		t.Errorf("expected prompt to end with 'Assistant: ', got:\n%s", prompt)
 	}
 }
+
+func TestTranslator_ToolOutputDeduplication(t *testing.T) {
+	translator := anthropic.NewTranslator()
+
+	req := &anthropic.MessageRequest{
+		Model: "claude-3-5-sonnet",
+		Messages: []anthropic.Message{
+			{
+				Role: "user",
+				Content: anthropic.MessageContent{
+					Text: "Check cluster",
+				},
+			},
+			{
+				Role: "assistant",
+				Content: anthropic.MessageContent{
+					Blocks: []anthropic.ContentBlock{
+						{
+							Type: "tool_use",
+							ID:   "toolu_1",
+							Name: "status",
+						},
+					},
+				},
+			},
+			{
+				Role: "user",
+				Content: anthropic.MessageContent{
+					Blocks: []anthropic.ContentBlock{
+						{
+							Type:      "tool_result",
+							ToolUseID: "toolu_1",
+							Content:   "User: [Tool Execution Results]\nTool Output (id: toolu_1): all systems green",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, promptBlocks := translator.Translate(req, "tool_call")
+	prompt := promptBlocks[0].Text
+
+	count := strings.Count(prompt, "[Tool Execution Results]")
+	if count != 1 {
+		t.Fatalf("expected exactly 1 '[Tool Execution Results]', got %d in prompt:\n%s", count, prompt)
+	}
+
+	callPrefixCount := strings.Count(prompt, "Tool Output (id: toolu_1):")
+	if callPrefixCount != 1 {
+		t.Fatalf("expected exactly 1 'Tool Output (id: toolu_1):', got %d in prompt:\n%s", callPrefixCount, prompt)
+	}
+}
