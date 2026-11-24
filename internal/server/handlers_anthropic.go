@@ -235,11 +235,10 @@ func (h *AnthropicHandlers) handleSync(
 			}
 		}
 		effectiveSystemPrompt := systemPrompt
-		systemPromptMode := "append"
 		if effectiveSystemPrompt == "" {
 			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-			systemPromptMode = "override"
 		}
+		systemPromptMode := "override"
 		newParams.SystemPrompt = &acp.SystemPrompt{
 			Mode: systemPromptMode,
 			Content: []acp.PromptBlock{
@@ -679,11 +678,10 @@ func (h *AnthropicHandlers) handleStreaming(
 			}
 		}
 		effectiveSystemPrompt := systemPrompt
-		systemPromptMode := "append"
 		if effectiveSystemPrompt == "" {
 			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-			systemPromptMode = "override"
 		}
+		systemPromptMode := "override"
 		newParams.SystemPrompt = &acp.SystemPrompt{
 			Mode: systemPromptMode,
 			Content: []acp.PromptBlock{

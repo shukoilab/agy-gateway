@@ -197,11 +197,10 @@ func (h *OpenAIHandlers) handleSync(
 			}
 		}
 		effectiveSystemPrompt := systemPrompt
-		systemPromptMode := "append"
 		if effectiveSystemPrompt == "" {
 			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-			systemPromptMode = "override"
 		}
+		systemPromptMode := "override"
 		newParams.SystemPrompt = &acp.SystemPrompt{
 			Mode: systemPromptMode,
 			Content: []acp.PromptBlock{
@@ -621,11 +620,10 @@ func (h *OpenAIHandlers) handleStreaming(
 			}
 		}
 		effectiveSystemPrompt := systemPrompt
-		systemPromptMode := "append"
 		if effectiveSystemPrompt == "" {
 			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-			systemPromptMode = "override"
 		}
+		systemPromptMode := "override"
 		newParams.SystemPrompt = &acp.SystemPrompt{
 			Mode: systemPromptMode,
 			Content: []acp.PromptBlock{
