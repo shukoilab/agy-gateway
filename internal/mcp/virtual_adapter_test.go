@@ -25,6 +25,12 @@ func TestVirtualAdapter_BuildToolsPromptEnvelope(t *testing.T) {
 	if !strings.Contains(envelope, "# CONSUMER TOOL-CALLING DIRECTIVES") {
 		t.Fatalf("expected tool calling directives header in envelope")
 	}
+	if !strings.Contains(envelope, "API gateway") {
+		t.Fatalf("expected API gateway directive in envelope")
+	}
+	if !strings.Contains(envelope, "external client workspace") {
+		t.Fatalf("expected external client workspace directive in envelope")
+	}
 	if !strings.Contains(envelope, "<tool_call>") {
 		t.Fatalf("expected tool delimiter tag in envelope")
 	}

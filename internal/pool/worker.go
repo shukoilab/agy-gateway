@@ -128,21 +128,44 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-// CleanWorkspace removes transient files from the worker workspace between requests.
+// CleanWorkspace removes transient files from the worker workspace and purges
+// ephemeral ACP session databases and brain artifacts between requests.
+//
+// @purpose Eliminates storage and memory leakages across sequential requests on pooled workers.
+// @rationale Enforces true JIT isolation and prevents unbounded disk growth from internal ACP SQLite session DBs.
+// @invariants Safe against missing directories and concurrent read operations.
 func (w *Worker) CleanWorkspace() {
 	if !w.cfg.Execution.CleanWorkspaceBetweenRequests {
 		return
 	}
+	// 1. Purge transient workspace working directory files
 	entries, err := os.ReadDir(w.Cwd)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == ".git" {
-			continue
+	if err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == ".git" {
+				continue
+			}
+			_ = os.RemoveAll(filepath.Join(w.Cwd, name))
 		}
-		_ = os.RemoveAll(filepath.Join(w.Cwd, name))
+	}
+
+	// 2. Purge ephemeral ACP session databases, WAL/SHM journals, and brain artifacts in worker home
+	if w.HomeDir != "" {
+		geminiCliDir := filepath.Join(w.HomeDir, ".gemini", "antigravity-cli")
+		convDir := filepath.Join(geminiCliDir, "conversations")
+		if convEntries, err := os.ReadDir(convDir); err == nil {
+			for _, ce := range convEntries {
+				// Purge all ephemeral conversation databases, WAL journals, and SHM shared memory files
+				_ = os.RemoveAll(filepath.Join(convDir, ce.Name()))
+			}
+		}
+		brainDir := filepath.Join(geminiCliDir, "brain")
+		if brainEntries, err := os.ReadDir(brainDir); err == nil {
+			for _, be := range brainEntries {
+				_ = os.RemoveAll(filepath.Join(brainDir, be.Name()))
+			}
+		}
 	}
 }
 

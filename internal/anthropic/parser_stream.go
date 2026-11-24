@@ -83,9 +83,21 @@ func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolBlocks [
 		if sp.inTool {
 			idx := strings.Index(current, sp.closeTag)
 			if idx == -1 {
-				// Still accumulating tool JSON
-				sp.toolJSONBuf.WriteString(current)
+				// Still accumulating tool JSON; retain partial prefix of closeTag in buffer if split across chunks
+				keepLen := 0
+				for k := len(sp.closeTag) - 1; k > 0; k-- {
+					if strings.HasSuffix(current, sp.closeTag[:k]) {
+						keepLen = k
+						break
+					}
+				}
+				emitLen := len(current) - keepLen
+				if emitLen > 0 {
+					sp.toolJSONBuf.WriteString(current[:emitLen])
+					current = current[emitLen:]
+				}
 				sp.buffer.Reset()
+				sp.buffer.WriteString(current)
 				return textDelta, toolBlocks
 			}
 
@@ -144,6 +156,19 @@ func (sp *StreamParser) Flush() (textDelta string, toolBlocks []ContentBlock) {
 
 	if sp.inTool {
 		fullJSON := strings.TrimSpace(sp.toolJSONBuf.String() + sp.buffer.String())
+		// Resilient recovery: strip any trailing complete or partial close tag that was buffered or swallowed
+		if idx := strings.Index(fullJSON, sp.closeTag); idx != -1 {
+			fullJSON = fullJSON[:idx]
+		} else {
+			for k := len(sp.closeTag) - 1; k > 0; k-- {
+				if strings.HasSuffix(fullJSON, sp.closeTag[:k]) {
+					fullJSON = strings.TrimSuffix(fullJSON, sp.closeTag[:k])
+					break
+				}
+			}
+		}
+		fullJSON = strings.TrimSpace(fullJSON)
+
 		var parsed struct {
 			ID        string          `json:"id"`
 			Name      string          `json:"name"`

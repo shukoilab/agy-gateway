@@ -16,8 +16,8 @@ import (
 //
 // @purpose Maps Anthropic system prompts, multi-turn history, tool definitions, tool results,
 // and extended thinking blocks into standardized Google Antigravity ACP PromptBlocks.
-// @rationale Guarantees zero-semantic-loss across protocols and complies with Google Antigravity
-// Terms of Service by wrapping system instructions in <important>...</important> XML tags.
+// @rationale Guarantees zero-semantic-loss across protocols and forwards system instructions and tool schemas
+// directly to native ACP session/new via _meta.antigravity.systemPrompt.append.
 // @preconditions req must be validated; delimiter must be non-empty.
 type Translator struct {
 	virtualAdapter *mcp.VirtualAdapter
@@ -31,16 +31,16 @@ func NewTranslator() *Translator {
 }
 
 // Translate converts the Anthropic conversation into an ACP prompt payload.
+// System instructions and tool calling directives are extracted into a dedicated systemPrompt string
+// for native injection into ACP session/new via _meta.antigravity.systemPrompt.append.
 //
 // - @param: req Pointer to MessageRequest.
 // - @param: delimiter Tag name for client tool calling encapsulation (default: "tool_call").
-// @returns Slice of acp.PromptBlock ready for transmission over ACP.
-func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.PromptBlock {
+// @returns Extracted system prompt string and slice of acp.PromptBlock ready for transmission over ACP.
+func (t *Translator) Translate(req *MessageRequest, delimiter string) (string, []acp.PromptBlock) {
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
-
-	var historyBuilder strings.Builder
 
 	// 1. Process Consumer JIT Tool Directives (Deduplicated by function name)
 	var toolsBlock string
@@ -86,7 +86,7 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 		}
 	}
 
-	// 2. Inject System Instructions and Tool Directives into <important> envelope at the top
+	// 2. Compose system prompt for ACP session/new _meta.antigravity.systemPrompt.append
 	var systemBlocks []string
 	systemText := strings.TrimSpace(req.System.String())
 	if systemText != "" {
@@ -95,11 +95,11 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 	if toolsBlock != "" {
 		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
 	}
-	if len(systemBlocks) > 0 {
-		fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", strings.Join(systemBlocks, "\n\n"))
-	}
+	systemPrompt := strings.TrimSpace(strings.Join(systemBlocks, "\n\n"))
 
-	// 3. Reconstitute Multi-Turn Conversational History
+	var historyBuilder strings.Builder
+
+	// 3. Reconstitute Multi-Turn Conversational History without artificial envelope wrapping
 	var lastTurnHadToolResults bool
 	for _, msg := range req.Messages {
 		role := strings.ToLower(msg.Role)
@@ -132,7 +132,7 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 		finalPrompt = "Hello"
 	}
 
-	return []acp.PromptBlock{
+	return systemPrompt, []acp.PromptBlock{
 		{
 			Type: "text",
 			Text: finalPrompt,

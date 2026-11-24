@@ -114,7 +114,7 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
-	promptBlocks := h.translator.Translate(&req, delimiter)
+	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
 
 	// Map Anthropic thinking config to ACP thought level
 	effort := ""
@@ -143,9 +143,9 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 	completionID := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
 
 	if req.Stream {
-		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID)
+		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID)
 	} else {
-		h.handleSync(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID)
+		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID)
 	}
 }
 
@@ -155,6 +155,7 @@ func (h *AnthropicHandlers) handleSync(
 	req *anthropic.MessageRequest,
 	modelEntry *models.ModelInfo,
 	thoughtLevel string,
+	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
 	completionID string,
 ) {
@@ -186,6 +187,15 @@ func (h *AnthropicHandlers) handleSync(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
+		if systemPrompt != "" {
+			newParams.Meta = map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{
+						"append": systemPrompt,
+					},
+				},
+			}
+		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
 			var respErr *acp.ResponseError
@@ -197,6 +207,16 @@ func (h *AnthropicHandlers) handleSync(
 				return err
 			}
 		}
+
+		defer func() {
+			if newResult.SessionID != "" {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelClose()
+				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
+					SessionID: newResult.SessionID,
+				}, nil)
+			}
+		}()
 
 		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
 			SessionID: newResult.SessionID,
@@ -346,6 +366,7 @@ func (h *AnthropicHandlers) handleStreaming(
 	req *anthropic.MessageRequest,
 	modelEntry *models.ModelInfo,
 	thoughtLevel string,
+	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
 	completionID string,
 ) {
@@ -423,6 +444,15 @@ func (h *AnthropicHandlers) handleStreaming(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
+		if systemPrompt != "" {
+			newParams.Meta = map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{
+						"append": systemPrompt,
+					},
+				},
+			}
+		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
 			var respErr *acp.ResponseError
@@ -434,6 +464,16 @@ func (h *AnthropicHandlers) handleStreaming(
 				return err
 			}
 		}
+
+		defer func() {
+			if newResult.SessionID != "" {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelClose()
+				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
+					SessionID: newResult.SessionID,
+				}, nil)
+			}
+		}()
 
 		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
 			SessionID: newResult.SessionID,

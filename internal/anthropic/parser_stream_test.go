@@ -108,3 +108,57 @@ func TestStreamParser_FlushUnclosedToolCall(t *testing.T) {
 		t.Fatalf("expected input '{\"path\": \"/etc/hosts\"}', got %q", string(flushTools[0].Input))
 	}
 }
+
+func TestStreamParser_SplitCloseTagAllOffsets(t *testing.T) {
+	fullPayload := `Before <tool_call>{"id": "toolu_split", "name": "read", "arguments": {"path": "main.go"}}</tool_call> After`
+
+	for splitIdx := 0; splitIdx <= len(fullPayload); splitIdx++ {
+		parser := anthropic.NewStreamParser("tool_call")
+		chunk1 := fullPayload[:splitIdx]
+		chunk2 := fullPayload[splitIdx:]
+
+		d1, tc1 := parser.ParseChunk(chunk1)
+		d2, tc2 := parser.ParseChunk(chunk2)
+		d3, tc3 := parser.Flush()
+
+		allText := d1 + d2 + d3
+		allTools := append(append(tc1, tc2...), tc3...)
+
+		if len(allTools) != 1 {
+			t.Fatalf("Split at %d: expected 1 tool call, got %d (text: %q)", splitIdx, len(allTools), allText)
+		}
+		if allTools[0].Name != "read" {
+			t.Fatalf("Split at %d: expected tool name 'read', got %q", splitIdx, allTools[0].Name)
+		}
+		if allText != "Before  After" {
+			t.Fatalf("Split at %d: expected text 'Before  After', got %q", splitIdx, allText)
+		}
+	}
+}
+
+func TestStreamParser_ByteByByteStreaming(t *testing.T) {
+	fullPayload := `Intro <tool_call>{"id": "toolu_byte", "name": "execute", "arguments": {"cmd": "pwd"}}</tool_call> Outro`
+	parser := anthropic.NewStreamParser("tool_call")
+
+	var collectedText string
+	var collectedTools []anthropic.ContentBlock
+
+	for i := 0; i < len(fullPayload); i++ {
+		d, tc := parser.ParseChunk(string(fullPayload[i]))
+		collectedText += d
+		collectedTools = append(collectedTools, tc...)
+	}
+	fd, ftc := parser.Flush()
+	collectedText += fd
+	collectedTools = append(collectedTools, ftc...)
+
+	if len(collectedTools) != 1 {
+		t.Fatalf("Byte-by-byte: expected 1 tool call, got %d", len(collectedTools))
+	}
+	if collectedTools[0].Name != "execute" {
+		t.Fatalf("Byte-by-byte: expected 'execute', got %q", collectedTools[0].Name)
+	}
+	if collectedText != "Intro  Outro" {
+		t.Fatalf("Byte-by-byte: expected text 'Intro  Outro', got %q", collectedText)
+	}
+}

@@ -70,7 +70,7 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 	}
 
 	translator := anthropic.NewTranslator()
-	promptBlocks := translator.Translate(req, "tool_call")
+	sysPrompt, promptBlocks := translator.Translate(req, "tool_call")
 
 	if len(promptBlocks) != 1 {
 		t.Fatalf("expected 1 prompt block, got %d", len(promptBlocks))
@@ -78,12 +78,20 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 
 	prompt := promptBlocks[0].Text
 
-	// Verify System Instructions enclosed in <important> tags
-	if !strings.Contains(prompt, "<important>") || !strings.Contains(prompt, "You are a senior systems engineer.") {
-		t.Errorf("prompt missing <important> system tags:\n%s", prompt)
+	// Verify System Instructions and Tool Directives in sysPrompt
+	if !strings.Contains(sysPrompt, "You are a senior systems engineer.") {
+		t.Errorf("sysPrompt missing system instructions:\n%s", sysPrompt)
 	}
-	if !strings.Contains(prompt, "</important>") {
-		t.Errorf("prompt missing </important> closing tag:\n%s", prompt)
+	if !strings.Contains(sysPrompt, "# CONSUMER TOOL-CALLING DIRECTIVES") {
+		t.Errorf("sysPrompt missing tool calling directives:\n%s", sysPrompt)
+	}
+	if !strings.Contains(sysPrompt, "query_cluster") {
+		t.Errorf("sysPrompt missing query_cluster tool definition:\n%s", sysPrompt)
+	}
+
+	// Verify prompt is pure conversational turns without artificial <important> wrapper
+	if strings.Contains(prompt, "<important>") {
+		t.Errorf("prompt contains unexpected <important> wrapper:\n%s", prompt)
 	}
 
 	// Verify Multi-Turn conversation reconstruction
@@ -98,11 +106,6 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 	}
 	if !strings.Contains(prompt, "[Tool Execution Results]") {
 		t.Errorf("prompt missing [Tool Execution Results] turn header")
-	}
-
-	// Verify Consumer Tool-Calling Directives
-	if !strings.Contains(prompt, "# CONSUMER TOOL-CALLING DIRECTIVES") {
-		t.Errorf("prompt missing tool calling directives")
 	}
 
 	// Verify Active Execution Loop continuation cue

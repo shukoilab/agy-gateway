@@ -40,7 +40,7 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 		},
 	}
 
-	promptBlocks := translator.Translate(req, "tool_call")
+	sysPrompt, promptBlocks := translator.Translate(req, "tool_call")
 
 	if len(promptBlocks) != 1 {
 		t.Fatalf("expected 1 prompt block, got %d", len(promptBlocks))
@@ -48,14 +48,29 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 
 	promptText := promptBlocks[0].Text
 
-	// Verify system prompt and tools directives are safely wrapped in <important>...</important> XML tag
-	if !strings.Contains(promptText, "<important>") || !strings.Contains(promptText, "You are a helpful coding assistant.") {
-		t.Fatalf("missing or incorrect <important> system prompt wrapper in prompt: %s", promptText)
+	// Verify system prompt and tools directives are cleanly extracted into sysPrompt
+	if !strings.Contains(sysPrompt, "You are a helpful coding assistant.") {
+		t.Fatalf("missing system instructions in sysPrompt: %s", sysPrompt)
 	}
-	if !strings.Contains(promptText, "</important>") {
-		t.Fatalf("missing closing </important> tag in prompt: %s", promptText)
+	if !strings.Contains(sysPrompt, "# CONSUMER TOOL-CALLING DIRECTIVES") {
+		t.Fatalf("missing tool directives in sysPrompt: %s", sysPrompt)
+	}
+	if !strings.Contains(sysPrompt, "<tool_call>") {
+		t.Fatalf("missing tool prompt directives in sysPrompt: %s", sysPrompt)
 	}
 
+	// Verify deduplication: [Tool 1] should appear, but NOT [Tool 2]
+	if !strings.Contains(sysPrompt, "[Tool 1] calculate_shipping") {
+		t.Fatalf("missing [Tool 1] in sysPrompt: %s", sysPrompt)
+	}
+	if strings.Contains(sysPrompt, "[Tool 2]") {
+		t.Fatalf("expected tool deduplication, but found [Tool 2] in sysPrompt: %s", sysPrompt)
+	}
+
+	// Verify conversational prompt contains pure user turns without artificial <important> wrapper
+	if strings.Contains(promptText, "<important>") {
+		t.Fatalf("unexpected <important> wrapper in promptText: %s", promptText)
+	}
 	if !strings.Contains(promptText, "User: What is 2+2?") {
 		t.Fatalf("missing user turn in prompt: %s", promptText)
 	}
@@ -65,21 +80,10 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 	if !strings.Contains(promptText, "User: Calculate shipping now.") {
 		t.Fatalf("missing latest user turn in prompt: %s", promptText)
 	}
-	if !strings.Contains(promptText, "<tool_call>") {
-		t.Fatalf("missing tool prompt directives in prompt: %s", promptText)
-	}
 
 	// Verify prompt primes assistant completion
 	if !strings.HasSuffix(promptText, "Assistant: ") {
 		t.Fatalf("expected prompt to end with 'Assistant: ', got: %s", promptText)
-	}
-
-	// Verify deduplication: [Tool 1] should appear, but NOT [Tool 2]
-	if !strings.Contains(promptText, "[Tool 1] calculate_shipping") {
-		t.Fatalf("missing [Tool 1] in prompt: %s", promptText)
-	}
-	if strings.Contains(promptText, "[Tool 2]") {
-		t.Fatalf("expected tool deduplication, but found [Tool 2] in prompt: %s", promptText)
 	}
 }
 
@@ -126,7 +130,7 @@ func TestTranslator_ToolExecutionResultsGroupingAndContinuation(t *testing.T) {
 		},
 	}
 
-	promptBlocks := translator.Translate(req, "tool_call")
+	_, promptBlocks := translator.Translate(req, "tool_call")
 	if len(promptBlocks) != 1 {
 		t.Fatalf("expected 1 prompt block, got %d", len(promptBlocks))
 	}

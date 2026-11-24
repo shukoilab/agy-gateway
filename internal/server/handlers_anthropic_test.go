@@ -151,7 +151,7 @@ func createMockWorkerWithPipe(t *testing.T, id int, cfg *config.Config, responde
 				}
 				raw, _ := json.Marshal(resp)
 				_, _ = inWriter.Write(append(raw, '\n'))
-			case "session/set_config_option":
+			case "session/set_config_option", "session/close":
 				resp := acp.Response{
 					JSONRPC: acp.JSONRPCVersion,
 					ID:      req.ID,

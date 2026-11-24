@@ -99,7 +99,7 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
-	promptBlocks := h.translator.Translate(&req, delimiter)
+	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
 
 	effort := req.ReasoningEffort
 	if effort == "" && modelEntry.PresetEffort != "" {
@@ -112,9 +112,9 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	completionID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:14])
 
 	if req.Stream {
-		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID, createdTime)
+		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID, createdTime)
 	} else {
-		h.handleSync(w, r, &req, modelEntry, thoughtLevel, promptBlocks, completionID, createdTime)
+		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID, createdTime)
 	}
 }
 
@@ -124,6 +124,7 @@ func (h *OpenAIHandlers) handleSync(
 	req *openai.ChatCompletionRequest,
 	modelEntry *models.ModelInfo,
 	thoughtLevel string,
+	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
 	completionID string,
 	createdTime int64,
@@ -156,6 +157,15 @@ func (h *OpenAIHandlers) handleSync(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
+		if systemPrompt != "" {
+			newParams.Meta = map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{
+						"append": systemPrompt,
+					},
+				},
+			}
+		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
 			var respErr *acp.ResponseError
@@ -167,6 +177,16 @@ func (h *OpenAIHandlers) handleSync(
 				return err
 			}
 		}
+
+		defer func() {
+			if newResult.SessionID != "" {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelClose()
+				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
+					SessionID: newResult.SessionID,
+				}, nil)
+			}
+		}()
 
 		// B. Apply session config options
 		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
@@ -324,6 +344,7 @@ func (h *OpenAIHandlers) handleStreaming(
 	req *openai.ChatCompletionRequest,
 	modelEntry *models.ModelInfo,
 	thoughtLevel string,
+	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
 	completionID string,
 	createdTime int64,
@@ -390,6 +411,15 @@ func (h *OpenAIHandlers) handleStreaming(
 		newParams := acp.SessionNewParams{
 			CWD: worker.Cwd,
 		}
+		if systemPrompt != "" {
+			newParams.Meta = map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{
+						"append": systemPrompt,
+					},
+				},
+			}
+		}
 		var newResult acp.SessionNewResult
 		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
 			var respErr *acp.ResponseError
@@ -401,6 +431,16 @@ func (h *OpenAIHandlers) handleStreaming(
 				return err
 			}
 		}
+
+		defer func() {
+			if newResult.SessionID != "" {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancelClose()
+				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
+					SessionID: newResult.SessionID,
+				}, nil)
+			}
+		}()
 
 		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
 			SessionID: newResult.SessionID,

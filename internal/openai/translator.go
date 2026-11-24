@@ -22,11 +22,11 @@ func NewTranslator() *Translator {
 }
 
 // Translate extracts system instructions and formats the multi-turn conversational history.
-// Consumer system instructions and tool calling directives are wrapped in <important>...</important> XML tags
-// at the top of the prompt in accordance with Google Antigravity ToS for consumer OAuth accounts.
-// Consumer tools are deduplicated by function name, tool execution results are grouped into structured turns,
-// and an active execution loop cue primes assistant continuation.
-func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []acp.PromptBlock {
+// Consumer system instructions and tool calling directives are extracted into a dedicated systemPrompt
+// string for native injection into ACP session/new via _meta.antigravity.systemPrompt.append.
+// Conversational turns (user, assistant, tool execution results) are cleanly formatted into ACP prompt blocks.
+// An active execution loop cue primes assistant continuation when turns end on tool outputs.
+func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (string, []acp.PromptBlock) {
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
@@ -76,9 +76,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 		}
 	}
 
-	var historyBuilder strings.Builder
-
-	// 3. Inject system instructions & tool directives into <important> envelope at the top
+	// 3. Compose system prompt for ACP session/new _meta.antigravity.systemPrompt.append
 	var systemBlocks []string
 	if len(sysMessages) > 0 {
 		sysBody := strings.TrimSpace(strings.Join(sysMessages, "\n\n"))
@@ -89,11 +87,11 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 	if toolsBlock != "" {
 		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
 	}
-	if len(systemBlocks) > 0 {
-		fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", strings.Join(systemBlocks, "\n\n"))
-	}
+	systemPrompt := strings.TrimSpace(strings.Join(systemBlocks, "\n\n"))
 
-	// 4. Reconstitute multi-turn conversation history
+	var historyBuilder strings.Builder
+
+	// 4. Reconstitute multi-turn conversation history without artificial envelope wrapping
 	for i := 0; i < len(nonSysMessages); i++ {
 		msg := nonSysMessages[i]
 		role := strings.ToLower(msg.Role)
@@ -157,7 +155,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 		finalPrompt = "Hello"
 	}
 
-	return []acp.PromptBlock{
+	return systemPrompt, []acp.PromptBlock{
 		{
 			Type: "text",
 			Text: finalPrompt,

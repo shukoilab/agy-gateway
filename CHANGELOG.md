@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.9.3] - 2026-11-24
+
+### Added
+- **Native ACP `systemPrompt.append` Protocol Refactoring (`internal/openai`, `internal/anthropic`, `internal/server`)**:
+  - Leveraged native Google Antigravity ACP capability (`agentCapabilities._meta.antigravity.systemPrompt.append`) by forwarding consumer system instructions and tool schemas via `_meta.antigravity.systemPrompt.append` in `session/new`.
+  - Replaced artificial prompt-level `<important>` wrapper injection with native upstream system prompt appending, eliminating Claude Sonnet prompt-injection heuristic false positives and ensuring universal compliance across all agent harnesses.
+
+### Fixed
+- **Universal Streaming Parser Tag Fragmentation Protection (`internal/openai`, `internal/anthropic`)**:
+  - Implemented closing tag (`</tool_call>`) prefix buffering in `StreamParser.ParseChunk`, preventing partial closing tags split across network chunks from getting swallowed into the tool JSON buffer.
+  - Implemented resilient trailing tag recovery in `Flush()`, preventing valid tool calls from leaking as raw plain text into `textDelta` when streams terminate abruptly.
+  - Added full-offset boundary testing (`TestStreamParser_SplitCloseTagAllOffsets`) and byte-by-byte streaming tests across both OpenAI and Anthropic adapters.
+- **ACP Session Lifecycle Hardening & Complete Zero-Garbage Purge (`internal/acp`, `internal/pool`, `internal/server`)**:
+  - Implemented automatic JIT session cleanup via standard ACP `session/close` across all sync and streaming handlers upon request completion.
+  - Extended worker workspace cleanup (`CleanWorkspace`) to comprehensively purge ephemeral internal ACP session SQLite databases (`conversations/*`, including `.db`, `.db-shm`, and `.db-wal` write-ahead logs) and brain artifacts (`brain/*`), completely eliminating disk storage leakage across high-throughput agent runs.
+- **Client Workspace & Runtime Host Clarification Directive (`internal/mcp`)**:
+  - Hardened virtual envelope prompt instructions to clearly state that the engine is connected via an API gateway to an external client workspace, establishing clear host runtime precedence without triggering safety or prompt-injection heuristics.
+
+---
+
 ## [3.9.0] - 2026-11-24
 
 ### Added

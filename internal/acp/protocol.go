@@ -81,6 +81,15 @@ type SessionNewResult struct {
 	SessionID string `json:"sessionId"`
 }
 
+// SessionCloseParams represents parameters sent in the session/close request.
+//
+// @purpose Unloads an active ACP session and releases all associated memory state.
+// @rationale Enforces true JIT lifecycle for ephemeral agent turns without long-lived session bloat.
+// @invariants Thread-safe.
+type SessionCloseParams struct {
+	SessionID string `json:"sessionId"`
+}
+
 // SetConfigOptionParams represents parameters sent in session/set_config_option.
 type SetConfigOptionParams struct {
 	SessionID string `json:"sessionId"`

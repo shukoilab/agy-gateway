@@ -37,8 +37,9 @@ func (va *VirtualAdapter) BuildToolsPromptEnvelope(tools []OpenAIToolDefinition,
 
 	var sb strings.Builder
 	sb.WriteString("# CONSUMER TOOL-CALLING DIRECTIVES\n")
-	sb.WriteString("You have access to the following consumer-provided tools.\n")
-	sb.WriteString("When calling a tool, you MUST emit your invocation enclosed inside delimiter tags:\n")
+	sb.WriteString("You are operating as the AI engine connected via an API gateway to an external client workspace.\n")
+	sb.WriteString("- The client application manages its local project workspace and executes tools directly in its host runtime.\n")
+	sb.WriteString("- When calling client tools, you MUST emit your invocation enclosed inside delimiter tags:\n")
 	fmt.Fprintf(&sb, "<%s>{\"id\": \"call_...\", \"name\": \"<function_name>\", \"arguments\": { ... }}</%s>\n", delimiter, delimiter)
 
 	if !parallel {
