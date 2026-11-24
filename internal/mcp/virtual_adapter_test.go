@@ -52,4 +52,18 @@ func TestVirtualAdapter_BuildToolsPromptEnvelope(t *testing.T) {
 	if emptyEnv != "" {
 		t.Fatalf("expected empty string for nil tools")
 	}
+
+	// Test BuildActiveContinuationCue
+	cueWithTools := adapter.BuildActiveContinuationCue(true, "tool_call")
+	if !strings.Contains(cueWithTools, "[SYSTEM DIRECTIVE: You are in an active execution loop.") {
+		t.Fatalf("expected active execution loop directive in cue: %s", cueWithTools)
+	}
+	if !strings.HasSuffix(cueWithTools, "Assistant: ") {
+		t.Fatalf("expected cue to end with 'Assistant: ', got: %s", cueWithTools)
+	}
+
+	cueWithoutTools := adapter.BuildActiveContinuationCue(false, "tool_call")
+	if cueWithoutTools != "Assistant: " {
+		t.Fatalf("expected 'Assistant: ', got %q", cueWithoutTools)
+	}
 }

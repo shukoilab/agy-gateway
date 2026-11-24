@@ -585,6 +585,40 @@ func (h *AnthropicHandlers) handleStreaming(
 			return err
 		}
 
+		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
+		flushDelta, flushTools := streamParser.Flush()
+		if flushDelta != "" {
+			if !textStarted {
+				textStarted = true
+				textIndex = blockIndex
+				blockIndex++
+				_ = sseWriter.WriteContentBlockStart(textIndex, anthropic.ContentBlock{
+					Type: "text",
+					Text: "",
+				})
+			}
+			_ = sseWriter.WriteContentBlockDelta(textIndex, anthropic.ContentBlockDelta{
+				Type: "text_delta",
+				Text: flushDelta,
+			})
+		}
+		if len(flushTools) > 0 {
+			if textStarted {
+				_ = sseWriter.WriteContentBlockStop(textIndex)
+				textStarted = false
+			}
+			for _, tc := range flushTools {
+				toolIdx := blockIndex
+				blockIndex++
+				_ = sseWriter.WriteContentBlockStart(toolIdx, tc)
+				_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
+					Type:        "input_json_delta",
+					PartialJSON: string(tc.Input),
+				})
+				_ = sseWriter.WriteContentBlockStop(toolIdx)
+			}
+		}
+
 		return nil
 	})
 

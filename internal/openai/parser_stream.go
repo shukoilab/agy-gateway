@@ -103,8 +103,14 @@ func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolCalls []
 					callID = sp.activeCallID
 				}
 				name := parsed.Name
-				argBytes, _ := json.Marshal(parsed.Arguments)
-				argStr := string(argBytes)
+				var argStr string
+				switch a := parsed.Arguments.(type) {
+				case string:
+					argStr = a
+				default:
+					argBytes, _ := json.Marshal(a)
+					argStr = string(argBytes)
+				}
 
 				idxVal := sp.toolIndex
 				tc := ToolCall{
@@ -127,21 +133,73 @@ func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolCalls []
 	return textDelta, toolCalls
 }
 
+// Flush forces emission of any pending unparsed buffer text and recovers any unclosed
+// tool call markup before the stream terminates.
+//
+// @purpose Prevents dropped text chunks or lost tool call fragments when the stream ends.
+// @rationale Models may close streams immediately after JSON payloads without writing </tool_call>,
+// or trailing text may be held in the buffer matching a partial open tag prefix.
+// @returns Remaining text delta and any recovered tool calls.
+// @invariants Thread-safe.
+func (sp *StreamParser) Flush() (textDelta string, toolCalls []ToolCall) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.inTool {
+		fullJSON := strings.TrimSpace(sp.toolJSONBuf.String() + sp.buffer.String())
+		var parsed struct {
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Arguments any    `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(fullJSON), &parsed); err == nil && parsed.Name != "" {
+			callID := parsed.ID
+			if callID == "" {
+				callID = sp.activeCallID
+			}
+			var argStr string
+			switch a := parsed.Arguments.(type) {
+			case string:
+				argStr = a
+			default:
+				argBytes, _ := json.Marshal(a)
+				argStr = string(argBytes)
+			}
+			idxVal := sp.toolIndex
+			toolCalls = append(toolCalls, ToolCall{
+				Index: &idxVal,
+				ID:    callID,
+				Type:  "function",
+				Function: FunctionCallData{
+					Name:      parsed.Name,
+					Arguments: argStr,
+				},
+			})
+			sp.toolIndex++
+		} else {
+			textDelta = sp.openTag + fullJSON
+		}
+		sp.inTool = false
+		sp.toolJSONBuf.Reset()
+		sp.buffer.Reset()
+		return textDelta, toolCalls
+	}
+
+	if sp.buffer.Len() > 0 {
+		textDelta = sp.buffer.String()
+		sp.buffer.Reset()
+	}
+	return textDelta, toolCalls
+}
+
 // ParseCompleteResponse parses a complete completion response for non-streaming mode.
 func ParseCompleteResponse(rawText, delimiter string) (string, []ToolCall, bool) {
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
 
-	openTag := fmt.Sprintf("<%s>", delimiter)
-	closeTag := fmt.Sprintf("</%s>", delimiter)
-
-	pattern := regexp.MustCompile(fmt.Sprintf(`%s([\s\S]*?)%s`, regexp.QuoteMeta(openTag), regexp.QuoteMeta(closeTag)))
+	pattern := regexp.MustCompile(fmt.Sprintf(`<%s\s*>([\s\S]*?)</%s\s*>`, regexp.QuoteMeta(delimiter), regexp.QuoteMeta(delimiter)))
 	matches := pattern.FindAllStringSubmatch(rawText, -1)
-
-	if len(matches) == 0 {
-		return rawText, nil, false
-	}
 
 	var toolCalls []ToolCall
 	for i, m := range matches {
@@ -151,12 +209,19 @@ func ParseCompleteResponse(rawText, delimiter string) (string, []ToolCall, bool)
 				Name      string `json:"name"`
 				Arguments any    `json:"arguments"`
 			}
-			if err := json.Unmarshal([]byte(strings.TrimSpace(m[1])), &parsed); err == nil {
+			if err := json.Unmarshal([]byte(strings.TrimSpace(m[1])), &parsed); err == nil && parsed.Name != "" {
 				callID := parsed.ID
 				if callID == "" {
 					callID = fmt.Sprintf("call_%s", uuid.New().String()[:9])
 				}
-				argBytes, _ := json.Marshal(parsed.Arguments)
+				var argStr string
+				switch a := parsed.Arguments.(type) {
+				case string:
+					argStr = a
+				default:
+					argBytes, _ := json.Marshal(a)
+					argStr = string(argBytes)
+				}
 				idx := i
 				toolCalls = append(toolCalls, ToolCall{
 					Index: &idx,
@@ -164,7 +229,7 @@ func ParseCompleteResponse(rawText, delimiter string) (string, []ToolCall, bool)
 					Type:  "function",
 					Function: FunctionCallData{
 						Name:      parsed.Name,
-						Arguments: string(argBytes),
+						Arguments: argStr,
 					},
 				})
 			}

@@ -48,9 +48,12 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 
 	promptText := promptBlocks[0].Text
 
-	// Verify system prompt is safely wrapped in <important>...</important> XML tag
-	if !strings.Contains(promptText, "<important>\nYou are a helpful coding assistant.\n</important>") {
+	// Verify system prompt and tools directives are safely wrapped in <important>...</important> XML tag
+	if !strings.Contains(promptText, "<important>") || !strings.Contains(promptText, "You are a helpful coding assistant.") {
 		t.Fatalf("missing or incorrect <important> system prompt wrapper in prompt: %s", promptText)
+	}
+	if !strings.Contains(promptText, "</important>") {
+		t.Fatalf("missing closing </important> tag in prompt: %s", promptText)
 	}
 
 	if !strings.Contains(promptText, "User: What is 2+2?") {
@@ -66,11 +69,82 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 		t.Fatalf("missing tool prompt directives in prompt: %s", promptText)
 	}
 
+	// Verify prompt primes assistant completion
+	if !strings.HasSuffix(promptText, "Assistant: ") {
+		t.Fatalf("expected prompt to end with 'Assistant: ', got: %s", promptText)
+	}
+
 	// Verify deduplication: [Tool 1] should appear, but NOT [Tool 2]
 	if !strings.Contains(promptText, "[Tool 1] calculate_shipping") {
 		t.Fatalf("missing [Tool 1] in prompt: %s", promptText)
 	}
 	if strings.Contains(promptText, "[Tool 2]") {
 		t.Fatalf("expected tool deduplication, but found [Tool 2] in prompt: %s", promptText)
+	}
+}
+
+func TestTranslator_ToolExecutionResultsGroupingAndContinuation(t *testing.T) {
+	translator := NewTranslator()
+
+	req := &ChatCompletionRequest{
+		Model: "gemini-3.8-flash",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "Run diagnostics on server 1 and 2."},
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: FunctionCallData{
+							Name:      "check_server",
+							Arguments: `{"server_id": 1}`,
+						},
+					},
+					{
+						ID:   "call_2",
+						Type: "function",
+						Function: FunctionCallData{
+							Name:      "check_server",
+							Arguments: `{"server_id": 2}`,
+						},
+					},
+				},
+			},
+			{Role: "tool", ToolCallID: "call_1", Content: `{"status": "ok"}`},
+			{Role: "tool", ToolCallID: "call_2", Content: `{"status": "degraded"}`},
+		},
+		Tools: []mcp.OpenAIToolDefinition{
+			{
+				Type: "function",
+				Function: mcp.FunctionSchema{
+					Name:        "check_server",
+					Description: "Check server status",
+					Parameters:  json.RawMessage(`{"type":"object"}`),
+				},
+			},
+		},
+	}
+
+	promptBlocks := translator.Translate(req, "tool_call")
+	if len(promptBlocks) != 1 {
+		t.Fatalf("expected 1 prompt block, got %d", len(promptBlocks))
+	}
+
+	prompt := promptBlocks[0].Text
+
+	// Verify tool results are grouped into a single User turn
+	if !strings.Contains(prompt, "User: [Tool Execution Results]\nTool Output (id: call_1): {\"status\": \"ok\"}\nTool Output (id: call_2): {\"status\": \"degraded\"}") {
+		t.Fatalf("expected grouped tool execution results turn in prompt:\n%s", prompt)
+	}
+
+	// Verify active execution loop directive is present
+	if !strings.Contains(prompt, "[SYSTEM DIRECTIVE: You are in an active execution loop.") {
+		t.Fatalf("expected active loop directive in prompt:\n%s", prompt)
+	}
+
+	// Verify ending with Assistant:
+	if !strings.HasSuffix(prompt, "Assistant: ") {
+		t.Fatalf("expected prompt to end with 'Assistant: ', got:\n%s", prompt)
 	}
 }

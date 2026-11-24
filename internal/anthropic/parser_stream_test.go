@@ -71,3 +71,40 @@ Finished execution.`
 		t.Errorf("expected cleanText %q, got %q", expectedText, cleanText)
 	}
 }
+
+func TestStreamParser_FlushTrailingBuffer(t *testing.T) {
+	parser := anthropic.NewStreamParser("tool_call")
+
+	delta, tools := parser.ParseChunk("Some leading content <tool_")
+	if delta != "Some leading content " || len(tools) != 0 {
+		t.Fatalf("unexpected delta: %q, tools: %v", delta, tools)
+	}
+
+	flushDelta, flushTools := parser.Flush()
+	if flushDelta != "<tool_" || len(flushTools) != 0 {
+		t.Fatalf("expected flushed delta '<tool_', got %q", flushDelta)
+	}
+}
+
+func TestStreamParser_FlushUnclosedToolCall(t *testing.T) {
+	parser := anthropic.NewStreamParser("tool_call")
+
+	delta, tools := parser.ParseChunk(`<tool_call>{"id": "toolu_12345", "name": "read_file", "arguments": {"path": "/etc/hosts"}}`)
+	if delta != "" || len(tools) != 0 {
+		t.Fatalf("unexpected delta: %q, tools: %v", delta, tools)
+	}
+
+	flushDelta, flushTools := parser.Flush()
+	if flushDelta != "" {
+		t.Fatalf("unexpected flush delta: %q", flushDelta)
+	}
+	if len(flushTools) != 1 {
+		t.Fatalf("expected 1 flushed tool, got %d", len(flushTools))
+	}
+	if flushTools[0].Name != "read_file" {
+		t.Fatalf("expected tool name 'read_file', got %q", flushTools[0].Name)
+	}
+	if string(flushTools[0].Input) != `{"path": "/etc/hosts"}` {
+		t.Fatalf("expected input '{\"path\": \"/etc/hosts\"}', got %q", string(flushTools[0].Input))
+	}
+}

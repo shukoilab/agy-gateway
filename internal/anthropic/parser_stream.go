@@ -130,21 +130,68 @@ func (sp *StreamParser) ParseChunk(chunk string) (textDelta string, toolBlocks [
 	return textDelta, toolBlocks
 }
 
+// Flush forces emission of any pending unparsed buffer text and recovers any unclosed
+// tool_use markup before the stream terminates.
+//
+// @purpose Prevents dropped text chunks or lost tool_use fragments when the stream ends.
+// @rationale Models may close streams immediately after JSON payloads without writing </tool_call>,
+// or trailing text may be held in the buffer matching a partial open tag prefix.
+// @returns Remaining text delta and any recovered tool_use content blocks.
+// @invariants Thread-safe.
+func (sp *StreamParser) Flush() (textDelta string, toolBlocks []ContentBlock) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+
+	if sp.inTool {
+		fullJSON := strings.TrimSpace(sp.toolJSONBuf.String() + sp.buffer.String())
+		var parsed struct {
+			ID        string          `json:"id"`
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(fullJSON), &parsed); err == nil && parsed.Name != "" {
+			callID := parsed.ID
+			if callID == "" {
+				callID = sp.activeCallID
+			}
+			if !strings.HasPrefix(callID, "toolu_") {
+				callID = "toolu_" + callID
+			}
+			rawInput := parsed.Arguments
+			if len(rawInput) == 0 {
+				rawInput = json.RawMessage("{}")
+			}
+			toolBlocks = append(toolBlocks, ContentBlock{
+				Type:  "tool_use",
+				ID:    callID,
+				Name:  parsed.Name,
+				Input: rawInput,
+			})
+			sp.toolIndex++
+		} else {
+			textDelta = sp.openTag + fullJSON
+		}
+		sp.inTool = false
+		sp.toolJSONBuf.Reset()
+		sp.buffer.Reset()
+		return textDelta, toolBlocks
+	}
+
+	if sp.buffer.Len() > 0 {
+		textDelta = sp.buffer.String()
+		sp.buffer.Reset()
+	}
+	return textDelta, toolBlocks
+}
+
 // ParseCompleteResponse parses a complete completion response for non-streaming mode.
 func ParseCompleteResponse(rawText, delimiter string) (string, []ContentBlock, bool) {
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
 
-	openTag := fmt.Sprintf("<%s>", delimiter)
-	closeTag := fmt.Sprintf("</%s>", delimiter)
-
-	pattern := regexp.MustCompile(fmt.Sprintf(`%s([\s\S]*?)%s`, regexp.QuoteMeta(openTag), regexp.QuoteMeta(closeTag)))
+	pattern := regexp.MustCompile(fmt.Sprintf(`<%s\s*>([\s\S]*?)</%s\s*>`, regexp.QuoteMeta(delimiter), regexp.QuoteMeta(delimiter)))
 	matches := pattern.FindAllStringSubmatch(rawText, -1)
-
-	if len(matches) == 0 {
-		return rawText, nil, false
-	}
 
 	var toolBlocks []ContentBlock
 	for _, m := range matches {
@@ -154,7 +201,7 @@ func ParseCompleteResponse(rawText, delimiter string) (string, []ContentBlock, b
 				Name      string          `json:"name"`
 				Arguments json.RawMessage `json:"arguments"`
 			}
-			if err := json.Unmarshal([]byte(m[1]), &parsed); err == nil {
+			if err := json.Unmarshal([]byte(strings.TrimSpace(m[1])), &parsed); err == nil && parsed.Name != "" {
 				callID := parsed.ID
 				if callID == "" {
 					callID = fmt.Sprintf("toolu_%s", uuid.New().String()[:12])

@@ -22,8 +22,10 @@ func NewTranslator() *Translator {
 }
 
 // Translate extracts system instructions and formats the multi-turn conversational history.
-// Consumer system instructions are wrapped in <important>...</important> XML tags in accordance
-// with Google Antigravity ToS for consumer OAuth accounts. Consumer tools are deduplicated by function name.
+// Consumer system instructions and tool calling directives are wrapped in <important>...</important> XML tags
+// at the top of the prompt in accordance with Google Antigravity ToS for consumer OAuth accounts.
+// Consumer tools are deduplicated by function name, tool execution results are grouped into structured turns,
+// and an active execution loop cue primes assistant continuation.
 func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []acp.PromptBlock {
 	if delimiter == "" {
 		delimiter = "tool_call"
@@ -44,18 +46,56 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 		}
 	}
 
-	var historyBuilder strings.Builder
+	// 2. Format Consumer JIT Tool Directives (Deduplicated by function name)
+	var toolsBlock string
+	if len(req.Tools) > 0 {
+		var uniqueTools []mcp.OpenAIToolDefinition
+		seen := make(map[string]bool)
+		for _, tool := range req.Tools {
+			if tool.Type != "function" || tool.Function.Name == "" {
+				continue
+			}
+			if seen[tool.Function.Name] {
+				continue
+			}
+			seen[tool.Function.Name] = true
+			uniqueTools = append(uniqueTools, tool)
+		}
 
-	// 2. Wrap system/developer instructions safely in <important></important> tags as user guidance
-	if len(sysMessages) > 0 {
-		sysBody := strings.TrimSpace(strings.Join(sysMessages, "\n\n"))
-		if sysBody != "" {
-			fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", sysBody)
+		if len(uniqueTools) > 0 {
+			parallel := true
+			if req.ParallelToolCalls != nil {
+				parallel = *req.ParallelToolCalls
+			}
+			var toolChoiceStr string
+			switch tc := req.ToolChoice.(type) {
+			case string:
+				toolChoiceStr = tc
+			}
+			toolsBlock = t.virtualAdapter.BuildToolsPromptEnvelope(uniqueTools, toolChoiceStr, parallel, delimiter)
 		}
 	}
 
-	// 3. Reconstitute multi-turn conversation history
-	for i, msg := range nonSysMessages {
+	var historyBuilder strings.Builder
+
+	// 3. Inject system instructions & tool directives into <important> envelope at the top
+	var systemBlocks []string
+	if len(sysMessages) > 0 {
+		sysBody := strings.TrimSpace(strings.Join(sysMessages, "\n\n"))
+		if sysBody != "" {
+			systemBlocks = append(systemBlocks, sysBody)
+		}
+	}
+	if toolsBlock != "" {
+		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
+	}
+	if len(systemBlocks) > 0 {
+		fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", strings.Join(systemBlocks, "\n\n"))
+	}
+
+	// 4. Reconstitute multi-turn conversation history
+	for i := 0; i < len(nonSysMessages); i++ {
+		msg := nonSysMessages[i]
 		role := strings.ToLower(msg.Role)
 		content := msg.ContentString()
 
@@ -82,7 +122,14 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 				fmt.Fprintf(&historyBuilder, "Assistant: %s\n\n", content)
 			}
 		case "tool":
-			fmt.Fprintf(&historyBuilder, "Tool Output (id: %s): %s\n\n", msg.ToolCallID, content)
+			// Group consecutive tool outputs under a single User turn
+			if i == 0 || strings.ToLower(nonSysMessages[i-1].Role) != "tool" {
+				historyBuilder.WriteString("User: [Tool Execution Results]\n")
+			}
+			fmt.Fprintf(&historyBuilder, "Tool Output (id: %s): %s\n", msg.ToolCallID, content)
+			if i+1 == len(nonSysMessages) || strings.ToLower(nonSysMessages[i+1].Role) != "tool" {
+				historyBuilder.WriteString("\n")
+			}
 		default:
 			if i == len(nonSysMessages)-1 {
 				fmt.Fprintf(&historyBuilder, "User: %s\n\n", content)
@@ -90,37 +137,22 @@ func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) []a
 		}
 	}
 
-	// 4. Inject Consumer JIT Tool Directives (Deduplicated by function name)
-	if len(req.Tools) > 0 {
-		var uniqueTools []mcp.OpenAIToolDefinition
-		seen := make(map[string]bool)
-		for _, tool := range req.Tools {
-			if tool.Type != "function" || tool.Function.Name == "" {
-				continue
-			}
-			if seen[tool.Function.Name] {
-				continue
-			}
-			seen[tool.Function.Name] = true
-			uniqueTools = append(uniqueTools, tool)
+	// 5. Append Active Continuation Cue to prevent premature agent loops from stalling
+	if len(nonSysMessages) > 0 {
+		lastRole := strings.ToLower(nonSysMessages[len(nonSysMessages)-1].Role)
+		if lastRole == "tool" {
+			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(true, delimiter))
+		} else if lastRole == "user" {
+			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(false, delimiter))
 		}
-
-		if len(uniqueTools) > 0 {
-			parallel := true
-			if req.ParallelToolCalls != nil {
-				parallel = *req.ParallelToolCalls
-			}
-			var toolChoiceStr string
-			switch tc := req.ToolChoice.(type) {
-			case string:
-				toolChoiceStr = tc
-			}
-			toolsBlock := t.virtualAdapter.BuildToolsPromptEnvelope(uniqueTools, toolChoiceStr, parallel, delimiter)
-			historyBuilder.WriteString(toolsBlock)
-		}
+	} else {
+		historyBuilder.WriteString("Assistant: ")
 	}
 
 	finalPrompt := strings.TrimSpace(historyBuilder.String())
+	if strings.HasSuffix(finalPrompt, "Assistant:") {
+		finalPrompt += " "
+	}
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}

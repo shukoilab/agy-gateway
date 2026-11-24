@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.9.0] - 2026-11-24
+
+### Added
+- **Universal Autonomous Agent Anti-Stall & Continuous Execution Engine (`internal/mcp`, `internal/openai`, `internal/anthropic`, `internal/server`)**:
+  - **Top-Level Tool Schema Placement**: Relocated tool calling directives and complete JSON schemas into the system `<important>` XML envelope at the beginning of the prompt context, preventing models (e.g. Gemini 3.8 Flash) from misinterpreting buried schema dumps as static chat logs.
+  - **Conversational Turn Symmetry for Tool Outputs**: Reconstituted tool messages under structured user turns (`User: [Tool Execution Results]\nTool Output...`) to ensure standard multi-turn symmetry across consecutive tool execution batches.
+  - **Active Continuation Priming (`BuildActiveContinuationCue`)**: Injected an active execution loop directive and primed `Assistant: ` turn continuation whenever conversational history terminates with tool outputs, preventing autonomous agent loops (OpenCode, Claude Code, Cursor, Cline, Roo Code, Continue.dev) from stalling into idle state.
+  - **Streaming Parser Buffer Recovery & Flush (`Flush()`)**: Added thread-safe buffer flushing in `StreamParser` across both OpenAI and Anthropic adapters, guaranteeing recovery of unclosed tool tags and zero dropped tokens upon stream termination.
+  - **Flexible Whitespace Delimiter Parsing**: Upgraded regex pattern matchers (`<%s\s*>...`) in `ParseCompleteResponse` to tolerate varying whitespace within delimiter tags.
+  - **Polymorphic Tool Argument Parsing**: Enhanced OpenAI streaming parser to handle both raw JSON objects and stringified JSON payloads without double-escaping arguments.
+  - **Streaming Termination Invariant Enforcement**: Added secondary verification of full collected text in streaming handlers to ensure `finish_reason: "tool_calls"` / `"tool_use"` is guaranteed.
+
+---
+
 ## [3.5.0] - 2026-11-24
 
 ### Added

@@ -63,3 +63,57 @@ Let me know if you need anything else.`
 		t.Fatalf("unexpected clean text: %q", text)
 	}
 }
+
+func TestStreamParser_FlushTrailingBuffer(t *testing.T) {
+	parser := NewStreamParser("tool_call")
+
+	// Model emits text ending with a prefix of <tool_call> e.g. "<tool_"
+	delta, tools := parser.ParseChunk("Some leading content <tool_")
+	if delta != "Some leading content " || len(tools) != 0 {
+		t.Fatalf("unexpected delta: %q, tools: %v", delta, tools)
+	}
+
+	// Flush should release the held prefix
+	flushDelta, flushTools := parser.Flush()
+	if flushDelta != "<tool_" || len(flushTools) != 0 {
+		t.Fatalf("expected flushed delta '<tool_', got %q", flushDelta)
+	}
+}
+
+func TestStreamParser_FlushUnclosedToolCall(t *testing.T) {
+	parser := NewStreamParser("tool_call")
+
+	// Model emits tool call opening and JSON body, but stream ends before </tool_call>
+	delta, tools := parser.ParseChunk(`<tool_call>{"id": "call_flush_1", "name": "run_command", "arguments": {"command": "ls -la"}}`)
+	if delta != "" || len(tools) != 0 {
+		t.Fatalf("unexpected delta: %q, tools: %v", delta, tools)
+	}
+
+	flushDelta, flushTools := parser.Flush()
+	if flushDelta != "" {
+		t.Fatalf("unexpected flush delta: %q", flushDelta)
+	}
+	if len(flushTools) != 1 {
+		t.Fatalf("expected 1 flushed tool call, got %d", len(flushTools))
+	}
+	if flushTools[0].Function.Name != "run_command" {
+		t.Fatalf("expected function 'run_command', got %q", flushTools[0].Function.Name)
+	}
+	if flushTools[0].Function.Arguments != `{"command":"ls -la"}` {
+		t.Fatalf("expected arguments '{\"command\":\"ls -la\"}', got %q", flushTools[0].Function.Arguments)
+	}
+}
+
+func TestStreamParser_StringifiedArguments(t *testing.T) {
+	parser := NewStreamParser("tool_call")
+
+	// Model emits arguments as a stringified JSON string instead of an object
+	chunk := `<tool_call>{"id": "call_str_1", "name": "run_bash", "arguments": "{\"flag\": true}"}</tool_call>`
+	_, tools := parser.ParseChunk(chunk)
+	if len(tools) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(tools))
+	}
+	if tools[0].Function.Arguments != `{"flag": true}` {
+		t.Fatalf("expected raw string arguments to be preserved, got %q", tools[0].Function.Arguments)
+	}
+}

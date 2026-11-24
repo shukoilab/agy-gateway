@@ -265,9 +265,13 @@ func (h *OpenAIHandlers) handleSync(
 	var message openai.ChatMessage
 	if hasTools {
 		finishReason = "tool_calls"
+		var contentVal any
+		if cleanContent != "" {
+			contentVal = cleanContent
+		}
 		message = openai.ChatMessage{
 			Role:      "assistant",
-			Content:   nil,
+			Content:   contentVal,
 			ToolCalls: toolCalls,
 		}
 	} else {
@@ -516,6 +520,38 @@ func (h *OpenAIHandlers) handleStreaming(
 			return err
 		}
 
+		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
+		flushDelta, flushTools := streamParser.Flush()
+		if len(flushTools) > 0 {
+			hasToolCalls = true
+		}
+		if flushDelta != "" || len(flushTools) > 0 {
+			var delta openai.ChatCompletionChunkDelta
+			if !firstChunkSent {
+				delta.Role = "assistant"
+				firstChunkSent = true
+			}
+			if flushDelta != "" {
+				delta.Content = &flushDelta
+			}
+			if len(flushTools) > 0 {
+				delta.ToolCalls = flushTools
+			}
+			chunk := openai.ChatCompletionChunk{
+				ID:      completionID,
+				Object:  "chat.completion.chunk",
+				Created: createdTime,
+				Model:   req.Model,
+				Choices: []openai.ChatCompletionChunkChoice{
+					{
+						Index: 0,
+						Delta: delta,
+					},
+				},
+			}
+			_ = sseWriter.WriteChunk(&chunk)
+		}
+
 		return nil
 	})
 
@@ -534,6 +570,14 @@ func (h *OpenAIHandlers) handleStreaming(
 		}
 		_ = sseWriter.WriteError("Inference error: "+err.Error(), "api_error")
 		return
+	}
+
+	// Double check tool presence across full collected text
+	if !hasToolCalls {
+		_, parsedTools, hasTools := openai.ParseCompleteResponse(totalText.String(), delimiter)
+		if hasTools || len(parsedTools) > 0 {
+			hasToolCalls = true
+		}
 	}
 
 	// Emit finish reason chunk

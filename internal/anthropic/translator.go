@@ -42,25 +42,8 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 
 	var historyBuilder strings.Builder
 
-	// 1. Process System Instructions: Wrap in <important></important> per ToS guidelines
-	systemText := strings.TrimSpace(req.System.String())
-	if systemText != "" {
-		fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", systemText)
-	}
-
-	// 2. Reconstitute Multi-Turn Conversational History
-	for _, msg := range req.Messages {
-		role := strings.ToLower(msg.Role)
-
-		switch role {
-		case "user":
-			t.formatUserMessage(&historyBuilder, msg)
-		case "assistant":
-			t.formatAssistantMessage(&historyBuilder, msg, delimiter)
-		}
-	}
-
-	// 3. Inject Consumer JIT Tool Directives (Deduplicated by function name)
+	// 1. Process Consumer JIT Tool Directives (Deduplicated by function name)
+	var toolsBlock string
 	if len(req.Tools) > 0 {
 		var openaiTools []mcp.OpenAIToolDefinition
 		seen := make(map[string]bool)
@@ -99,12 +82,52 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 			}
 
 			// Format JIT tools envelope
-			toolsBlock := t.virtualAdapter.BuildToolsPromptEnvelope(openaiTools, toolChoiceStr, true, delimiter)
-			historyBuilder.WriteString(toolsBlock)
+			toolsBlock = t.virtualAdapter.BuildToolsPromptEnvelope(openaiTools, toolChoiceStr, true, delimiter)
 		}
 	}
 
+	// 2. Inject System Instructions and Tool Directives into <important> envelope at the top
+	var systemBlocks []string
+	systemText := strings.TrimSpace(req.System.String())
+	if systemText != "" {
+		systemBlocks = append(systemBlocks, systemText)
+	}
+	if toolsBlock != "" {
+		systemBlocks = append(systemBlocks, strings.TrimSpace(toolsBlock))
+	}
+	if len(systemBlocks) > 0 {
+		fmt.Fprintf(&historyBuilder, "<important>\n%s\n</important>\n\n", strings.Join(systemBlocks, "\n\n"))
+	}
+
+	// 3. Reconstitute Multi-Turn Conversational History
+	var lastTurnHadToolResults bool
+	for _, msg := range req.Messages {
+		role := strings.ToLower(msg.Role)
+
+		switch role {
+		case "user":
+			lastTurnHadToolResults = t.formatUserMessage(&historyBuilder, msg)
+		case "assistant":
+			t.formatAssistantMessage(&historyBuilder, msg, delimiter)
+			lastTurnHadToolResults = false
+		}
+	}
+
+	// 4. Append Active Continuation Cue to prevent premature agent loops from stalling
+	if len(req.Messages) > 0 {
+		lastMsg := req.Messages[len(req.Messages)-1]
+		lastRole := strings.ToLower(lastMsg.Role)
+		if lastRole == "user" {
+			historyBuilder.WriteString(t.virtualAdapter.BuildActiveContinuationCue(lastTurnHadToolResults, delimiter))
+		}
+	} else {
+		historyBuilder.WriteString("Assistant: ")
+	}
+
 	finalPrompt := strings.TrimSpace(historyBuilder.String())
+	if strings.HasSuffix(finalPrompt, "Assistant:") {
+		finalPrompt += " "
+	}
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}
@@ -118,22 +141,27 @@ func (t *Translator) Translate(req *MessageRequest, delimiter string) []acp.Prom
 }
 
 // formatUserMessage formats user turns, handling text, images, and tool_result blocks.
-func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) {
+// Returns true if the message contained tool_result blocks.
+func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) bool {
 	if len(msg.Content.Blocks) == 0 {
 		if msg.Content.Text != "" {
 			fmt.Fprintf(sb, "User: %s\n\n", msg.Content.Text)
 		}
-		return
+		return false
 	}
 
-	var userParts []string
+	var textParts []string
+	var toolResults []string
+	var hasToolResults bool
+
 	for _, block := range msg.Content.Blocks {
 		switch block.Type {
 		case "text":
 			if block.Text != "" {
-				userParts = append(userParts, block.Text)
+				textParts = append(textParts, block.Text)
 			}
 		case "tool_result":
+			hasToolResults = true
 			resStr := ""
 			switch c := block.Content.(type) {
 			case string:
@@ -143,18 +171,27 @@ func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message) {
 				resStr = string(raw)
 			}
 			if block.IsError {
-				userParts = append(userParts, fmt.Sprintf("Tool Error (id: %s): %s", block.ToolUseID, resStr))
+				toolResults = append(toolResults, fmt.Sprintf("Tool Error (id: %s): %s", block.ToolUseID, resStr))
 			} else {
-				userParts = append(userParts, fmt.Sprintf("Tool Output (id: %s): %s", block.ToolUseID, resStr))
+				toolResults = append(toolResults, fmt.Sprintf("Tool Output (id: %s): %s", block.ToolUseID, resStr))
 			}
 		case "image":
-			userParts = append(userParts, "[Image Attached]")
+			textParts = append(textParts, "[Image Attached]")
 		}
 	}
 
-	if len(userParts) > 0 {
-		fmt.Fprintf(sb, "User: %s\n\n", strings.Join(userParts, "\n"))
+	var userParts []string
+	if len(textParts) > 0 {
+		userParts = append(userParts, strings.Join(textParts, "\n\n"))
 	}
+	if len(toolResults) > 0 {
+		userParts = append(userParts, "[Tool Execution Results]\n"+strings.Join(toolResults, "\n"))
+	}
+
+	if len(userParts) > 0 {
+		fmt.Fprintf(sb, "User: %s\n\n", strings.Join(userParts, "\n\n"))
+	}
+	return hasToolResults
 }
 
 // formatAssistantMessage formats assistant turns, reconstructing thinking blocks and tool_use tags.

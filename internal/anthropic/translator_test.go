@@ -79,8 +79,11 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 	prompt := promptBlocks[0].Text
 
 	// Verify System Instructions enclosed in <important> tags
-	if !strings.Contains(prompt, "<important>\nYou are a senior systems engineer.\n</important>") {
+	if !strings.Contains(prompt, "<important>") || !strings.Contains(prompt, "You are a senior systems engineer.") {
 		t.Errorf("prompt missing <important> system tags:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "</important>") {
+		t.Errorf("prompt missing </important> closing tag:\n%s", prompt)
 	}
 
 	// Verify Multi-Turn conversation reconstruction
@@ -93,9 +96,20 @@ func TestTranslator_MultiTurnHistoryAndTools(t *testing.T) {
 	if !strings.Contains(prompt, "Tool Output (id: toolu_cluster_1):") {
 		t.Errorf("prompt missing user tool_result output")
 	}
+	if !strings.Contains(prompt, "[Tool Execution Results]") {
+		t.Errorf("prompt missing [Tool Execution Results] turn header")
+	}
 
 	// Verify Consumer Tool-Calling Directives
 	if !strings.Contains(prompt, "# CONSUMER TOOL-CALLING DIRECTIVES") {
 		t.Errorf("prompt missing tool calling directives")
+	}
+
+	// Verify Active Execution Loop continuation cue
+	if !strings.Contains(prompt, "[SYSTEM DIRECTIVE: You are in an active execution loop.") {
+		t.Errorf("prompt missing active execution loop directive:\n%s", prompt)
+	}
+	if !strings.HasSuffix(prompt, "Assistant: ") {
+		t.Errorf("expected prompt to end with 'Assistant: ', got:\n%s", prompt)
 	}
 }
