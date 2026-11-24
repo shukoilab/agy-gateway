@@ -69,22 +69,19 @@
 
 ### 1. Prerequisites
 - Docker Engine 24.0+ & Docker Compose v2.20+
-- Google Antigravity CLI (`agy`) binary
 - At least 1 authenticated Google account for Google Antigravity
 
-### 2. Prepare Antigravity Binary
-Place your local `agy` binary in `vendor-bins/` for Docker build:
-
-```bash
-mkdir -p vendor-bins/amd64
-cp $(which agy) vendor-bins/amd64/agy
-```
-
-### 3. Launch the Gateway
-Clone the repository and start the container:
+### 2. Launch the Gateway
+Clone the repository and start the container (the Docker build automatically provisions and verifies the official Google Antigravity CLI binary inside the image):
 
 ```bash
 docker compose up -d --build
+```
+
+Alternatively, pull the prebuilt package published by our automated CI/CD pipeline from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/shukoilab/agy-gateway:latest
 ```
 
 Verify that the service is running and healthy:
@@ -518,6 +515,28 @@ To run in the production-mode container environment with non-root security and l
 docker compose up -d --build
 docker compose logs -f
 ```
+
+---
+
+## 🤖 Automated CI/CD & GitHub Container Registry
+
+The repository is equipped with a fully automated, production-grade GitHub Actions pipeline (`.github/workflows/ci-release.yml`):
+
+1. **Continuous Integration Gate (`ci`)**:
+   - Runs on every push and pull request to `main`.
+   - Verifies Go module dependencies, runs `go vet`, executes the full test suite with data race detection (`go test -v -race ./...`), and tests binary compilation.
+2. **Automated Semantic Version Bumping & Git Tagging**:
+   - Analyzes commit messages upon push to `main` (supporting `#major`, `#minor`, `#patch` or Conventional Commits like `feat:` / `fix:`).
+   - Generates the next semver tag automatically (e.g. `v3.3.1`), creates an annotated Git tag, and generates automated changelogs.
+3. **Automated GitHub Release**:
+   - Publishes a formal GitHub Release corresponding to the new version tag.
+4. **Automated Docker Package Publishing (GHCR)**:
+   - Builds the production multi-stage container with target version branding (`-ldflags="-X main.version=${VERSION}"`).
+   - Automatically publishes tagged images and `:latest` to GitHub Container Registry:
+     ```bash
+     docker pull ghcr.io/shukoilab/agy-gateway:latest
+     docker pull ghcr.io/shukoilab/agy-gateway:v3.3.1
+     ```
 
 ---
 

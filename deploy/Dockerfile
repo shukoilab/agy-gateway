@@ -3,12 +3,13 @@
 FROM golang:1.25-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
+ARG VERSION=3.3.0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w -X main.version=3.3.0" \
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/agy-gateway ./cmd/agy-gateway
 
 FROM debian:bookworm-slim AS runtime
@@ -17,12 +18,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       tini \
       curl \
+      tar \
+      gzip \
       nodejs \
       npm \
       python3 \
       python3-pip \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g @fikrilal/agy-auth \
+    && curl -fsSL https://antigravity.google/cli/install.sh | bash \
+    && cp -f /root/.local/bin/agy /usr/local/bin/agy \
+    && rm -rf /root/.local /root/.cache \
     && groupadd --gid 10001 agygw \
     && useradd --uid 10001 --gid 10001 --shell /usr/sbin/nologin --create-home agygw \
     && mkdir -p /etc/agy-gateway \
@@ -33,7 +39,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chown -R 10001:10001 /etc/agy-gateway /var/lib/agy-gateway
 
 COPY --from=go-builder /out/agy-gateway /usr/local/bin/agy-gateway
-COPY vendor-bins/${TARGETARCH}/agy /usr/local/bin/agy
 COPY config.yaml /etc/agy-gateway/config.yaml
 RUN chmod 0755 /usr/local/bin/agy-gateway /usr/local/bin/agy && \
     chown -R 10001:10001 /etc/agy-gateway /var/lib/agy-gateway
