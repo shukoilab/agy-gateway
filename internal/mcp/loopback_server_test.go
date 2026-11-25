@@ -20,7 +20,10 @@ func TestLoopbackServer_LifecycleAndToolCallInterception(t *testing.T) {
 		},
 	}
 
-	state := server.RegisterSession(sessionID, tools)
+	state, regErr := server.RegisterSession(sessionID, tools)
+	if regErr != nil {
+		t.Fatalf("RegisterSession failed: %v", regErr)
+	}
 	if state == nil {
 		t.Fatalf("expected state to be non-nil")
 	}
@@ -117,7 +120,10 @@ func TestLoopbackServer_AnthropicSessionRegistration(t *testing.T) {
 		},
 	}
 
-	state := server.RegisterAnthropicSession(sessionID, tools)
+	state, regErr := server.RegisterAnthropicSession(sessionID, tools)
+	if regErr != nil {
+		t.Fatalf("RegisterAnthropicSession failed: %v", regErr)
+	}
 	if state == nil {
 		t.Fatalf("expected state to be non-nil")
 	}
@@ -137,5 +143,38 @@ func TestLoopbackServer_AnthropicSessionRegistration(t *testing.T) {
 	}
 	if len(listResp.Result.Tools) != 1 || listResp.Result.Tools[0].Name != "edit_file" {
 		t.Fatalf("unexpected tools returned: %+v", listResp.Result.Tools)
+	}
+}
+
+func TestLoopbackServer_NotificationsAndListFallbacks(t *testing.T) {
+	server := NewLoopbackServer()
+
+	// Notifications must never return a response even if session is unregistered
+	notifReq := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	respBytes, err := server.HandleJSONRPC("missing_sess", notifReq)
+	if err != nil {
+		t.Fatalf("unexpected error for notification: %v", err)
+	}
+	if respBytes != nil {
+		t.Fatalf("expected nil response for JSON-RPC notification, got %s", string(respBytes))
+	}
+
+	// resources/list and prompts/list should return empty collections cleanly
+	resReq := []byte(`{"jsonrpc":"2.0","id":10,"method":"resources/list","params":{}}`)
+	resBytes, err := server.HandleJSONRPC("missing_sess", resReq)
+	if err != nil {
+		t.Fatalf("resources/list failed: %v", err)
+	}
+	if string(resBytes) == "" {
+		t.Fatalf("expected JSON response for resources/list")
+	}
+
+	promptReq := []byte(`{"jsonrpc":"2.0","id":11,"method":"prompts/list","params":{}}`)
+	promptBytes, err := server.HandleJSONRPC("missing_sess", promptReq)
+	if err != nil {
+		t.Fatalf("prompts/list failed: %v", err)
+	}
+	if string(promptBytes) == "" {
+		t.Fatalf("expected JSON response for prompts/list")
 	}
 }

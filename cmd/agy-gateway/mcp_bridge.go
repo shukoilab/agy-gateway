@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -40,16 +41,27 @@ func runMCPBridgeSubcommand(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: --session-id or --url must be specified\n")
 			os.Exit(1)
 		}
+		// Precedence: explicit --port flag > ambient env. The parent gateway always passes --port
+		// derived from its own configured listen port, so an inherited AGY_GW_PORT/PORT from an
+		// unrelated process must never redirect the bridge to a different instance.
 		activePort := *port
-		if envPort := os.Getenv("AGY_GW_PORT"); envPort != "" {
-			var p int
-			if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil && p > 0 {
-				activePort = p
+		portExplicit := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "port" {
+				portExplicit = true
 			}
-		} else if envPort := os.Getenv("PORT"); envPort != "" {
-			var p int
-			if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil && p > 0 {
-				activePort = p
+		})
+		if !portExplicit {
+			if envPort := os.Getenv("AGY_GW_PORT"); envPort != "" {
+				var p int
+				if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil && p > 0 {
+					activePort = p
+				}
+			} else if envPort := os.Getenv("PORT"); envPort != "" {
+				var p int
+				if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil && p > 0 {
+					activePort = p
+				}
 			}
 		}
 		targetURL = fmt.Sprintf("http://127.0.0.1:%d/internal/mcp/%s", activePort, *sessionID)
@@ -58,6 +70,10 @@ func runMCPBridgeSubcommand(args []string) {
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 	}
+
+	// AGY_GW_MCP_TOKEN is injected by the gateway into this process's environment at
+	// session/new time. It authenticates this bridge against POST /internal/mcp/<session>.
+	mcpToken := os.Getenv("AGY_GW_MCP_TOKEN")
 
 	reader := bufio.NewReaderSize(os.Stdin, 1024*1024)
 	for {
@@ -71,10 +87,14 @@ func runMCPBridgeSubcommand(args []string) {
 					continue
 				}
 				req.Header.Set("Content-Type", "application/json")
+				if mcpToken != "" {
+					req.Header.Set("Authorization", "Bearer "+mcpToken)
+				}
 
 				resp, respErr := client.Do(req)
 				if respErr != nil {
 					fmt.Fprintf(os.Stderr, "HTTP request failed: %v\n", respErr)
+					writeBridgeError(trimmed, -32603, "gateway unreachable: "+respErr.Error())
 					continue
 				}
 
@@ -82,11 +102,26 @@ func runMCPBridgeSubcommand(args []string) {
 				_ = resp.Body.Close()
 				if readErr != nil {
 					fmt.Fprintf(os.Stderr, "Failed to read response: %v\n", readErr)
+					writeBridgeError(trimmed, -32603, "gateway response unreadable: "+readErr.Error())
 					continue
 				}
 
-				if len(respBody) > 0 && resp.StatusCode == http.StatusOK {
-					respBody = bytes.TrimSpace(respBody)
+				respBody = bytes.TrimSpace(respBody)
+				// 204 No Content is the correct reply for JSON-RPC notifications (no id): there is
+				// nothing to forward. Treating it as a failure injects a spurious error frame that
+				// corrupts the MCP handshake and makes the agent silently drop the tool registry.
+				if resp.StatusCode == http.StatusNoContent {
+					continue
+				}
+				if resp.StatusCode != http.StatusOK {
+					// A transport-level failure must reach the agent as a JSON-RPC error frame,
+					// otherwise the agent waits forever for a response that will never come.
+					fmt.Fprintf(os.Stderr, "gateway returned HTTP %d: %s\n", resp.StatusCode, string(respBody))
+					writeBridgeError(trimmed, -32603, fmt.Sprintf("gateway HTTP %d: %s", resp.StatusCode, string(respBody)))
+					continue
+				}
+
+				if len(respBody) > 0 {
 					_, _ = os.Stdout.Write(respBody)
 					_, _ = os.Stdout.Write([]byte("\n"))
 					_ = os.Stdout.Sync()
@@ -98,4 +133,38 @@ func runMCPBridgeSubcommand(args []string) {
 			break // EOF or stdin pipe closed
 		}
 	}
+}
+
+// writeBridgeError emits a JSON-RPC 2.0 error frame on stdout for the given request line.
+//
+// @purpose Prevents the upstream ACP agent from blocking forever when the gateway is unreachable.
+// @rationale An unanswered MCP request stalls the whole turn; a typed error lets the agent retry or
+// report the failure instead of hanging until the inference timeout.
+// @preconditions reqLine must be a complete JSON-RPC request line received from stdin.
+// @param reqLine Raw request bytes as read from stdin.
+// @param code JSON-RPC error code to report.
+// @param message Human-readable error detail.
+// @returns None; writes to stdout and syncs.
+// @throws None; unparsable ids are reported with a null id per JSON-RPC spec.
+// @invariants O(1); single stdout write; no shared state.
+func writeBridgeError(reqLine []byte, code int, message string) {
+	var req struct {
+		ID any `json:"id"`
+	}
+	_ = json.Unmarshal(reqLine, &req)
+	errFrame := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      req.ID,
+		"error": map[string]any{
+			"code":    code,
+			"message": message,
+		},
+	}
+	raw, marshalErr := json.Marshal(errFrame)
+	if marshalErr != nil {
+		return
+	}
+	_, _ = os.Stdout.Write(raw)
+	_, _ = os.Stdout.Write([]byte("\n"))
+	_ = os.Stdout.Sync()
 }

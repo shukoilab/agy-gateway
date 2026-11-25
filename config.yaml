@@ -15,21 +15,20 @@ security:
       rate_limit_rpm: 120
   admin_api_key_env: "AGY_GW_ADMIN_KEY"
   admin_api_key: "admin-super-secret-key-change-me"
-  allow_remote_image_urls: false
   allowed_cors_origins: []
 
 binaries:
   agy_path: "/usr/local/bin/agy"
-  agy_min_version: "1.5.5"
+  agy_min_version: "1.5.16"
   agy_auth_path: "/usr/local/bin/agy-auth"
   agy_acp_args:
     - "acp"
-    - "--dangerously-skip-permissions"
 
 execution:
-  yolo_mode: true
   acp_session_mode: "accept-edits"
   auto_approve_permissions: true
+  system_prompt_channel: "auto" # auto|standard|vendor|both
+  vision_mode: "reject"         # reject|flatten - agy cannot process images
   clean_workspace_between_requests: true
   max_retries: 3
   retry_initial_backoff: "500ms"
@@ -109,9 +108,11 @@ auto_update:
 mcp:
   client_tool_calling:
     enabled: true
-    default_parallel: true
     strict_schema_validation: true
     max_tool_argument_bytes: 16777216 # 16 MiB (supports large context tool returns)
+    max_client_tools: 128
+    max_intercepted_tool_calls: 16
+    tool_call_collect_window: "1s"
     delimiter_tag: "tool_call"
 
 observability:

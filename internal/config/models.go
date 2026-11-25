@@ -2,11 +2,37 @@ package config
 
 import "strings"
 
-// MapReasoningEffort converts OpenAI reasoning_effort string values
-// into Antigravity ACP thought_level parameters.
+// ThoughtLevelLow, ThoughtLevelMedium, ThoughtLevelHigh and ThoughtLevelXHigh are the ONLY wire values
+// accepted by agy acp for session/set_config_option{configId:"thought_level"}.
 //
-// OpenAI values: "none", "minimal", "low", "medium", "high", "xhigh"
-// ACP values: "off", "low", "medium", "high", "extra"
+// @purpose Single source of truth for the thought-level enum.
+// @rationale Verified against agy 1.5.16: "off", "minimal", "max" and "extra" are all rejected with
+// -32602. "extra" is merely the DISPLAY LABEL of the wire value "xhigh" (advertised as
+// {"value":"xhigh","name":"Extra"}), so returning the label as a wire value silently downgrades every
+// high-effort request to the session default.
+const (
+	ThoughtLevelLow    = "low"
+	ThoughtLevelMedium = "medium"
+	ThoughtLevelHigh   = "high"
+	ThoughtLevelXHigh  = "xhigh"
+)
+
+// ThoughtLevels lists the accepted wire values in ascending effort order.
+var ThoughtLevels = []string{ThoughtLevelLow, ThoughtLevelMedium, ThoughtLevelHigh, ThoughtLevelXHigh}
+
+// MapReasoningEffort converts a client reasoning-effort token into an agy acp thought_level wire value.
+//
+// @purpose Normalises OpenAI `reasoning_effort` and Anthropic thinking budgets into a value agy accepts.
+// @rationale The gateway previously emitted "off" and "extra", both of which agy rejects with -32602, and
+// the error was discarded, so callers silently received the session default instead of the level they asked
+// for. Mapping onto the four accepted wire values makes every request land where the caller intended.
+//
+// @preconditions effort and defaultEffort are free-form; case and surrounding space are ignored.
+// @param effort Client-supplied effort token ("none", "minimal", "low", "medium", "high", "xhigh", "extra").
+// @param defaultEffort Fallback used when effort is empty.
+// @returns One of ThoughtLevels; never "off" and never "extra".
+// @throws None.
+// @invariants Pure function, O(1), always returns an accepted wire value.
 func MapReasoningEffort(effort string, defaultEffort string) string {
 	target := strings.ToLower(strings.TrimSpace(effort))
 	if target == "" {
@@ -14,17 +40,106 @@ func MapReasoningEffort(effort string, defaultEffort string) string {
 	}
 
 	switch target {
-	case "none", "off":
-		return "off"
-	case "minimal", "low":
-		return "low"
-	case "medium":
-		return "medium"
-	case "high":
-		return "high"
-	case "xhigh", "extra":
-		return "extra"
+	case "none", "off", "minimal", ThoughtLevelLow:
+		// agy offers no "off"/"none" level; the lowest accepted effort is "low".
+		return ThoughtLevelLow
+	case ThoughtLevelMedium:
+		return ThoughtLevelMedium
+	case ThoughtLevelHigh:
+		return ThoughtLevelHigh
+	case ThoughtLevelXHigh, "extra":
+		// "extra" is the display label of the "xhigh" wire value.
+		return ThoughtLevelXHigh
+	case "max":
+		return ThoughtLevelXHigh
 	default:
-		return "medium"
+		return ThoughtLevelMedium
 	}
+}
+
+// MapThinkingBudget converts an Anthropic thinking budget into an agy thought_level wire value.
+//
+// @purpose Bridges Anthropic `thinking.budget_tokens` onto the four accepted ACP effort levels.
+// @rationale Anthropic expresses effort as a token budget with no ACP equivalent, so a deterministic
+// bucketing is required instead of dropping the field.
+//
+// @param budgetTokens Requested reasoning budget; <= 0 means unset.
+// @returns One of ThoughtLevels (medium when the budget is unset).
+// @invariants Pure, O(1), monotonic non-decreasing in budgetTokens.
+func MapThinkingBudget(budgetTokens int) string {
+	switch {
+	case budgetTokens <= 0:
+		return ThoughtLevelMedium
+	case budgetTokens <= 1024:
+		return ThoughtLevelLow
+	case budgetTokens <= 4096:
+		return ThoughtLevelMedium
+	case budgetTokens <= 16384:
+		return ThoughtLevelHigh
+	default:
+		return ThoughtLevelXHigh
+	}
+}
+
+// IsThoughtLevel reports whether value is an accepted agy thought_level wire value.
+//
+// @purpose Validates a value before it is sent upstream.
+// @param value Candidate wire value.
+// @returns True for low/medium/high/xhigh (case-insensitive).
+// @invariants Pure, O(4).
+func IsThoughtLevel(value string) bool {
+	v := strings.ToLower(strings.TrimSpace(value))
+	for _, l := range ThoughtLevels {
+		if v == l {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionModes enumerates agy acp session modes.
+//
+// @purpose Validation set for execution.acp_session_mode.
+// @rationale Verified from a live session/new response: agy 1.5.16 advertises default, accept-edits,
+// auto and plan. Excluding `auto` made an advertised mode unreachable.
+var sessionModes = []string{"default", "accept-edits", "auto", "plan"}
+
+// systemPromptChannels enumerates delivery channels for the system prompt.
+//
+// @purpose Validation set for execution.system_prompt_channel.
+// @rationale "auto" sends every channel the agent advertises (the only safe default); "standard" and
+// "vendor" pin one channel; "both" forces both regardless of advertisement.
+var systemPromptChannels = []string{"auto", "standard", "vendor", "both"}
+
+// visionModes enumerates image/embedded-content handling.
+//
+// @purpose Validation set for execution.vision_mode.
+// @rationale agy advertises image support but fails every such turn with a 400 surfaced as assistant text.
+var visionModes = []string{"reject", "flatten"}
+
+// unsupportedParamPolicies enumerates handling of parameters the agent cannot honour.
+//
+// @purpose Validation set for openai.unsupported_param_policy.
+// @rationale Silent stripping is the bug this knob exists to eliminate.
+var unsupportedParamPolicies = []string{"strip_and_warn", "reject"}
+
+func validSessionMode(v string) bool            { return contains(sessionModes, v) }
+func validSystemPromptChannel(v string) bool    { return contains(systemPromptChannels, v) }
+func validVisionMode(v string) bool             { return contains(visionModes, v) }
+func validUnsupportedParamPolicy(v string) bool { return contains(unsupportedParamPolicies, v) }
+
+// contains reports membership in a small string set.
+//
+// @purpose Shared validation helper for closed enums.
+// @param set Candidate values.
+// @param v Value to look up.
+// @returns True when v is a member.
+// @invariants O(n) over a compile-time constant slice.
+func contains(set []string, v string) bool {
+	for _, s := range set {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }

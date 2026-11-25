@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -118,6 +116,21 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// FR-07: agy advertises image/embedded context but the model rejects both with INVALID_ARGUMENT.
+	if where := anthropicVisionRequest(&req); where != "" && visionModeRejects(h.cfg) {
+		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("Image content is not supported by the upstream agent (%s). Send a textual description instead.", where))
+		return
+	}
+
+	// FR-14: report or reject fields the agent cannot honour instead of dropping them silently.
+	if _, err := applyUnsupportedParamPolicy(suppliedAnthropicUnsupportedParams(&req), h.cfg.Anthropic.UnsupportedParamPolicy, w); err != nil {
+		field, _ := IsUnsupportedParam(err)
+		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			fmt.Sprintf("The parameter %q is not supported by the upstream agent", field))
+		return
+	}
+
 	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
 	if delimiter == "" {
 		delimiter = "tool_call"
@@ -140,16 +153,7 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 		case "adaptive":
 			effort = "high"
 		case "enabled":
-			switch {
-			case req.Thinking.BudgetTokens <= 1024:
-				effort = "low"
-			case req.Thinking.BudgetTokens <= 4096:
-				effort = "medium"
-			case req.Thinking.BudgetTokens <= 16384:
-				effort = "high"
-			default:
-				effort = "extra"
-			}
+			effort = config.MapThinkingBudget(req.Thinking.BudgetTokens)
 		}
 	}
 	if effort == "" && modelEntry.PresetEffort != "" {
@@ -176,353 +180,89 @@ func (h *AnthropicHandlers) handleSync(
 	promptBlocks []acp.PromptBlock,
 	completionID string,
 ) {
-	var fullText strings.Builder
-	var fullThoughts strings.Builder
-	var turnMu sync.Mutex
-
-	ttftDuration := h.cfg.Pool.FirstTokenTimeout
-	if ttftDuration <= 0 {
-		ttftDuration = 120 * time.Second
+	in := turnInput{
+		Ctx:           r.Context(),
+		ModelEntry:    modelEntry,
+		ThoughtLevel:  thoughtLevel,
+		SystemPrompt:  systemPrompt,
+		PromptBlocks:  promptBlocks,
+		StopSequences: req.StopSequences,
 	}
-	var ttftTimedOut atomic.Bool
+
+	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+	if delimiter == "" {
+		delimiter = "tool_call"
+	}
+	in.ParseTextToolCalls = func(text string) (string, []toolCollectorEntry) {
+		clean, blocks, has := anthropic.ParseCompleteResponse(text, delimiter)
+		if !has || len(blocks) == 0 {
+			return text, nil
+		}
+		out := make([]toolCollectorEntry, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type != "tool_use" || b.Name == "" {
+				continue
+			}
+			args := json.RawMessage(b.Input)
+			if len(args) == 0 || string(args) == "null" {
+				args = json.RawMessage("{}")
+			}
+			out = append(out, toolCollectorEntry{ID: b.ID, Name: b.Name, Arguments: args})
+		}
+		return clean, out
+	}
+
+	if len(req.Tools) > 0 {
+		anthropicTools, toolNames := convertAnthropicTools(req.Tools)
+		loopbackSessionID := newLoopbackSessionID()
+		state, err := h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
+		if err != nil {
+			h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+		in.LoopbackSessionID = loopbackSessionID
+		in.LoopbackToken = state.Token
+		in.LoopbackState = state
+		in.ClientToolNames = toolNames
+	}
 
 	maxRetries := h.cfg.Execution.MaxRetries
 	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
-	var interceptedToolBlocks []anthropic.ContentBlock
-	var actualPromptTokens atomic.Int64
+	var outcome turnResult
 	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
-		turnMu.Lock()
-		fullText.Reset()
-		fullThoughts.Reset()
-		interceptedToolBlocks = nil
-		turnMu.Unlock()
-
-		// A. Negotiate ACP session
-		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
-		defer cancelSess()
-
-		newParams := acp.SessionNewParams{
-			CWD: worker.Cwd,
+		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
+		if attemptErr != nil {
+			return attemptErr
 		}
-		var loopbackSessionID string
-		var loopbackState *mcp.SessionState
-		if len(req.Tools) > 0 {
-			var anthropicTools []mcp.AnthropicToolDefinition
-			for _, t := range req.Tools {
-				anthropicTools = append(anthropicTools, mcp.AnthropicToolDefinition{
-					Name:        t.Name,
-					Description: t.Description,
-					InputSchema: t.InputSchema,
-				})
-			}
-			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-			loopbackState = h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
-			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-
-			execPath, err := os.Executable()
-			if err != nil || execPath == "" {
-				execPath = "agy-gateway"
-			}
-			newParams.MCPServers = []acp.MCPServerInfo{
-				{
-					Name:    "client-tools",
-					Command: execPath,
-					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
-				},
-			}
-		}
-		effectiveSystemPrompt := systemPrompt
-		if effectiveSystemPrompt == "" {
-			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-		}
-		systemPromptMode := "override"
-		newParams.SystemPrompt = &acp.SystemPrompt{
-			Mode: systemPromptMode,
-			Content: []acp.PromptBlock{
-				{
-					Type: "text",
-					Text: effectiveSystemPrompt,
-				},
-			},
-		}
-		newParams.Meta = map[string]any{
-			"antigravity": map[string]any{
-				"systemPrompt": map[string]any{
-					systemPromptMode: effectiveSystemPrompt,
-				},
-			},
-		}
-		var newResult acp.SessionNewResult
-		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
-			var respErr *acp.ResponseError
-			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
-				time.Sleep(1 * time.Second)
-				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
-			}
-			if err != nil {
-				return err
-			}
-		}
-
-		defer func() {
-			if newResult.SessionID != "" {
-				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancelClose()
-				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
-					SessionID: newResult.SessionID,
-				}, nil)
-			}
-		}()
-
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDMode,
-			Value:     h.cfg.Execution.AcpSessionMode,
-		}, nil)
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDModel,
-			Value:     modelEntry.UpstreamModel,
-		}, nil)
-		if thoughtLevel != "" {
-			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-				SessionID: newResult.SessionID,
-				ConfigID:  acp.ConfigIDThoughtLevel,
-				Value:     thoughtLevel,
-			}, nil)
-		}
-
-		// B. TTFT Watchdog initialization
-		var ttftDisarmed atomic.Bool
-		ttftTimer := time.NewTimer(ttftDuration)
-		defer ttftTimer.Stop()
-
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
-		go func() {
-			select {
-			case <-promptCtx.Done():
-			case <-ttftTimer.C:
-				if !ttftDisarmed.Load() {
-					ttftTimedOut.Store(true)
-					h.logger.Warn("time-to-first-token watchdog triggered", "timeout", ttftDuration)
-					cancelPrompt()
-				}
-			}
-		}()
-
-		// C. Register listener for turn updates with early stop-sequence detection
-		delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-		if delimiter == "" {
-			delimiter = "tool_call"
-		}
-		streamParser := anthropic.NewStreamParser(delimiter)
-		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
-			if !ttftDisarmed.Load() {
-				ttftDisarmed.Store(true)
-				ttftTimer.Stop()
-			}
-			turnMu.Lock()
-			defer turnMu.Unlock()
-
-			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				if streamParser.IsTerminated() {
-					cancelPrompt()
-					return
-				}
-				textChunk := update.Update.Content.Text
-				_, _ = streamParser.ParseChunk(textChunk)
-				fullText.WriteString(textChunk)
-				if streamParser.IsTerminated() {
-					h.logger.Debug("anthropic non-streaming turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
-					cancelPrompt()
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
-				fullThoughts.WriteString(update.Update.Content.Text)
-			} else if update.Update.SessionUpdate == acp.UpdateUsage {
-				if update.Update.Used != nil && *update.Update.Used > 0 {
-					actualPromptTokens.Store(*update.Update.Used)
-				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
-					actualPromptTokens.Store(update.Update.Usage.Used)
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
-				if loopbackState == nil {
-					h.logger.Warn("tool_call update ignored: loopbackState is nil", "name", update.Update.Name)
-					return
-				}
-				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
-				h.logger.Info("anthropic sync tool_call check", "rawName", update.Update.Name, "normalized", normalizedName, "matched", matched)
-				if !matched {
-					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
-					return
-				}
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-				callID := update.Update.ToolCallID
-				if callID == "" {
-					callID = fmt.Sprintf("toolu_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-				}
-				args := string(update.Update.RawInput)
-				if args == "" || args == "null" {
-					args = "{}"
-				}
-
-				already := false
-				for _, tb := range interceptedToolBlocks {
-					if tb.ID == callID || tb.Name == normalizedName {
-						already = true
-						break
-					}
-				}
-				if !already {
-					interceptedToolBlocks = append(interceptedToolBlocks, anthropic.ContentBlock{
-						Type:  "tool_use",
-						ID:    callID,
-						Name:  normalizedName,
-						Input: json.RawMessage(args),
-					})
-				}
-
-				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-					SessionID: newResult.SessionID,
-				})
-				time.AfterFunc(2500*time.Millisecond, func() {
-					cancelPrompt()
-				})
-				return
-			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-			}
-		})
-		defer worker.Transport.SetUpdateListener(nil)
-
-		if loopbackState != nil {
-			go func() {
-				select {
-				case call, ok := <-loopbackState.Calls:
-					if !ok {
-						return
-					}
-					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
-					h.logger.Info("anthropic stream loopbackState.Calls received", "callName", call.Name, "normalized", normalizedName, "matched", matched)
-					if !matched {
-						return
-					}
-					turnMu.Lock()
-					already := false
-					for _, tb := range interceptedToolBlocks {
-						if tb.ID == call.ID || tb.Name == normalizedName {
-							already = true
-							break
-						}
-					}
-					if !already {
-						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-						interceptedToolBlocks = append(interceptedToolBlocks, anthropic.ContentBlock{
-							Type:  "tool_use",
-							ID:    call.ID,
-							Name:  normalizedName,
-							Input: call.Arguments,
-						})
-					}
-					turnMu.Unlock()
-
-					_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-						SessionID: newResult.SessionID,
-					})
-					time.AfterFunc(2500*time.Millisecond, func() {
-						cancelPrompt()
-					})
-				case <-promptCtx.Done():
-					return
-				}
-			}()
-		}
-
-		// D. Send session/prompt turn
-		var promptResult acp.PromptResult
-		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
-			SessionID: newResult.SessionID,
-			Prompt:    promptBlocks,
-		}, &promptResult); err != nil {
-			if (streamParser.IsTerminated() || len(interceptedToolBlocks) > 0) && errors.Is(err, context.Canceled) {
-				// Turn was gracefully aborted via session/cancel or watchdog
-				err = nil
-			} else {
-				return err
-			}
-		}
-
-		if len(interceptedToolBlocks) > 0 {
-			h.logger.Debug("anthropic non-streaming turn completed: tool call intercepted", "workerId", worker.ID, "toolCount", len(interceptedToolBlocks))
-		} else if streamParser.IsTerminated() {
-			h.logger.Debug("anthropic non-streaming turn completed: early stop sequence detected", "workerId", worker.ID)
-		}
-
+		outcome = res
 		return nil
 	})
 
 	if err != nil {
-		if ttftTimedOut.Load() {
-			h.writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", fmt.Sprintf("Time to first token exceeded %s", ttftDuration))
-			return
-		}
-		var respErr *acp.ResponseError
-		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
-			strings.Contains(err.Error(), "Authentication required") ||
-			strings.Contains(err.Error(), "transport is closed") {
-			h.writeAnthropicError(w, http.StatusServiceUnavailable, "authentication_error", "No authenticated Antigravity accounts available")
-			return
-		}
-		h.writeAnthropicError(w, http.StatusInternalServerError, "api_error", "Inference error: "+err.Error())
+		h.writeAnthropicTurnError(w, err)
 		return
 	}
 
-	// 3. Parse text and JIT consumer tool calls
-	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
-	cleanContent, toolBlocks, hasTools := anthropic.ParseCompleteResponse(fullText.String(), delimiter)
-
 	var contentBlocks []anthropic.ContentBlock
-
-	// Include thinking block if reasoning content is exposed or client requested thinking
-	if (h.cfg.Anthropic.ExposeReasoningContent || req.Thinking != nil) && fullThoughts.Len() > 0 {
+	if (h.cfg.Anthropic.ExposeReasoningContent || req.Thinking != nil) && outcome.Thoughts != "" {
 		contentBlocks = append(contentBlocks, anthropic.ContentBlock{
 			Type:      "thinking",
-			Thinking:  fullThoughts.String(),
-			Signature: anthropic.GenerateThinkingSignature(fullThoughts.String()),
+			Thinking:  outcome.Thoughts,
+			Signature: anthropic.GenerateThinkingSignature(outcome.Thoughts),
 		})
 	}
-
-	// Append text content if present
-	if cleanContent != "" {
-		contentBlocks = append(contentBlocks, anthropic.ContentBlock{
-			Type: "text",
-			Text: cleanContent,
-		})
+	if outcome.Text != "" {
+		contentBlocks = append(contentBlocks, anthropic.ContentBlock{Type: "text", Text: outcome.Text})
 	}
+	contentBlocks = append(contentBlocks, assembleAnthropicTools(outcome)...)
 
-	var finalToolBlocks []anthropic.ContentBlock
-	if len(interceptedToolBlocks) > 0 {
-		finalToolBlocks = interceptedToolBlocks
-	} else if hasTools {
-		finalToolBlocks = toolBlocks
-	}
-
-	// Append tool calls
-	if len(finalToolBlocks) > 0 {
-		contentBlocks = append(contentBlocks, finalToolBlocks...)
-	}
-
-	// Guard against empty content blocks (e.g. only thinking block produced, no tools, no text)
 	hasRealContent := false
-	for _, b := range contentBlocks {
-		if b.Type == "text" || b.Type == "tool_use" {
+	for _, block := range contentBlocks {
+		if block.Type == "text" || block.Type == "tool_use" {
 			hasRealContent = true
 			break
 		}
@@ -535,27 +275,27 @@ func (h *AnthropicHandlers) handleSync(
 	}
 
 	stopReason := "end_turn"
-	if len(finalToolBlocks) > 0 {
+	var stopSequence *string
+	if len(outcome.Tools) > 0 {
 		stopReason = "tool_use"
+	} else if outcome.StopMatched {
+		stopReason = "stop_sequence"
+		if seq := outcome.MatchedSequence; seq != "" {
+			stopSequence = &seq
+		}
+	} else if _, anthropicStop := MapStopReason(outcome.StopReason); anthropicStop != "" {
+		stopReason = anthropicStop
 	}
-
-	promptTokens := anthropic.CountTokens(promptBlocks[0].Text)
-	if actual := actualPromptTokens.Load(); actual > 0 {
-		promptTokens = int(actual)
-	}
-	outputTokens := anthropic.CountTokens(cleanContent) + anthropic.CountTokens(fullThoughts.String())
 
 	resp := anthropic.MessageResponse{
-		ID:         completionID,
-		Type:       "message",
-		Role:       "assistant",
-		Content:    contentBlocks,
-		Model:      req.Model,
-		StopReason: &stopReason,
-		Usage: anthropic.Usage{
-			InputTokens:  promptTokens,
-			OutputTokens: outputTokens,
-		},
+		ID:           completionID,
+		Type:         "message",
+		Role:         "assistant",
+		Content:      contentBlocks,
+		Model:        req.Model,
+		StopReason:   &stopReason,
+		StopSequence: stopSequence,
+		Usage:        buildAnthropicUsage(outcome, promptBlocks),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -581,34 +321,12 @@ func (h *AnthropicHandlers) handleStreaming(
 		return
 	}
 
-	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
-
-	streamParser := anthropic.NewStreamParser(delimiter)
-	var firstTokenSent atomic.Bool
-	var blockIndex int
-	var streamMu sync.Mutex
-
-	var thinkingStarted bool
-	var thinkingIndex int
-	var textStarted bool
-	var textIndex int
-
-	var totalText strings.Builder
-	var totalThoughts strings.Builder
-
-	promptTokens := anthropic.CountTokens(promptBlocks[0].Text)
-
-	// Keepalive ticker
 	keepaliveInterval := h.cfg.Server.SSEKeepaliveInterval
 	if keepaliveInterval <= 0 {
 		keepaliveInterval = 15 * time.Second
 	}
 	keepaliveTicker := time.NewTicker(keepaliveInterval)
 	defer keepaliveTicker.Stop()
-
 	go func() {
 		for {
 			select {
@@ -620,528 +338,342 @@ func (h *AnthropicHandlers) handleStreaming(
 		}
 	}()
 
-	ttftDuration := h.cfg.Pool.FirstTokenTimeout
-	if ttftDuration <= 0 {
-		ttftDuration = 120 * time.Second
+	// One writer for the whole turn: Anthropic requires strictly ordered events, so every emission
+	// takes streamMu and block indices are allocated inside it.
+	var streamMu sync.Mutex
+	blockIndex := 0
+	textIndex := -1
+	thinkingIndex := -1
+	messageStarted := false
+	promptTokens := estimateAnthropicPromptTokens(promptBlocks)
+
+	startMessage := func() {
+		if messageStarted {
+			return
+		}
+		messageStarted = true
+		_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
 	}
-	var ttftTimedOut atomic.Bool
+	closeThinking := func() {
+		if thinkingIndex < 0 {
+			return
+		}
+		sig := anthropic.GenerateThinkingSignature("")
+		_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{Type: "signature_delta", Signature: sig})
+		_ = sseWriter.WriteContentBlockStop(thinkingIndex)
+		thinkingIndex = -1
+	}
+	closeText := func() {
+		if textIndex < 0 {
+			return
+		}
+		_ = sseWriter.WriteContentBlockStop(textIndex)
+		textIndex = -1
+	}
+
+	in := turnInput{
+		Ctx:           r.Context(),
+		ModelEntry:    modelEntry,
+		ThoughtLevel:  thoughtLevel,
+		SystemPrompt:  systemPrompt,
+		PromptBlocks:  promptBlocks,
+		StopSequences: req.StopSequences,
+	}
+
+	if len(req.Tools) > 0 {
+		anthropicTools, toolNames := convertAnthropicTools(req.Tools)
+		loopbackSessionID := newLoopbackSessionID()
+		state, regErr := h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
+		if regErr != nil {
+			h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", regErr.Error())
+			return
+		}
+		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+		in.LoopbackSessionID = loopbackSessionID
+		in.LoopbackToken = state.Token
+		in.LoopbackState = state
+		in.ClientToolNames = toolNames
+	}
+
+	// Streaming text-tool-call recovery: some models emit `<tool_call>…</tool_call>` inside the text
+	// stream instead of native ACP tool_call updates. Parse incrementally so the tool_use block is
+	// emitted at the same point the model produced it, not only at end of turn.
+	streamDelimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
+	if streamDelimiter == "" {
+		streamDelimiter = "tool_call"
+	}
+	streamTextParser := anthropic.NewStreamParser(streamDelimiter)
+	in.StreamTextToolCalls = func(chunk string) (string, []toolCollectorEntry) {
+		textDelta, blocks := streamTextParser.ParseChunk(chunk)
+		if len(blocks) == 0 {
+			return textDelta, nil
+		}
+		out := make([]toolCollectorEntry, 0, len(blocks))
+		for _, b := range blocks {
+			if b.Type != "tool_use" || b.Name == "" {
+				continue
+			}
+			args := json.RawMessage(b.Input)
+			if len(args) == 0 || string(args) == "null" {
+				args = json.RawMessage("{}")
+			}
+			out = append(out, toolCollectorEntry{ID: b.ID, Name: b.Name, Arguments: args})
+		}
+		return textDelta, out
+	}
+
+	in.OnFirstToken = func() {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		startMessage()
+	}
+	in.OnThought = func(chunk string) {
+		if !h.cfg.Anthropic.ExposeReasoningContent && req.Thinking == nil {
+			return
+		}
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		startMessage()
+		if thinkingIndex < 0 {
+			thinkingIndex = blockIndex
+			blockIndex++
+			_ = sseWriter.WriteContentBlockStart(thinkingIndex, anthropic.ContentBlock{
+				Type:     "thinking",
+				Thinking: "",
+			})
+		}
+		_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
+			Type:     "thinking_delta",
+			Thinking: chunk,
+		})
+	}
+	in.OnText = func(chunk string) {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		startMessage()
+		closeThinking()
+		if textIndex < 0 {
+			textIndex = blockIndex
+			blockIndex++
+			_ = sseWriter.WriteContentBlockStart(textIndex, anthropic.ContentBlock{Type: "text", Text: ""})
+		}
+		_ = sseWriter.WriteContentBlockDelta(textIndex, anthropic.ContentBlockDelta{
+			Type: "text_delta",
+			Text: chunk,
+		})
+	}
+	in.OnInternalToolProgress = func(text string) {
+		if !h.cfg.Anthropic.ExposeReasoningContent {
+			return
+		}
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		startMessage()
+		_ = sseWriter.WriteContentBlockStart(blockIndex, anthropic.ContentBlock{Type: "text", Text: ""})
+		_ = sseWriter.WriteContentBlockDelta(blockIndex, anthropic.ContentBlockDelta{Type: "text_delta", Text: text})
+		_ = sseWriter.WriteContentBlockStop(blockIndex)
+		blockIndex++
+	}
+	in.OnTool = func(entry toolCollectorEntry) {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		startMessage()
+		closeThinking()
+		closeText()
+
+		idx := blockIndex
+		blockIndex++
+		args := string(entry.Arguments)
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		_ = sseWriter.WriteContentBlockStart(idx, anthropic.ContentBlock{
+			Type:  "tool_use",
+			ID:    entry.ID,
+			Name:  entry.Name,
+			Input: json.RawMessage("{}"),
+		})
+		_ = sseWriter.WriteContentBlockDelta(idx, anthropic.ContentBlockDelta{
+			Type:        "input_json_delta",
+			PartialJSON: args,
+		})
+		_ = sseWriter.WriteContentBlockStop(idx)
+	}
 
 	maxRetries := h.cfg.Execution.MaxRetries
 	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
-	var hasToolCalls bool
-	var actualPromptTokens atomic.Int64
-	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+	messageStartedPtr := func() bool {
 		streamMu.Lock()
-		totalText.Reset()
-		totalThoughts.Reset()
-		streamParser = anthropic.NewStreamParser(delimiter)
-		thinkingStarted = false
-		textStarted = false
-		hasToolCalls = false
-		blockIndex = 0
-		streamMu.Unlock()
+		defer streamMu.Unlock()
+		return messageStarted
+	}
 
-		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
-		defer cancelSess()
-
-		newParams := acp.SessionNewParams{
-			CWD: worker.Cwd,
+	var outcome turnResult
+	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
+		outcome = res
+		if attemptErr != nil {
+			if messageStartedPtr() {
+				return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, attemptErr)
+			}
+			return attemptErr
 		}
-		var loopbackSessionID string
-		var loopbackState *mcp.SessionState
-		if len(req.Tools) > 0 {
-			var anthropicTools []mcp.AnthropicToolDefinition
-			for _, t := range req.Tools {
-				anthropicTools = append(anthropicTools, mcp.AnthropicToolDefinition{
-					Name:        t.Name,
-					Description: t.Description,
-					InputSchema: t.InputSchema,
-				})
-			}
-			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-			loopbackState = h.loopbackServer.RegisterAnthropicSession(loopbackSessionID, anthropicTools)
-			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-
-			execPath, err := os.Executable()
-			if err != nil || execPath == "" {
-				execPath = "agy-gateway"
-			}
-			newParams.MCPServers = []acp.MCPServerInfo{
-				{
-					Name:    "client-tools",
-					Command: execPath,
-					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
-				},
-			}
-		}
-		effectiveSystemPrompt := systemPrompt
-		if effectiveSystemPrompt == "" {
-			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-		}
-		systemPromptMode := "override"
-		newParams.SystemPrompt = &acp.SystemPrompt{
-			Mode: systemPromptMode,
-			Content: []acp.PromptBlock{
-				{
-					Type: "text",
-					Text: effectiveSystemPrompt,
-				},
-			},
-		}
-		newParams.Meta = map[string]any{
-			"antigravity": map[string]any{
-				"systemPrompt": map[string]any{
-					systemPromptMode: effectiveSystemPrompt,
-				},
-			},
-		}
-		var newResult acp.SessionNewResult
-		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
-			var respErr *acp.ResponseError
-			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
-				time.Sleep(1 * time.Second)
-				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
-			}
-			if err != nil {
-				return err
-			}
-		}
-
-		defer func() {
-			if newResult.SessionID != "" {
-				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancelClose()
-				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
-					SessionID: newResult.SessionID,
-				}, nil)
-			}
-		}()
-
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDMode,
-			Value:     h.cfg.Execution.AcpSessionMode,
-		}, nil)
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDModel,
-			Value:     modelEntry.UpstreamModel,
-		}, nil)
-		if thoughtLevel != "" {
-			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-				SessionID: newResult.SessionID,
-				ConfigID:  acp.ConfigIDThoughtLevel,
-				Value:     thoughtLevel,
-			}, nil)
-		}
-
-		var ttftDisarmed atomic.Bool
-		ttftTimer := time.NewTimer(ttftDuration)
-		defer ttftTimer.Stop()
-
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
-		go func() {
-			select {
-			case <-promptCtx.Done():
-			case <-ttftTimer.C:
-				if !ttftDisarmed.Load() {
-					ttftTimedOut.Store(true)
-					h.logger.Warn("streaming time-to-first-token watchdog triggered", "timeout", ttftDuration)
-					cancelPrompt()
-				}
-			}
-		}()
-
-		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
-			if !ttftDisarmed.Load() {
-				ttftDisarmed.Store(true)
-				ttftTimer.Stop()
-			}
-
-			streamMu.Lock()
-			defer streamMu.Unlock()
-
-			// 1. Handle Thinking Chunk
-			if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
-				thoughtChunk := update.Update.Content.Text
-				totalThoughts.WriteString(thoughtChunk)
-
-				if !firstTokenSent.Load() {
-					firstTokenSent.Store(true)
-					_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
-				}
-
-				if !thinkingStarted {
-					thinkingStarted = true
-					thinkingIndex = blockIndex
-					blockIndex++
-					_ = sseWriter.WriteContentBlockStart(thinkingIndex, anthropic.ContentBlock{
-						Type:     "thinking",
-						Thinking: "",
-					})
-				}
-
-				_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
-					Type:     "thinking_delta",
-					Thinking: thoughtChunk,
-				})
-				return
-			}
-
-			// 2. Handle Message Text Chunk
-			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				if streamParser.IsTerminated() {
-					cancelPrompt()
-					return
-				}
-				textChunk := update.Update.Content.Text
-
-				// If thinking was active, close it out before emitting text
-				if thinkingStarted {
-					sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
-					_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
-						Type:      "signature_delta",
-						Signature: sig,
-					})
-					_ = sseWriter.WriteContentBlockStop(thinkingIndex)
-					thinkingStarted = false
-				}
-
-				if !firstTokenSent.Load() {
-					firstTokenSent.Store(true)
-					_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
-				}
-
-				textDelta, toolCalls := streamParser.ParseChunk(textChunk)
-				if streamParser.IsTerminated() {
-					h.logger.Debug("anthropic stream turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
-					cancelPrompt()
-				}
-				if textDelta != "" {
-					totalText.WriteString(textDelta)
-				}
-
-				if textDelta != "" {
-					if !textStarted {
-						textStarted = true
-						textIndex = blockIndex
-						blockIndex++
-						_ = sseWriter.WriteContentBlockStart(textIndex, anthropic.ContentBlock{
-							Type: "text",
-							Text: "",
-						})
-					}
-					_ = sseWriter.WriteContentBlockDelta(textIndex, anthropic.ContentBlockDelta{
-						Type: "text_delta",
-						Text: textDelta,
-					})
-				}
-
-				if len(toolCalls) > 0 {
-					// Close active text block if open
-					if textStarted {
-						_ = sseWriter.WriteContentBlockStop(textIndex)
-						textStarted = false
-					}
-
-					for _, tc := range toolCalls {
-						h.logger.Debug("anthropic stream tool call parsed", "workerId", worker.ID, "toolUseId", tc.ID, "name", tc.Name)
-						toolIdx := blockIndex
-						blockIndex++
-						startBlock := tc
-						startBlock.Input = json.RawMessage("{}")
-						_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
-						_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
-							Type:        "input_json_delta",
-							PartialJSON: string(tc.Input),
-						})
-						_ = sseWriter.WriteContentBlockStop(toolIdx)
-					}
-				}
-				return
-			}
-
-			if update.Update.SessionUpdate == acp.UpdateUsage {
-				if update.Update.Used != nil && *update.Update.Used > 0 {
-					actualPromptTokens.Store(*update.Update.Used)
-					promptTokens = int(*update.Update.Used)
-				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
-					actualPromptTokens.Store(update.Update.Usage.Used)
-					promptTokens = int(update.Update.Usage.Used)
-				}
-				return
-			}
-
-			if update.Update.SessionUpdate == acp.UpdateToolCall {
-				if loopbackState == nil {
-					h.logger.Warn("tool_call update ignored: loopbackState is nil", "name", update.Update.Name)
-					return
-				}
-				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
-				h.logger.Info("anthropic stream tool_call check", "rawName", update.Update.Name, "normalized", normalizedName, "matched", matched)
-				if !matched {
-					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
-					return
-				}
-				if hasToolCalls {
-					return
-				}
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-				callID := update.Update.ToolCallID
-				if callID == "" {
-					callID = fmt.Sprintf("toolu_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-				}
-				args := string(update.Update.RawInput)
-				if args == "" || args == "null" {
-					args = "{}"
-				}
-
-				hasToolCalls = true
-				if !firstTokenSent.Load() {
-					firstTokenSent.Store(true)
-					_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
-				}
-				if thinkingStarted {
-					sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
-					_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
-						Type:      "signature_delta",
-						Signature: sig,
-					})
-					_ = sseWriter.WriteContentBlockStop(thinkingIndex)
-					thinkingStarted = false
-				}
-				if textStarted {
-					_ = sseWriter.WriteContentBlockStop(textIndex)
-					textStarted = false
-				}
-
-				toolIdx := blockIndex
-				blockIndex++
-				startBlock := anthropic.ContentBlock{
-					Type:  "tool_use",
-					ID:    callID,
-					Name:  normalizedName,
-					Input: json.RawMessage("{}"),
-				}
-				_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
-				_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
-					Type:        "input_json_delta",
-					PartialJSON: args,
-				})
-				_ = sseWriter.WriteContentBlockStop(toolIdx)
-
-				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-					SessionID: newResult.SessionID,
-				})
-				time.AfterFunc(2500*time.Millisecond, func() {
-					cancelPrompt()
-				})
-				return
-			}
-
-			if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-			}
-		})
-		defer worker.Transport.SetUpdateListener(nil)
-
-		if loopbackState != nil {
-			go func() {
-				select {
-				case call, ok := <-loopbackState.Calls:
-					if !ok {
-						return
-					}
-					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
-					h.logger.Info("anthropic stream loopbackState.Calls received", "callName", call.Name, "normalized", normalizedName, "matched", matched)
-					if !matched {
-						return
-					}
-					streamMu.Lock()
-					if !hasToolCalls {
-						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-						hasToolCalls = true
-						if !firstTokenSent.Load() {
-							firstTokenSent.Store(true)
-							_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
-						}
-						if thinkingStarted {
-							sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
-							_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
-								Type:      "signature_delta",
-								Signature: sig,
-							})
-							_ = sseWriter.WriteContentBlockStop(thinkingIndex)
-							thinkingStarted = false
-						}
-						if textStarted {
-							_ = sseWriter.WriteContentBlockStop(textIndex)
-							textStarted = false
-						}
-
-						toolIdx := blockIndex
-						blockIndex++
-						startBlock := anthropic.ContentBlock{
-							Type:  "tool_use",
-							ID:    call.ID,
-							Name:  normalizedName,
-							Input: json.RawMessage("{}"),
-						}
-						_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
-						_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
-							Type:        "input_json_delta",
-							PartialJSON: string(call.Arguments),
-						})
-						_ = sseWriter.WriteContentBlockStop(toolIdx)
-
-						_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-							SessionID: newResult.SessionID,
-						})
-						time.AfterFunc(2500*time.Millisecond, func() {
-							cancelPrompt()
-						})
-					}
-					streamMu.Unlock()
-				case <-promptCtx.Done():
-					return
-				}
-			}()
-		}
-
-		var promptResult acp.PromptResult
-		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
-			SessionID: newResult.SessionID,
-			Prompt:    promptBlocks,
-		}, &promptResult); err != nil {
-			if (streamParser.IsTerminated() || hasToolCalls) && errors.Is(err, context.Canceled) {
-				// Turn was gracefully aborted via session/cancel or watchdog
-				err = nil
-			} else {
-				if firstTokenSent.Load() {
-					return pool.ErrNonRetryableStream
-				}
-				return err
-			}
-		}
-
-		if hasToolCalls {
-			h.logger.Debug("anthropic stream turn completed: tool call intercepted", "workerId", worker.ID)
-		} else if streamParser.IsTerminated() {
-			h.logger.Debug("anthropic stream turn completed: early stop sequence detected", "workerId", worker.ID)
-		}
-
-		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
-		flushDelta, flushTools := streamParser.Flush()
-		if flushDelta != "" {
-			if !textStarted {
-				textStarted = true
-				textIndex = blockIndex
-				blockIndex++
-				_ = sseWriter.WriteContentBlockStart(textIndex, anthropic.ContentBlock{
-					Type: "text",
-					Text: "",
-				})
-			}
-			_ = sseWriter.WriteContentBlockDelta(textIndex, anthropic.ContentBlockDelta{
-				Type: "text_delta",
-				Text: flushDelta,
-			})
-		}
-		if len(flushTools) > 0 {
-			if textStarted {
-				_ = sseWriter.WriteContentBlockStop(textIndex)
-				textStarted = false
-			}
-			for _, tc := range flushTools {
-				toolIdx := blockIndex
-				blockIndex++
-				startBlock := tc
-				startBlock.Input = json.RawMessage("{}")
-				_ = sseWriter.WriteContentBlockStart(toolIdx, startBlock)
-				_ = sseWriter.WriteContentBlockDelta(toolIdx, anthropic.ContentBlockDelta{
-					Type:        "input_json_delta",
-					PartialJSON: string(tc.Input),
-				})
-				_ = sseWriter.WriteContentBlockStop(toolIdx)
-			}
-		}
-
 		return nil
 	})
 
 	if err != nil {
-		if firstTokenSent.Load() {
-			_ = sseWriter.WriteError("api_error", "Streaming interrupted: "+err.Error())
+		if !messageStartedPtr() {
+			h.writeAnthropicTurnError(w, err)
 			return
 		}
-		if ttftTimedOut.Load() {
-			h.writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", fmt.Sprintf("Time to first token exceeded %s", ttftDuration))
-			return
-		}
-		h.writeAnthropicError(w, http.StatusInternalServerError, "api_error", "Inference error: "+err.Error())
+		// See the OpenAI branch: after message_start the only channel left is in-band, so the class
+		// is exposed and the full error is logged with the request id (FR-18).
+		kind := ClientErrorKind(err)
+		h.logger.Error("anthropic stream failed after message start",
+			"requestID", requestIDFromContext(r), "class", kind, "err", err)
+		_ = sseWriter.WriteError(kind, ClientErrorMessage(kind))
 		return
 	}
 
-	// Final stream closure
+	stopReason := "end_turn"
+	var stopSequence *string
+	if len(outcome.Tools) > 0 {
+		stopReason = "tool_use"
+	} else if outcome.StopMatched {
+		stopReason = "stop_sequence"
+		if seq := outcome.MatchedSequence; seq != "" {
+			stopSequence = &seq
+		}
+	} else if _, anthropicStop := MapStopReason(outcome.StopReason); anthropicStop != "" {
+		stopReason = anthropicStop
+	}
+
 	streamMu.Lock()
 	defer streamMu.Unlock()
 
-	if thinkingStarted {
-		sig := anthropic.GenerateThinkingSignature(totalThoughts.String())
-		_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
-			Type:      "signature_delta",
-			Signature: sig,
-		})
-		_ = sseWriter.WriteContentBlockStop(thinkingIndex)
-		thinkingStarted = false
-	}
-	if textStarted {
-		_ = sseWriter.WriteContentBlockStop(textIndex)
-		textStarted = false
-	}
-
-	stopReason := "end_turn"
-	if hasToolCalls {
-		stopReason = "tool_use"
-	}
-	_, toolBlocks, hasTools := anthropic.ParseCompleteResponse(totalText.String(), delimiter)
-	if hasTools || len(toolBlocks) > 0 {
-		stopReason = "tool_use"
-	}
-
-	// Guard against empty assistant response (e.g. only thinking block produced, no tools, no text)
-	if !hasToolCalls && !hasTools && len(toolBlocks) == 0 && totalText.Len() == 0 {
-		if !firstTokenSent.Load() {
-			firstTokenSent.Store(true)
-			_ = sseWriter.WriteMessageStart(completionID, req.Model, promptTokens)
-		}
-		fallbackText := "I have completed the analysis."
-		totalText.WriteString(fallbackText)
-		textIdx := blockIndex
+	startMessage()
+	if outcome.Text == "" && len(outcome.Tools) == 0 {
+		textIndex = blockIndex
 		blockIndex++
-		_ = sseWriter.WriteContentBlockStart(textIdx, anthropic.ContentBlock{
-			Type: "text",
-			Text: "",
-		})
-		_ = sseWriter.WriteContentBlockDelta(textIdx, anthropic.ContentBlockDelta{
+		_ = sseWriter.WriteContentBlockStart(textIndex, anthropic.ContentBlock{Type: "text", Text: ""})
+		_ = sseWriter.WriteContentBlockDelta(textIndex, anthropic.ContentBlockDelta{
 			Type: "text_delta",
-			Text: fallbackText,
+			Text: "I have completed the analysis.",
 		})
-		_ = sseWriter.WriteContentBlockStop(textIdx)
+		_ = sseWriter.WriteContentBlockStop(textIndex)
+		textIndex = -1
 	}
+	closeThinking()
+	closeText()
 
-	outputTokens := anthropic.CountTokens(totalText.String()) + anthropic.CountTokens(totalThoughts.String())
-
-	_ = sseWriter.WriteMessageDelta(stopReason, nil, outputTokens)
+	usage := buildAnthropicUsage(outcome, promptBlocks)
+	_ = sseWriter.WriteMessageDelta(stopReason, stopSequence, usage.OutputTokens)
 	_ = sseWriter.WriteMessageStop()
 }
 
-// writeAnthropicError renders an Anthropic RFC-compliant JSON error.
+// assembleAnthropicTools renders collected tool calls as Anthropic tool_use blocks.
+//
+// @purpose Single conversion point from sanitised collector entries to provider payloads.
+// @param outcome Executor result.
+// @returns tool_use blocks in first-seen order, or nil.
+// @invariants Pure.
+func assembleAnthropicTools(outcome turnResult) []anthropic.ContentBlock {
+	if len(outcome.Tools) == 0 {
+		return nil
+	}
+	blocks := make([]anthropic.ContentBlock, 0, len(outcome.Tools))
+	for _, entry := range outcome.Tools {
+		args := string(entry.Arguments)
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		blocks = append(blocks, anthropic.ContentBlock{
+			Type:  "tool_use",
+			ID:    entry.ID,
+			Name:  entry.Name,
+			Input: json.RawMessage(args),
+		})
+	}
+	return blocks
+}
+
+// buildAnthropicUsage renders usage from the authoritative agent counters.
+//
+// @purpose Reports cache and reasoning counters the previous implementation dropped.
+// @param outcome Executor result.
+// @param promptBlocks Prompt blocks used for the fallback estimate.
+// @returns Anthropic usage with exact field names.
+// @invariants Pure.
+func buildAnthropicUsage(outcome turnResult, promptBlocks []acp.PromptBlock) anthropic.Usage {
+	if outcome.UsageFromAgent {
+		return anthropic.Usage{
+			InputTokens:              int(outcome.Usage.InputTokens),
+			OutputTokens:             int(outcome.Usage.OutputTokens),
+			CacheReadInputTokens:     int(outcome.Usage.CachedReadTokens),
+			CacheCreationInputTokens: int(outcome.Usage.CachedWriteTokens),
+		}
+	}
+	return anthropic.Usage{
+		InputTokens:  estimateAnthropicPromptTokens(promptBlocks),
+		OutputTokens: anthropic.CountTokens(outcome.Text) + anthropic.CountTokens(outcome.Thoughts),
+	}
+}
+
+// estimateAnthropicPromptTokens sums prompt tokens without indexing an empty slice.
+//
+// @purpose Removes the unchecked `promptBlocks[0]` index expressions.
+// @param blocks Prompt blocks sent upstream.
+// @returns Token estimate, zero when no blocks exist.
+// @invariants Pure; nil-safe.
+func estimateAnthropicPromptTokens(blocks []acp.PromptBlock) int {
+	total := 0
+	for _, block := range blocks {
+		total += anthropic.CountTokens(block.Text)
+	}
+	return total
+}
+
+// writeAnthropicTurnError maps an executor error onto the Anthropic error surface.
+//
+// @purpose Single error-mapping point implementing the FR-18 table for this protocol.
+// @param w Response writer.
+// @param err Executor error.
+// @invariants Writes exactly one response.
+func (h *AnthropicHandlers) writeAnthropicTurnError(w http.ResponseWriter, err error) {
+	if field, ok := IsUnsupportedParam(err); ok {
+		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "parameter "+field+" is not supported upstream")
+		return
+	}
+	if errors.Is(err, ErrFirstTokenTimeout) {
+		h.writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", "time to first token exceeded")
+		return
+	}
+	if errors.Is(err, pool.ErrQueueSaturated) {
+		h.writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "all workers are busy; retry shortly")
+		return
+	}
+	var respErr *acp.ResponseError
+	if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
+		strings.Contains(err.Error(), "Authentication required") ||
+		strings.Contains(err.Error(), "transport is closed") {
+		h.writeAnthropicError(w, http.StatusServiceUnavailable, "authentication_error", "No authenticated Antigravity accounts available")
+		return
+	}
+	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeInvalidParams {
+		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "upstream rejected the request: "+respErr.Message)
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		h.writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", "inference turn was cancelled")
+		return
+	}
+	h.logger.Error("anthropic turn failed", "err", err)
+	h.writeAnthropicError(w, http.StatusInternalServerError, "api_error", "Inference error")
+}
+
 func (h *AnthropicHandlers) writeAnthropicError(w http.ResponseWriter, statusCode int, errType, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("anthropic-version", "2023-06-01")

@@ -3,10 +3,12 @@
 package mcp
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +22,12 @@ import (
 var (
 	ErrSessionNotFound = errors.New("mcp session not registered or expired")
 	ErrMethodNotFound  = errors.New("mcp method not supported")
+	// ErrTooManyTools is returned when a request declares more tools than the configured ceiling.
+	// Failing loudly is required: silently truncating the list would make the model call tools that
+	// the client never advertised.
+	ErrTooManyTools = errors.New("too many client tools declared")
+	// ErrUnauthorized is returned when the loopback bearer token does not match the session token.
+	ErrUnauthorized = errors.New("mcp session token invalid")
 )
 
 // MCPToolDefinition represents an official Model Context Protocol tool schema.
@@ -38,7 +46,10 @@ type InterceptedToolCall struct {
 
 // SessionState encapsulates registered tools and intercepted calls for an active session.
 type SessionState struct {
-	SessionID  string
+	SessionID string
+	// Token is the per-session bearer credential the stdio bridge must present. Session ids appear
+	// in process arguments, so they cannot double as a secret.
+	Token      string
 	Tools      []MCPToolDefinition
 	Calls      chan InterceptedToolCall
 	CreatedAt  time.Time
@@ -46,6 +57,24 @@ type SessionState struct {
 	mu         sync.Mutex
 	closeOnce  sync.Once
 	closed     bool
+}
+
+// ToolDefinitionSnapshot returns a copy of the declared tool schemas.
+//
+// @purpose Lets the turn layer sanitize tool arguments against the caller's declared schemas.
+// @rationale Arguments must be validated against the schema the client supplied, not a heuristic.
+// @preconditions None.
+// @returns A copy of the tool definitions; empty when none were declared.
+// @invariants Mutex-protected; the returned slice is independent of session state.
+func (s *SessionState) ToolDefinitionSnapshot() []MCPToolDefinition {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]MCPToolDefinition, len(s.Tools))
+	copy(out, s.Tools)
+	return out
 }
 
 // Close gracefully terminates the session state channel and prevents further mutations.
@@ -63,6 +92,7 @@ func (s *SessionState) Close() {
 type LoopbackServer struct {
 	mu       sync.RWMutex
 	sessions map[string]*SessionState
+	maxTools int
 }
 
 // NewLoopbackServer creates an initialized in-memory Loopback MCP Server.
@@ -71,10 +101,31 @@ type LoopbackServer struct {
 // @rationale By presenting an official MCP server interface to agy acp, the model invokes tools natively
 // through Google's internal function calling engine rather than generating raw XML tags in text streams.
 // @invariants Thread-safe, non-blocking registration, automatic lifecycle cleanup.
-func NewLoopbackServer() *LoopbackServer {
+func NewLoopbackServer(maxTools ...int) *LoopbackServer {
+	limit := DefaultMaxClientTools
+	if len(maxTools) > 0 && maxTools[0] > 0 {
+		limit = maxTools[0]
+	}
 	return &LoopbackServer{
 		sessions: make(map[string]*SessionState),
+		maxTools: limit,
 	}
+}
+
+// DefaultMaxClientTools is the fallback ceiling when the caller supplies none.
+const DefaultMaxClientTools = 128
+
+// newSessionToken mints a full-entropy bearer token for one loopback session.
+//
+// @purpose Gives the stdio bridge a credential that is not derivable from the session id.
+// @rationale Session ids are passed on the child process command line and therefore appear in `ps`;
+// a short suffix of the same UUID would be guessable enough to matter.
+// @preconditions None.
+// @returns A 32-hex-character random token.
+// @throws None; falls back to a random UUID string.
+// @invariants O(1), cryptographically random, never logged.
+func newSessionToken() string {
+	return strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 // RegisterSession registers an array of OpenAI tools under a unique session ID.
@@ -85,39 +136,23 @@ func NewLoopbackServer() *LoopbackServer {
 // @param tools Array of OpenAI tool definitions from the consumer request.
 // @returns Initialized SessionState with an active InterceptedToolCall channel.
 // @invariants Thread-safe, idempotent overwrite if session ID exists.
-func (s *LoopbackServer) RegisterSession(sessionID string, tools []OpenAIToolDefinition) *SessionState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var mcpTools []MCPToolDefinition
+func (s *LoopbackServer) RegisterSession(sessionID string, tools []OpenAIToolDefinition) (*SessionState, error) {
+	defs := make([]MCPToolDefinition, 0, len(tools))
 	for _, t := range tools {
 		if t.Type != "function" || t.Function.Name == "" {
 			continue
 		}
-		schema := t.Function.Parameters
-		if len(schema) == 0 || string(schema) == "null" {
-			schema = json.RawMessage(`{"type":"object","properties":{}}`)
-		}
-		mcpTools = append(mcpTools, MCPToolDefinition{
+		defs = append(defs, MCPToolDefinition{
 			Name:        t.Function.Name,
 			Description: t.Function.Description,
-			InputSchema: schema,
+			InputSchema: normalizeToolSchema(t.Function.Parameters),
 		})
 	}
-
-	state := &SessionState{
-		SessionID:  sessionID,
-		Tools:      mcpTools,
-		Calls:      make(chan InterceptedToolCall, 32),
-		CreatedAt:  time.Now(),
-		LastActive: time.Now(),
+	state, err := s.register(sessionID, defs)
+	if err != nil {
+		return nil, err
 	}
-
-	if existing, exists := s.sessions[sessionID]; exists {
-		existing.Close()
-	}
-	s.sessions[sessionID] = state
-	return state
+	return state, nil
 }
 
 // AnthropicToolDefinition mirrors an Anthropic tool schema for protocol translation.
@@ -135,39 +170,69 @@ type AnthropicToolDefinition struct {
 // @param tools Array of Anthropic tool definitions from the consumer request.
 // @returns Initialized SessionState with an active InterceptedToolCall channel.
 // @invariants Thread-safe, idempotent overwrite if session ID exists.
-func (s *LoopbackServer) RegisterAnthropicSession(sessionID string, tools []AnthropicToolDefinition) *SessionState {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var mcpTools []MCPToolDefinition
+func (s *LoopbackServer) RegisterAnthropicSession(sessionID string, tools []AnthropicToolDefinition) (*SessionState, error) {
+	defs := make([]MCPToolDefinition, 0, len(tools))
 	for _, t := range tools {
 		if t.Name == "" {
 			continue
 		}
-		schema := t.InputSchema
-		if len(schema) == 0 || string(schema) == "null" {
-			schema = json.RawMessage(`{"type":"object","properties":{}}`)
-		}
-		mcpTools = append(mcpTools, MCPToolDefinition{
+		defs = append(defs, MCPToolDefinition{
 			Name:        t.Name,
 			Description: t.Description,
-			InputSchema: schema,
+			InputSchema: normalizeToolSchema(t.InputSchema),
 		})
+	}
+	return s.register(sessionID, defs)
+}
+
+// normalizeToolSchema substitutes an empty object schema when a caller omits parameters.
+//
+// @purpose Guarantees every declared tool carries a usable JSON Schema for MCP clients.
+// @rationale agy validates tool arguments against this schema; a null schema makes the tool
+// uncallable and the failure surfaces as an opaque -32602.
+// @preconditions None.
+// @param raw The caller-supplied schema, possibly nil or literal null.
+// @returns A non-empty JSON Schema object.
+// @throws None.
+// @invariants O(1).
+func normalizeToolSchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+	return raw
+}
+
+// register stores a session state under the enforced tool ceiling.
+//
+// @purpose Single registration path so both protocol adapters share the limit and token rules.
+// @rationale Duplicated logic previously allowed the ceilings to drift between OpenAI and Anthropic.
+// @preconditions defs already normalised.
+// @param sessionID Unique loopback session id.
+// @param defs Canonical MCP tool definitions.
+// @returns The stored session state, or ErrTooManyTools.
+// @throws None; the ceiling breach is returned as a value.
+// @invariants O(n) in tool count; atomic under s.mu.
+func (s *LoopbackServer) register(sessionID string, defs []MCPToolDefinition) (*SessionState, error) {
+	if len(defs) > s.maxTools {
+		return nil, fmt.Errorf("%w: %d declared, limit %d", ErrTooManyTools, len(defs), s.maxTools)
 	}
 
 	state := &SessionState{
 		SessionID:  sessionID,
-		Tools:      mcpTools,
+		Token:      newSessionToken(),
+		Tools:      defs,
 		Calls:      make(chan InterceptedToolCall, 32),
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if existing, exists := s.sessions[sessionID]; exists {
 		existing.Close()
 	}
 	s.sessions[sessionID] = state
-	return state
+	return state, nil
 }
 
 // GetSession retrieves the session state associated with a session ID.
@@ -191,6 +256,28 @@ func (s *LoopbackServer) UnregisterSession(sessionID string) {
 	}
 }
 
+// ValidateToken constant-time-compares a presented bearer token with the session token.
+//
+// @purpose Authenticates the stdio bridge before any MCP method is dispatched.
+// @rationale The bridge runs as a child of agy and reaches the gateway over loopback HTTP; without a
+// credential any local process could invoke tools/call against a live session.
+// @preconditions The session must be registered.
+// @param sessionID Session whose token to compare against.
+// @param presented Caller-supplied token; may be empty.
+// @returns nil when the token matches, ErrUnauthorized otherwise.
+// @throws None.
+// @invariants O(len(token)) constant-time; no early exit on mismatch.
+func (s *LoopbackServer) ValidateToken(sessionID, presented string) error {
+	state, err := s.GetSession(sessionID)
+	if err != nil {
+		return ErrUnauthorized
+	}
+	if presented == "" || subtle.ConstantTimeCompare([]byte(state.Token), []byte(presented)) != 1 {
+		return ErrUnauthorized
+	}
+	return nil
+}
+
 // jsonrpcRequest represents an incoming JSON-RPC 2.0 message.
 type jsonrpcRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -201,10 +288,10 @@ type jsonrpcRequest struct {
 
 // jsonrpcResponse represents an outgoing JSON-RPC 2.0 message.
 type jsonrpcResponse struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      any             `json:"id"`
-	Result  any             `json:"result,omitempty"`
-	Error   *jsonrpcError   `json:"error,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	ID      any           `json:"id"`
+	Result  any           `json:"result,omitempty"`
+	Error   *jsonrpcError `json:"error,omitempty"`
 }
 
 type jsonrpcError struct {
@@ -231,8 +318,14 @@ func (s *LoopbackServer) HandleJSONRPC(sessionID string, reqBytes []byte) ([]byt
 		return json.Marshal(resp)
 	}
 
+	// JSON-RPC 2.0 notifications (no id, or notifications/*) MUST NEVER produce a response,
+	// even when a session has already been unregistered during teardown.
+	if req.ID == nil || strings.HasPrefix(req.Method, "notifications/") {
+		return nil, nil
+	}
+
 	state, err := s.GetSession(sessionID)
-	if err != nil && req.Method != "initialize" && req.Method != "ping" {
+	if err != nil && req.Method != "initialize" && req.Method != "ping" && req.Method != "resources/list" && req.Method != "prompts/list" {
 		resp := jsonrpcResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
@@ -265,6 +358,12 @@ func (s *LoopbackServer) HandleJSONRPC(sessionID string, reqBytes []byte) ([]byt
 	case "ping":
 		result = map[string]any{}
 
+	case "resources/list":
+		result = map[string]any{"resources": []any{}}
+
+	case "prompts/list":
+		result = map[string]any{"prompts": []any{}}
+
 	case "tools/list":
 		toolsList := []MCPToolDefinition{}
 		if state != nil {
@@ -273,6 +372,7 @@ func (s *LoopbackServer) HandleJSONRPC(sessionID string, reqBytes []byte) ([]byt
 			state.LastActive = time.Now()
 			state.mu.Unlock()
 		}
+		slog.Debug("loopback tools/list served", "sessionID", sessionID, "toolCount", len(toolsList))
 		result = map[string]any{
 			"tools": toolsList,
 		}
@@ -353,6 +453,17 @@ func (s *LoopbackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := pathParts[2]
 
+	// Constant-time bearer check: the session token is minted at registration and injected into the
+	// bridge process environment, so an unauthenticated caller cannot enumerate or hijack sessions.
+	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if err := s.ValidateToken(sessionID, presented); err != nil {
+		slog.Warn("loopback mcp request rejected", "sessionID", sessionID, "presentedLen", len(presented), "err", err)
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"invalid or missing session token","type":"authentication_error"}}`))
+		return
+	}
+	slog.Debug("loopback mcp request accepted", "sessionID", sessionID)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
@@ -404,4 +515,3 @@ func (s *SessionState) MatchAndNormalizeToolName(rawName string) (string, bool) 
 	}
 	return "", false
 }
-

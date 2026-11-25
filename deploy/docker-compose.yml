@@ -7,7 +7,7 @@ services:
     container_name: agy-gateway
     restart: unless-stopped
     stop_signal: SIGTERM
-    stop_grace_period: 30s
+    stop_grace_period: 140s
     ports:
       - "${AGY_GW_HOST_PORT:-${PORT:-8080}}:${AGY_GW_PORT:-${PORT:-8080}}"
     env_file:
@@ -22,6 +22,7 @@ services:
       - AGY_GW_LOG_FORMAT=${AGY_GW_LOG_FORMAT:-json}
       - AGY_GW_DEFAULT_MODEL=${AGY_GW_DEFAULT_MODEL:-gemini-3.8-flash}
       - AGY_GW_DEFAULT_REASONING_EFFORT=${AGY_GW_DEFAULT_REASONING_EFFORT:-medium}
+      - AGY_GW_STRICT_CLIENT_TOOL_DELEGATION=${AGY_GW_STRICT_CLIENT_TOOL_DELEGATION:-true}
       - AGY_AUTH_NO_UPDATE_CHECK=1
       # Outbound Proxy Configuration (Optional - Docker layer & container egress)
       - HTTP_PROXY=${HTTP_PROXY:-}

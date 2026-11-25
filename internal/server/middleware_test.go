@@ -93,8 +93,13 @@ func TestMiddleware_Recovery(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "Internal gateway panic") {
-		t.Errorf("expected JSON body to contain 'Internal gateway panic', got %s", body)
+	// FR-18: the panic value is operator data. The body must be a constant so no internal path,
+	// model id or stack fragment can reach the client (CWE-209).
+	if strings.Contains(body, "pointer fault simulation") {
+		t.Errorf("recovery body leaked the panic value: %s", body)
+	}
+	if !strings.Contains(body, "internal server error") {
+		t.Errorf("expected the constant message, got %s", body)
 	}
 }
 

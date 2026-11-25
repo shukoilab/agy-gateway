@@ -483,7 +483,7 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 		default:
 			upstreamModel = modelID
 			presetEffort = ""
-			supportedEfforts = []string{"low", "medium", "high", "extra"}
+			supportedEfforts = []string{"low", "medium", "high", "xhigh"}
 		}
 
 		ownedBy := "google"
@@ -555,7 +555,7 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 				OwnedBy:          ownedBy,
 				Created:          1740000000,
 				RequiresPaidTier: strings.Contains(baseID, "opus"),
-				SupportedEfforts: []string{"low", "medium", "high", "extra"},
+				SupportedEfforts: []string{"low", "medium", "high", "xhigh"},
 				AccountIDs:       []string{},
 				ContextWindow:    baseContextWindow,
 				MaxOutputTokens:  baseMaxOutputTokens,

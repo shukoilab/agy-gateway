@@ -63,6 +63,9 @@ func TestWorker_CleanWorkspacePurgesConversationsAndBrain(t *testing.T) {
 		Execution: config.ExecutionConfig{
 			CleanWorkspaceBetweenRequests: true,
 		},
+		Storage: config.StorageConfig{
+			WorkspacesRootDir: tempBase,
+		},
 	}
 
 	worker := NewWorker(1, workerHome, workerTmp, workerCwd, nil, cfg, nil)

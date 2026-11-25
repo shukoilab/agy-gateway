@@ -3,6 +3,7 @@ package acp
 import (
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -48,6 +49,171 @@ func TestTransport_YOLOAutoApprovalPriority(t *testing.T) {
 	if result.Outcome.OptionID != "always_opt" {
 		t.Fatalf("expected always_opt to be selected, got %q", result.Outcome.OptionID)
 	}
+}
+
+// TestTransport_PermissionSelectionMatrix covers every documented PermissionOptionKind combination,
+// including the reject_* kinds that the old substring-based logic could accidentally select.
+func TestTransport_PermissionSelectionMatrix(t *testing.T) {
+	cases := []struct {
+		name     string
+		options  []PermissionOption
+		wantKind string // "" means expect cancelled
+	}{
+		{
+			name:     "reject_only_cancels",
+			options:  []PermissionOption{{OptionID: "allow-ish", Kind: "reject_once"}, {OptionID: "nope", Kind: "reject_always"}},
+			wantKind: "",
+		},
+		{
+			name:     "allow_once_beats_unknown_allow_prefix",
+			options:  []PermissionOption{{OptionID: "allow_custom", Kind: "allow_special"}, {OptionID: "a", Kind: "allow_once"}},
+			wantKind: "allow_once",
+		},
+		{
+			name:     "allow_always_wins",
+			options:  []PermissionOption{{OptionID: "a", Kind: "allow_once"}, {OptionID: "b", Kind: "allow_always"}},
+			wantKind: "allow_always",
+		},
+		{
+			name:     "unknown_allow_kind_selected",
+			options:  []PermissionOption{{OptionID: "custom", Kind: "allow_forever"}},
+			wantKind: "allow_forever",
+		},
+		{
+			name:     "empty_options_cancels",
+			options:  nil,
+			wantKind: "",
+		},
+		{
+			// The old implementation selected options[0] blindly; a `deny` option could be chosen.
+			name:     "deny_first_is_never_selected",
+			options:  []PermissionOption{{OptionID: "deny", Kind: "reject_once"}},
+			wantKind: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			outReader, outWriter := io.Pipe()
+			inReader, inWriter := io.Pipe()
+			transport := NewTransport(outWriter, inReader, 1024*1024, nil)
+			defer transport.Close()
+
+			req := Request{JSONRPC: JSONRPCVersion, ID: int64(7), Method: "session/request_permission"}
+			req.Params, _ = json.Marshal(RequestPermissionParams{SessionID: "s", Options: tc.options})
+			reqBytes, _ := json.Marshal(req)
+
+			go func() { _, _ = inWriter.Write(append(reqBytes, '\n')) }()
+
+			var resp Response
+			if err := json.NewDecoder(outReader).Decode(&resp); err != nil {
+				t.Fatalf("failed to decode response: %v", err)
+			}
+			var result RequestPermissionResult
+			if err := json.Unmarshal(resp.Result, &result); err != nil {
+				t.Fatalf("failed to unmarshal result: %v", err)
+			}
+
+			if tc.wantKind == "" {
+				if result.Outcome.Outcome != "cancelled" {
+					t.Fatalf("expected cancelled, got %+v", result.Outcome)
+				}
+				return
+			}
+			if result.Outcome.Outcome != "selected" {
+				t.Fatalf("expected selected, got %+v", result.Outcome)
+			}
+			var chosenKind string
+			for _, o := range tc.options {
+				if o.OptionID == result.Outcome.OptionID {
+					chosenKind = o.Kind
+				}
+			}
+			if chosenKind != tc.wantKind {
+				t.Fatalf("expected kind %q, got %q (outcome %+v)", tc.wantKind, chosenKind, result.Outcome)
+			}
+		})
+	}
+}
+
+// TestTransport_PermissionDeniedByPolicy proves that auto_approve_permissions=false yields a
+// deterministic cancellation instead of hanging the turn.
+func TestTransport_PermissionDeniedByPolicy(t *testing.T) {
+	outReader, outWriter := io.Pipe()
+	inReader, inWriter := io.Pipe()
+	transport := NewTransport(outWriter, inReader, 1024*1024, nil)
+	defer transport.Close()
+	transport.SetAutoApprovePermissions(false)
+
+	req := Request{JSONRPC: JSONRPCVersion, ID: int64(9), Method: "session/request_permission"}
+	req.Params, _ = json.Marshal(RequestPermissionParams{
+		SessionID: "sess_x",
+		Options:   []PermissionOption{{OptionID: "allow", Kind: "allow_once"}},
+	})
+	reqBytes, _ := json.Marshal(req)
+	go func() { _, _ = inWriter.Write(append(reqBytes, '\n')) }()
+
+	dec := json.NewDecoder(outReader)
+	var resp Response
+	if err := dec.Decode(&resp); err != nil {
+		t.Fatalf("failed to decode permission response: %v", err)
+	}
+	var result RequestPermissionResult
+	if err := json.Unmarshal(resp.Result, &result); err != nil {
+		t.Fatalf("failed to unmarshal result: %v", err)
+	}
+	if result.Outcome.Outcome != "cancelled" {
+		t.Fatalf("policy disabled must produce cancelled, got %+v", result.Outcome)
+	}
+
+	// The agent is also told to cancel the in-flight turn so it cannot remain blocked.
+	var notif Notification
+	if err := dec.Decode(&notif); err != nil {
+		t.Fatalf("expected session/cancel notification after denial: %v", err)
+	}
+	if notif.Method != "session/cancel" {
+		t.Fatalf("expected session/cancel notification, got %q", notif.Method)
+	}
+}
+
+// TestTransport_DispatchResponseNeverRacesClose reproduces the reachable "send on closed channel"
+// panic: a response is being dispatched at the same moment the transport is closed.
+func TestTransport_DispatchResponseNeverRacesClose(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		outReader, outWriter := io.Pipe()
+		inReader, _ := io.Pipe()
+		transport := NewTransport(outWriter, inReader, 1024*1024, nil)
+
+		// Register a pending waiter exactly as Call does.
+		ch := make(chan *Response, 1)
+		transport.pendingMu.Lock()
+		transport.pending[int64(i)] = ch
+		transport.pendingMu.Unlock()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			transport.dispatchResponse(&Response{JSONRPC: JSONRPCVersion, ID: float64(i)})
+		}()
+		go func() { _ = transport.Close() }()
+		<-done
+
+		// Drain so the pipe goroutines can exit.
+		_, _ = io.Copy(io.Discard, outReader)
+	}
+}
+
+func TestTransport_UpdateListenerReplacementIsReported(t *testing.T) {
+	_, outWriter := io.Pipe()
+	inReader, _ := io.Pipe()
+	transport := NewTransport(outWriter, inReader, 1024*1024, nil)
+	defer transport.Close()
+
+	first := func(SessionUpdateParams) {}
+	second := func(SessionUpdateParams) {}
+	transport.SetUpdateListener(first)
+	transport.SetUpdateListener(second) // must log but not panic
+	transport.SetUpdateListener(nil)
 }
 
 func TestSessionUpdate_PolymorphicContentChunk(t *testing.T) {
@@ -221,5 +387,278 @@ func TestSessionUpdate_UsageUpdate(t *testing.T) {
 	}
 	if params.Update.Cost == nil || params.Update.Cost.Amount != 0.0035 || params.Update.Cost.Currency != "USD" {
 		t.Fatalf("unexpected cost payload: %+v", params.Update.Cost)
+	}
+}
+
+func TestParseAgentCapabilities(t *testing.T) {
+	// 1. Nil input safety — never panics, everything defaults false.
+	emptyCaps := ParseAgentCapabilities(nil)
+	if emptyCaps.SupportsSystemPromptAppend || emptyCaps.SupportsSystemPromptOveride || emptyCaps.SupportsSystemPrompt {
+		t.Fatalf("expected all false for nil initResult, got %+v", emptyCaps)
+	}
+
+	// 2. Real agy acp v1.5.16 shape: NO sessionCapabilities.systemPrompt, vendor _meta boolean only.
+	agyPayload := map[string]any{
+		"protocolVersion": float64(1),
+		"agentCapabilities": map[string]any{
+			"loadSession": true,
+			"promptCapabilities": map[string]any{
+				"image":           true,
+				"audio":           false,
+				"embeddedContext": true,
+			},
+			"sessionCapabilities": map[string]any{
+				"resume":                map[string]any{},
+				"close":                 map[string]any{},
+				"load":                  map[string]any{},
+				"list":                  map[string]any{},
+				"additionalDirectories": map[string]any{},
+			},
+			"_meta": map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{"append": true},
+				},
+			},
+		},
+	}
+	caps := ParseAgentCapabilities(agyPayload)
+	if caps.ProtocolVersion != 1 || !caps.LoadSession || !caps.SupportsAdditionalDirs ||
+		!caps.SupportsSessionClose || !caps.SupportsVendorSystemPrompt {
+		t.Fatalf("agy 1.5.16 capability parse wrong: %+v", caps)
+	}
+	// FR-01: a vendor key must not be read as evidence about the standard dialect.
+	if caps.SupportsSystemPrompt || caps.SupportsSystemPromptAppend ||
+		caps.SupportsSystemPromptOveride || caps.SupportsVendorPromptOveride {
+		t.Fatalf("agy advertises no standard systemPrompt and no override; got %+v", caps)
+	}
+	if !caps.PromptImage || caps.PromptEmbeddedContext != true {
+		t.Fatalf("expected promptCapabilities image/embeddedContext parsed; got %+v", caps)
+	}
+
+	// 3. Official schema dialect: {"systemPrompt":{}} means append is IMPLICIT (no entry at all).
+	specAppend := ParseAgentCapabilities(map[string]any{
+		"agentCapabilities": map[string]any{
+			"sessionCapabilities": map[string]any{"systemPrompt": map[string]any{}},
+		},
+	})
+	if !specAppend.SupportsSystemPrompt || !specAppend.SupportsSystemPromptAppend {
+		t.Fatalf("schema dialect {systemPrompt:{}} must imply append support; got %+v", specAppend)
+	}
+	if specAppend.SupportsSystemPromptOveride {
+		t.Fatalf("schema dialect {systemPrompt:{}} must not imply override; got %+v", specAppend)
+	}
+
+	// 4. Official schema dialect: override is an OBJECT {}, not a boolean.
+	specOverride := ParseAgentCapabilities(map[string]any{
+		"agentCapabilities": map[string]any{
+			"sessionCapabilities": map[string]any{
+				"systemPrompt": map[string]any{
+					"mode": map[string]any{"override": map[string]any{}},
+				},
+			},
+		},
+	})
+	if !specOverride.SupportsSystemPromptOveride {
+		t.Fatalf("schema dialect override object must be recognised as supported; got %+v", specOverride)
+	}
+	if !specOverride.SupportsSystemPromptAppend {
+		t.Fatalf("older schema dialect {mode:{override:{}}} must still imply append; got %+v", specOverride)
+	}
+
+	// 5. Vendor snake_case duplicates are accepted as aliases.
+	aliased := ParseAgentCapabilities(map[string]any{
+		"agentCapabilities": map[string]any{
+			"load_session": true,
+			"session_capabilities": map[string]any{
+				"close": map[string]any{},
+			},
+		},
+	})
+	if !aliased.LoadSession || !aliased.SupportsSessionClose {
+		t.Fatalf("snake_case capability aliases must be honoured; got %+v", aliased)
+	}
+
+	// 6. Malformed / hostile JSON types never panic and never produce false positives.
+	hostile := ParseAgentCapabilities(map[string]any{
+		"protocolVersion":   "one",
+		"agentCapabilities": "nope",
+	})
+	if hostile.ProtocolVersion != 0 || hostile.SupportsSystemPrompt {
+		t.Fatalf("malformed payload must degrade silently; got %+v", hostile)
+	}
+	hostile2 := ParseAgentCapabilities(map[string]any{
+		"agentCapabilities": map[string]any{
+			"sessionCapabilities": map[string]any{
+				"systemPrompt": "not-an-object",
+			},
+			"mcpCapabilities": map[string]any{"http": "yes"},
+			"_meta":           map[string]any{"antigravity": 42},
+		},
+	})
+	if hostile2.SupportsMCPHTTP || hostile2.SupportsVendorSystemPrompt {
+		t.Fatalf("non-boolean capability values must not be treated as true; got %+v", hostile2)
+	}
+}
+
+func TestSanitizeToolArguments(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"city":{"type":"string"},"unit":{"type":"string"}},"required":["city"]}`)
+
+	cases := []struct {
+		name   string
+		raw    string
+		schema json.RawMessage
+		want   string
+	}{
+		{
+			name:   "strips vendor toolSummary",
+			raw:    `{"city":"Jakarta","toolSummary":"Get weather for Jakarta"}`,
+			schema: schema,
+			want:   `{"city":"Jakarta"}`,
+		},
+		{
+			name:   "keeps every declared property",
+			raw:    `{"city":"Jakarta","unit":"celsius"}`,
+			schema: schema,
+			want:   `{"city":"Jakarta","unit":"celsius"}`,
+		},
+		{
+			name:   "drops undeclared keys when schema is usable",
+			raw:    `{"city":"Jakarta","hallucinated":1}`,
+			schema: schema,
+			want:   `{"city":"Jakarta"}`,
+		},
+		{
+			name:   "without schema only known vendor keys are dropped",
+			raw:    `{"city":"Jakarta","toolSummary":"x"}`,
+			schema: nil,
+			want:   `{"city":"Jakarta"}`,
+		},
+		{
+			name:   "null degrades to empty object",
+			raw:    `null`,
+			schema: schema,
+			want:   `{}`,
+		},
+		{
+			name:   "empty degrades to empty object",
+			raw:    ``,
+			schema: schema,
+			want:   `{}`,
+		},
+		{
+			name:   "non-object degrades to empty object",
+			raw:    `["city"]`,
+			schema: schema,
+			want:   `{}`,
+		},
+		{
+			name:   "everything stripped yields empty object",
+			raw:    `{"toolSummary":"only vendor key"}`,
+			schema: schema,
+			want:   `{}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SanitizeToolArguments(json.RawMessage(tc.raw), tc.schema, VendorToolArgumentKeys...)
+			var gotObj, wantObj map[string]any
+			if err := json.Unmarshal(got, &gotObj); err != nil {
+				t.Fatalf("sanitized output is not valid JSON object: %s", string(got))
+			}
+			if err := json.Unmarshal([]byte(tc.want), &wantObj); err != nil {
+				t.Fatalf("bad want fixture: %v", err)
+			}
+			if len(gotObj) != len(wantObj) {
+				t.Fatalf("got %s, want %s", string(got), tc.want)
+			}
+			for k, v := range wantObj {
+				if gotObj[k] != v {
+					t.Fatalf("key %q: got %v, want %v (full: %s)", k, gotObj[k], v, string(got))
+				}
+			}
+		})
+	}
+
+	// The toolSummary key must never survive, regardless of schema shape.
+	for _, sch := range []string{``, `{}`, `{"properties":{}}`, `not-json`} {
+		out := SanitizeToolArguments(json.RawMessage(`{"city":"X","toolSummary":"Y"}`), json.RawMessage(sch), VendorToolArgumentKeys...)
+		if strings.Contains(string(out), "toolSummary") {
+			t.Fatalf("toolSummary survived for schema %q: %s", sch, string(out))
+		}
+	}
+}
+
+func TestRequestPermissionParams_ResolvedToolCallID(t *testing.T) {
+	nested := &RequestPermissionParams{
+		SessionID: "s1",
+		ToolCall:  &PermissionToolCall{ToolCallID: "call_nested", Name: "t", Args: map[string]any{"a": 1}},
+		Options:   []PermissionOption{{OptionID: "allow", Kind: "allow_once"}},
+	}
+	if got := nested.ResolvedToolCallID(); got != "call_nested" {
+		t.Fatalf("expected nested toolCallId, got %q", got)
+	}
+
+	flat := &RequestPermissionParams{SessionID: "s1", ToolCallID: "call_flat"}
+	if got := flat.ResolvedToolCallID(); got != "call_flat" {
+		t.Fatalf("expected flat fallback, got %q", got)
+	}
+
+	var nilParams *RequestPermissionParams
+	if got := nilParams.ResolvedToolCallID(); got != "" {
+		t.Fatalf("nil receiver must return empty, got %q", got)
+	}
+}
+
+func TestSessionNewResult_ConfigOptionByID(t *testing.T) {
+	var raw = `{
+      "sessionId":"abc",
+      "modes":{"currentModeId":"default","availableModes":[{"id":"default"},{"id":"accept-edits"},{"id":"auto"},{"id":"plan"}]},
+      "configOptions":[
+        {"id":"thought_level","category":"thought_level","type":"select","currentValue":"high",
+         "options":[{"value":"low"},{"value":"medium"},{"value":"high"},{"value":"xhigh","name":"Extra"}]}
+      ],
+      "usage":{"inputTokens":10,"outputTokens":20,"cachedReadTokens":3,"cachedWriteTokens":0,"thoughtTokens":5,"totalTokens":30}
+    }`
+	var res SessionNewResult
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
+		t.Fatalf("failed to decode session/new result: %v", err)
+	}
+	opt := res.ConfigOptionByID("thought_level")
+	if opt == nil || len(opt.Options) != 4 {
+		t.Fatalf("expected 4 thought_level options, got %+v", opt)
+	}
+	if opt.Options[3].Value != "xhigh" || opt.Options[3].Name != "Extra" {
+		t.Fatalf("wire value must be xhigh with label Extra, got %+v", opt.Options[3])
+	}
+	if res.Modes == nil || len(res.Modes.AvailableModes) != 4 {
+		t.Fatalf("expected 4 available modes, got %+v", res.Modes)
+	}
+	if res.ConfigOptionByID("nope") != nil {
+		t.Fatalf("unknown option must return nil")
+	}
+	var nilRes *SessionNewResult
+	if nilRes.ConfigOptionByID("model") != nil {
+		t.Fatalf("nil receiver must return nil")
+	}
+}
+
+func TestClientToolDelegationAndBuiltInChecks(t *testing.T) {
+	if !IsBuiltInContainerTool("read_file") || !IsBuiltInContainerTool("run_command") {
+		t.Fatalf("expected read_file and run_command to be detected as built-in container tools")
+	}
+	if IsBuiltInContainerTool("mcp_client-tools_read") || IsBuiltInContainerTool("read") {
+		t.Fatalf("client tools should not be flagged as built-in container tools")
+	}
+
+	if d := ClientToolDelegationDirective(nil); d != "" {
+		t.Fatalf("expected empty directive for nil toolNames, got %q", d)
+	}
+	directive := ClientToolDelegationDirective([]string{"read", "bash"})
+	if !strings.Contains(directive, "mcp_client-tools_read") || !strings.Contains(directive, "mcp_client-tools_bash") {
+		t.Fatalf("expected prefixed mcp_client-tools_ names in directive, got %q", directive)
+	}
+	if !strings.Contains(directive, "NEVER call any built-in container tools") {
+		t.Fatalf("expected strict prohibition on built-in container tools")
 	}
 }

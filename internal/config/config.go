@@ -59,12 +59,11 @@ type APIKeyConfig struct {
 }
 
 type SecurityConfig struct {
-	APIKeys              []APIKeyConfig `yaml:"api_keys"`
-	AdminAPIKey          string         `yaml:"admin_api_key"`
-	AdminAPIKeyEnv       string         `yaml:"admin_api_key_env"`
-	AdminAPIKeySecret    string         `yaml:"-"`
-	AllowRemoteImageURLs bool           `yaml:"allow_remote_image_urls"`
-	AllowedCORSOrigins   []string       `yaml:"allowed_cors_origins"`
+	APIKeys            []APIKeyConfig `yaml:"api_keys"`
+	AdminAPIKey        string         `yaml:"admin_api_key"`
+	AdminAPIKeyEnv     string         `yaml:"admin_api_key_env"`
+	AdminAPIKeySecret  string         `yaml:"-"`
+	AllowedCORSOrigins []string       `yaml:"allowed_cors_origins"`
 }
 
 type BinariesConfig struct {
@@ -74,11 +73,18 @@ type BinariesConfig struct {
 	AgyAcpArgs    []string `yaml:"agy_acp_args"`
 }
 
+// ExecutionConfig controls per-turn agent behaviour.
+//
+// @purpose Groups the policies that shape how one inference turn is executed.
+// @rationale YoloMode was removed: it was a dead duplicate of AutoApprovePermissions plus the
+// --dangerously-skip-permissions CLI flag, so its presence implied a switch that did nothing.
 type ExecutionConfig struct {
-	YoloMode                      bool          `yaml:"yolo_mode"`
 	AcpSessionMode                string        `yaml:"acp_session_mode"`
 	AutoApprovePermissions        bool          `yaml:"auto_approve_permissions"`
 	CleanWorkspaceBetweenRequests bool          `yaml:"clean_workspace_between_requests"`
+	StrictClientToolDelegation    bool          `yaml:"strict_client_tool_delegation"`
+	SystemPromptChannel           string        `yaml:"system_prompt_channel"`
+	VisionMode                    string        `yaml:"vision_mode"`
 	MaxRetries                    int           `yaml:"max_retries"`
 	RetryInitialBackoff           time.Duration `yaml:"retry_initial_backoff"`
 	RetryMaxBackoff               time.Duration `yaml:"retry_max_backoff"`
@@ -143,6 +149,7 @@ type AnthropicConfig struct {
 	DefaultModel           string `yaml:"default_model"`
 	DefaultMaxTokens       int    `yaml:"default_max_tokens"`
 	ExposeReasoningContent bool   `yaml:"expose_reasoning_content"`
+	UnsupportedParamPolicy string `yaml:"unsupported_param_policy"`
 }
 
 // ProxyConfig specifies optional outbound HTTP/HTTPS proxy settings for Docker and host environments.
@@ -251,14 +258,21 @@ func (c *Config) SetAgyAuthPath(p string) {
 	c.Binaries.AgyAuthPath = p
 }
 
+// MCPClientToolCallingConfig controls client tool delegation and interception.
+//
+// @purpose Bounds and validates every knob that affects the client-tool path.
+// @rationale DefaultParallel was removed: OpenAI's `parallel_tool_calls` is the real control surface, and
+// multi-call collection is now always enabled, so the knob implied a switch that did nothing.
 type MCPClientToolCallingConfig struct {
-	Enabled                bool   `yaml:"enabled"`
-	DefaultParallel        bool   `yaml:"default_parallel"`
-	StrictSchemaValidation bool   `yaml:"strict_schema_validation"`
-	MaxToolArgumentBytes   int64  `yaml:"max_tool_argument_bytes"`
+	Enabled                 bool          `yaml:"enabled"`
+	StrictSchemaValidation  bool          `yaml:"strict_schema_validation"`
+	MaxToolArgumentBytes    int64         `yaml:"max_tool_argument_bytes"`
+	MaxClientTools          int           `yaml:"max_client_tools"`
+	MaxInterceptedToolCalls int           `yaml:"max_intercepted_tool_calls"`
+	ToolCallCollectWindow   time.Duration `yaml:"tool_call_collect_window"`
 	// DelimiterTag is retained for configuration backwards-compatibility.
 	// All tools are natively handled via ACP and the in-memory MCP loopback server.
-	DelimiterTag           string `yaml:"delimiter_tag"`
+	DelimiterTag string `yaml:"delimiter_tag"`
 }
 
 type MCPConfig struct {
@@ -293,21 +307,22 @@ func DefaultConfig() *Config {
 			SSEKeepaliveInterval: 15 * time.Second,
 		},
 		Security: SecurityConfig{
-			APIKeys:              make([]APIKeyConfig, 0),
-			AllowRemoteImageURLs: false,
-			AllowedCORSOrigins:   make([]string, 0),
+			APIKeys:            make([]APIKeyConfig, 0),
+			AllowedCORSOrigins: make([]string, 0),
 		},
 		Binaries: BinariesConfig{
 			AgyPath:       "/usr/local/bin/agy",
-			AgyMinVersion: "1.5.5",
+			AgyMinVersion: "1.5.16",
 			AgyAuthPath:   "/usr/local/bin/agy-auth",
-			AgyAcpArgs:    []string{"acp", "--dangerously-skip-permissions"},
+			AgyAcpArgs:    []string{"acp"},
 		},
 		Execution: ExecutionConfig{
-			YoloMode:                      true,
 			AcpSessionMode:                "accept-edits",
 			AutoApprovePermissions:        true,
 			CleanWorkspaceBetweenRequests: true,
+			StrictClientToolDelegation:    true,
+			SystemPromptChannel:           "auto",
+			VisionMode:                    "reject",
 			MaxRetries:                    3,
 			RetryInitialBackoff:           500 * time.Millisecond,
 			RetryMaxBackoff:               10 * time.Second,
@@ -362,6 +377,7 @@ func DefaultConfig() *Config {
 		},
 		Anthropic: AnthropicConfig{
 			DefaultModel:           "claude-3-5-sonnet",
+			UnsupportedParamPolicy: "strip_and_warn",
 			DefaultMaxTokens:       4096,
 			ExposeReasoningContent: true,
 		},
@@ -388,11 +404,13 @@ func DefaultConfig() *Config {
 		},
 		MCP: MCPConfig{
 			ClientToolCalling: MCPClientToolCallingConfig{
-				Enabled:                true,
-				DefaultParallel:        true,
-				StrictSchemaValidation: true,
-				MaxToolArgumentBytes:   16777216, // 16 MiB (supports large code/document tool outputs)
-				DelimiterTag:           "tool_call",
+				Enabled:                 true,
+				StrictSchemaValidation:  true,
+				MaxToolArgumentBytes:    16777216, // 16 MiB (supports large code/document tool outputs)
+				MaxClientTools:          128,
+				MaxInterceptedToolCalls: 16,
+				ToolCallCollectWindow:   time.Second,
+				DelimiterTag:            "tool_call",
 			},
 		},
 		Observability: ObsConfig{
@@ -575,6 +593,9 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
 		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
 	}
+	if v := os.Getenv("AGY_GW_STRICT_CLIENT_TOOL_DELEGATION"); v != "" {
+		cfg.Execution.StrictClientToolDelegation = parseBoolEnv(v, cfg.Execution.StrictClientToolDelegation)
+	}
 
 	// 5. OpenAI & Models Overrides
 	if v := getFirstEnv("AGY_GW_DEFAULT_MODEL", "DEFAULT_MODEL"); v != "" {
@@ -589,9 +610,6 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AGY_GW_UNSUPPORTED_PARAM_POLICY"); v != "" {
 		cfg.OpenAI.UnsupportedParamPolicy = v
 	}
-	if v := os.Getenv("AGY_GW_ALLOW_REMOTE_IMAGE_URLS"); v != "" {
-		cfg.Security.AllowRemoteImageURLs = parseBoolEnv(v, cfg.Security.AllowRemoteImageURLs)
-	}
 
 	// 5b. Anthropic Overrides
 	if v := getFirstEnv("AGY_GW_ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_MODEL"); v != "" {
@@ -603,6 +621,9 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Anthropic.DefaultMaxTokens = n
 		}
 	}
+	if v := os.Getenv("AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY"); v != "" {
+		cfg.Anthropic.UnsupportedParamPolicy = strings.TrimSpace(v)
+	}
 	if v := os.Getenv("AGY_GW_ANTHROPIC_EXPOSE_REASONING_CONTENT"); v != "" {
 		cfg.Anthropic.ExposeReasoningContent = parseBoolEnv(v, cfg.Anthropic.ExposeReasoningContent)
 	}
@@ -610,6 +631,67 @@ func applyEnvOverrides(cfg *Config) {
 		var n int64
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			cfg.MCP.ClientToolCalling.MaxToolArgumentBytes = n
+		}
+	}
+	if v := os.Getenv("AGY_GW_STRICT_SCHEMA_VALIDATION"); v != "" {
+		cfg.MCP.ClientToolCalling.StrictSchemaValidation = parseBoolEnv(v, cfg.MCP.ClientToolCalling.StrictSchemaValidation)
+	}
+	if v := os.Getenv("AGY_GW_MAX_CLIENT_TOOLS"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			cfg.MCP.ClientToolCalling.MaxClientTools = n
+		}
+	}
+	if v := os.Getenv("AGY_GW_MAX_INTERCEPTED_TOOL_CALLS"); v != "" {
+		var n int
+		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+			cfg.MCP.ClientToolCalling.MaxInterceptedToolCalls = n
+		}
+	}
+	if v := os.Getenv("AGY_GW_TOOL_CALL_COLLECT_WINDOW"); v != "" {
+		cfg.MCP.ClientToolCalling.ToolCallCollectWindow = parseDurationEnv(v, cfg.MCP.ClientToolCalling.ToolCallCollectWindow)
+	}
+
+	// 5d. Execution Policy Overrides
+	if v := getFirstEnv("AGY_GW_ACP_SESSION_MODE", "ACP_SESSION_MODE"); v != "" {
+		cfg.Execution.AcpSessionMode = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_AUTO_APPROVE_PERMISSIONS"); v != "" {
+		cfg.Execution.AutoApprovePermissions = parseBoolEnv(v, cfg.Execution.AutoApprovePermissions)
+	}
+	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
+		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
+	}
+	if v := os.Getenv("AGY_GW_SYSTEM_PROMPT_CHANNEL"); v != "" {
+		cfg.Execution.SystemPromptChannel = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_VISION_MODE"); v != "" {
+		cfg.Execution.VisionMode = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_CONFIG_SWITCH_TIMEOUT"); v != "" {
+		cfg.Pool.ConfigSwitchTimeout = parseDurationEnv(v, cfg.Pool.ConfigSwitchTimeout)
+	}
+	if v := os.Getenv("AGY_GW_METRICS_ENABLED"); v != "" {
+		cfg.Observability.MetricsEnabled = parseBoolEnv(v, cfg.Observability.MetricsEnabled)
+	}
+	if v := os.Getenv("AGY_GW_METRICS_PATH"); v != "" {
+		if p := strings.TrimSpace(v); strings.HasPrefix(p, "/") {
+			cfg.Observability.MetricsPath = p
+		}
+	}
+	if v := os.Getenv("AGY_GW_AGY_MIN_VERSION"); v != "" {
+		cfg.Binaries.AgyMinVersion = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_AGY_ACP_ARGS"); v != "" {
+		parts := strings.Split(v, ",")
+		args := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if t := strings.TrimSpace(p); t != "" {
+				args = append(args, t)
+			}
+		}
+		if len(args) > 0 {
+			cfg.Binaries.AgyAcpArgs = args
 		}
 	}
 
@@ -849,8 +931,40 @@ func validate(cfg *Config) error {
 	if cfg.Binaries.AgyAuthPath == "" {
 		return fmt.Errorf("binaries.agy_auth_path cannot be empty")
 	}
-	if cfg.Execution.AcpSessionMode != "default" && cfg.Execution.AcpSessionMode != "accept-edits" && cfg.Execution.AcpSessionMode != "plan" {
-		return fmt.Errorf("execution.acp_session_mode must be 'default', 'accept-edits', or 'plan', got %q", cfg.Execution.AcpSessionMode)
+	if !validUnsupportedParamPolicy(cfg.Anthropic.UnsupportedParamPolicy) {
+		return fmt.Errorf("anthropic.unsupported_param_policy must be 'strip_and_warn' or 'reject', got %q",
+			cfg.Anthropic.UnsupportedParamPolicy)
+	}
+	// "auto" is advertised by agy acp 1.5.16 and must be selectable.
+	if !validSessionMode(cfg.Execution.AcpSessionMode) {
+		return fmt.Errorf("execution.acp_session_mode must be one of %v, got %q",
+			sessionModes, cfg.Execution.AcpSessionMode)
+	}
+	if !validSystemPromptChannel(cfg.Execution.SystemPromptChannel) {
+		return fmt.Errorf("execution.system_prompt_channel must be one of %v, got %q",
+			systemPromptChannels, cfg.Execution.SystemPromptChannel)
+	}
+	if !validVisionMode(cfg.Execution.VisionMode) {
+		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",
+			visionModes, cfg.Execution.VisionMode)
+	}
+	if !validUnsupportedParamPolicy(cfg.OpenAI.UnsupportedParamPolicy) {
+		return fmt.Errorf("openai.unsupported_param_policy must be one of %v, got %q",
+			unsupportedParamPolicies, cfg.OpenAI.UnsupportedParamPolicy)
+	}
+	if cfg.MCP.ClientToolCalling.MaxClientTools <= 0 || cfg.MCP.ClientToolCalling.MaxClientTools > 1024 {
+		return fmt.Errorf("mcp.client_tool_calling.max_client_tools must be between 1 and 1024, got %d",
+			cfg.MCP.ClientToolCalling.MaxClientTools)
+	}
+	if cfg.MCP.ClientToolCalling.MaxInterceptedToolCalls <= 0 || cfg.MCP.ClientToolCalling.MaxInterceptedToolCalls > 256 {
+		return fmt.Errorf("mcp.client_tool_calling.max_intercepted_tool_calls must be between 1 and 256, got %d",
+			cfg.MCP.ClientToolCalling.MaxInterceptedToolCalls)
+	}
+	if cfg.MCP.ClientToolCalling.ToolCallCollectWindow <= 0 {
+		return fmt.Errorf("mcp.client_tool_calling.tool_call_collect_window must be > 0")
+	}
+	if cfg.Pool.ConfigSwitchTimeout <= 0 {
+		return fmt.Errorf("pool.config_switch_timeout must be > 0")
 	}
 
 	// Compile admin regexes

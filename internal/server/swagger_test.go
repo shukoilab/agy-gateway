@@ -19,7 +19,7 @@ func TestSwaggerUIEndpoints(t *testing.T) {
 		},
 	}
 
-	opsHandlers := server.NewOpsHandlers()
+	opsHandlers := server.NewOpsHandlers(nil)
 	// Create minimal server instance using NewServer
 	srv := server.NewServer(cfg, nil, nil, nil, opsHandlers, nil, nil)
 

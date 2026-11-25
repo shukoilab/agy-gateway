@@ -464,7 +464,7 @@ func TestAnthropicHandlers_EndToEnd_StreamingToolUse(t *testing.T) {
 			"jsonrpc": "2.0",
 			"method":  "session/update",
 			"params": map[string]any{
-				"sessionId": "mock_sess_tool_use",
+				"sessionId": "mock_sess_1",
 				"update": map[string]any{
 					"sessionUpdate": acp.UpdateAgentMessageChunk,
 					"content": map[string]any{
@@ -554,5 +554,57 @@ func TestAnthropicHandlers_EndToEnd_StreamingToolUse(t *testing.T) {
 
 	if cmd, ok := parsedArgs["command"].(string); !ok || cmd != "pwd && git status --porcelain" {
 		t.Errorf("expected command 'pwd && git status --porcelain', got %v", parsedArgs["command"])
+	}
+}
+
+// @purpose Proves FR-17: an update belonging to a different session on the same worker is dropped.
+// @rationale Workers are reused across turns, and session/close is deferred, so a late update from
+// the previous session could otherwise leak text into the next client's response — cross-tenant.
+// @preconditions None.
+// @param t (*testing.T) - Go test harness.
+// @returns None.
+// @throws Calls t.Fatalf if the foreign text reaches the response.
+// @invariants Spawns one real mock worker; deterministic ordering.
+func TestAnthropicHandlers_ForeignSessionUpdatesDropped(t *testing.T) {
+	handlers, cfg, _, _, _, _ := setupAnthropicTestEnvironment(t)
+
+	mockWorker := createMockWorkerWithPipe(t, 0, cfg, func(method string, params json.RawMessage, inWriter io.Writer) {
+		emit := func(sessionID, text string) {
+			update := map[string]any{
+				"jsonrpc": "2.0",
+				"method":  "session/update",
+				"params": map[string]any{
+					"sessionId": sessionID,
+					"update": map[string]any{
+						"sessionUpdate": acp.UpdateAgentMessageChunk,
+						"content":       map[string]any{"type": "text", "text": text},
+					},
+				},
+			}
+			raw, _ := json.Marshal(update)
+			_, _ = inWriter.Write(append(raw, '\n'))
+		}
+		// Emit the foreign session first so ordering cannot mask a wrong filter.
+		emit("mock_sess_FOREIGN", "LEAKED_FOREIGN_TOKEN")
+		emit("mock_sess_1", "EXPECTED_LOCAL_TOKEN")
+	})
+
+	testPool := pool.NewTestPoolWithWorker(mockWorker, cfg)
+	failoverCoord := pool.NewFailoverCoordinator(testPool, nil, nil)
+	handlers = server.NewAnthropicHandlers(cfg, testPool, failoverCoord, handlers.ModelRegistry(), nil, nil)
+
+	payload := `{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}`
+	rec := httptest.NewRecorder()
+	handlers.HandleMessages(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(payload)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "LEAKED_FOREIGN_TOKEN") {
+		t.Fatalf("update from another session leaked into the response: %s", body)
+	}
+	if !strings.Contains(body, "EXPECTED_LOCAL_TOKEN") {
+		t.Fatalf("update for the active session was dropped: %s", body)
 	}
 }

@@ -5,7 +5,6 @@ package server
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"runtime/debug"
@@ -125,12 +124,14 @@ func (m *Middleware) Recovery(next http.Handler) http.Handler {
 		defer func() {
 			if rec := recover(); rec != nil {
 				stack := debug.Stack()
-				slog.Error("panic intercepted by recovery middleware", "panic", rec, "stack", string(stack))
+				slog.Error("panic intercepted by recovery middleware", "panic", rec, "stack", string(stack), "requestID", r.Header.Get("X-Request-ID"))
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusInternalServerError)
+				// The panic value is operator data: echoing it leaks paths, model ids and internals to
+				// the client (CWE-209). The stack above is the diagnostic channel (FR-18).
 				_ = json.NewEncoder(w).Encode(map[string]any{
 					"error": map[string]string{
-						"message": fmt.Sprintf("Internal gateway panic: %v", rec),
+						"message": "internal server error",
 						"type":    "internal_server_error",
 					},
 				})

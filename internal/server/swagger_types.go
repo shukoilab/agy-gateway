@@ -143,3 +143,16 @@ type ModelSyncResponse struct {
 	// Elected family champions
 	Champions map[string]string `json:"champions"`
 }
+
+// OpsReadinessResponse reports worker pool availability.
+//
+// @purpose Gives orchestrators a truthful readiness signal.
+// @rationale A static readiness string hides a pool that has no warm workers.
+type OpsReadinessResponse struct {
+	// Status readiness indicator ("ready" or "not_ready")
+	Status string `json:"status" example:"ready"`
+	// WorkersTotal configured worker count
+	WorkersTotal int `json:"workers_total" example:"2"`
+	// WorkersAvailable workers currently queued for lease
+	WorkersAvailable int `json:"workers_available" example:"2"`
+}

@@ -266,11 +266,7 @@ func (m *Manager) SwitchWorkerAccount(ctx context.Context, workerID int, targetA
 	_ = os.MkdirAll(dstTokenDir, 0755)
 	dstToken := filepath.Join(dstTokenDir, "antigravity-oauth-token")
 
-	tokenCandidates := []string{
-		"/home/agygw/.gemini/antigravity-cli/antigravity-oauth-token",
-		filepath.Join(m.cfg.Storage.VaultXDGConfigDir, "gemini", "antigravity-cli", "antigravity-oauth-token"),
-		filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token"),
-	}
+	tokenCandidates := m.tokenCandidates()
 
 	for _, tokenPath := range tokenCandidates {
 		if _, err := os.Stat(tokenPath); err == nil {
@@ -440,16 +436,12 @@ func (m *Manager) ProvisionWorkerHome(workerID int) (string, string, string, err
 
 	// Ensure token mirror is written via switch if accounts exist
 	accounts := m.GetAccounts()
-	srcToken := "/home/agygw/.gemini/antigravity-cli/antigravity-oauth-token"
+	srcToken := m.tokenCandidates()[0]
 	if _, err := os.Stat(srcToken); err != nil && len(accounts) > 0 {
 		_, _ = m.execAgyAuth(context.Background(), "switch", accounts[0].ID)
 	}
 
-	tokenCandidates := []string{
-		srcToken,
-		filepath.Join(m.cfg.Storage.VaultXDGConfigDir, "gemini", "antigravity-cli", "antigravity-oauth-token"),
-		filepath.Join(os.Getenv("HOME"), ".gemini", "antigravity-cli", "antigravity-oauth-token"),
-	}
+	tokenCandidates := m.tokenCandidates()
 
 	dstTokenDir := filepath.Join(homeDir, ".gemini", "antigravity-cli")
 	_ = os.MkdirAll(dstTokenDir, 0755)
@@ -659,4 +651,29 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Sync()
+}
+
+// tokenCandidates returns the ordered list of filesystem locations that may hold the
+// Antigravity OAuth token, highest priority first.
+//
+// @purpose Removes the hardcoded /home/agygw development path (Zero-Hardcoding invariant).
+// @rationale The vault directory is the authoritative location and is derived from configuration;
+// HOME is only a last-resort convenience for bare-metal runs.
+// @preconditions m.cfg must be non-nil.
+// @returns Two or three absolute paths; the first is the preferred source.
+// @throws None.
+// @invariants O(1), allocation-bounded, no filesystem access.
+func (m *Manager) tokenCandidates() []string {
+	rel := []string{"gemini", "antigravity-cli", "antigravity-oauth-token"}
+	candidates := []string{}
+	if m.cfg != nil && m.cfg.Storage.VaultXDGConfigDir != "" {
+		candidates = append(candidates, filepath.Join(m.cfg.Storage.VaultXDGConfigDir, filepath.Join(rel...)))
+	}
+	if home := os.Getenv("HOME"); home != "" {
+		candidates = append(candidates, filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token"))
+	}
+	if len(candidates) == 0 {
+		candidates = append(candidates, filepath.Join(os.TempDir(), "agy-gateway-missing-token"))
+	}
+	return candidates
 }

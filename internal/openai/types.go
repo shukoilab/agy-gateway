@@ -28,6 +28,12 @@ type ChatCompletionRequest struct {
 	ReasoningEffort     string                     `json:"reasoning_effort,omitempty" enums:"low,medium,high" example:"medium"`
 	ResponseFormat      any                        `json:"response_format,omitempty" swaggertype:"object"`
 	User                string                     `json:"user,omitempty" example:"client_user_123"`
+	// Seed, Logprobs, TopLogprobs and LogitBias exist only so the FR-14 policy can see
+	// them: decoding drops unknown keys, which would let them be silently ignored.
+	Seed        *int64         `json:"seed,omitempty" example:"42"`
+	Logprobs    *bool          `json:"logprobs,omitempty" example:"false"`
+	TopLogprobs *int           `json:"top_logprobs,omitempty" example:"0"`
+	LogitBias   map[string]int `json:"logit_bias,omitempty" swaggertype:"object"`
 }
 
 type StreamOptions struct {

@@ -12,6 +12,18 @@ import (
 	"agy-gateway/internal/config"
 )
 
+// ErrQueueSaturated reports that every worker stayed leased past the acquire timeout.
+//
+// @purpose Lets the HTTP surfaces distinguish capacity exhaustion from an internal fault.
+// @rationale A saturated queue is a transient load condition: returning 500 tells clients to treat
+// it as a bug in the gateway, while 503 invites a retry.
+// @preconditions None.
+// @param None.
+// @returns A shared sentinel matched with errors.Is.
+// @throws None.
+// @invariants Immutable; safe for concurrent use.
+var ErrQueueSaturated = errors.New("timeout acquiring worker from pool (queue saturated)")
+
 // Pool coordinates a pool of N isolated warm agy acp workers.
 type Pool struct {
 	cfg     *config.Config
@@ -56,6 +68,20 @@ func NewTestPoolWithWorker(worker *Worker, cfg *config.Config) *Pool {
 	}
 	p.leaseCh <- worker
 	return p
+}
+
+// NewTestPoolWithNoWorkers initializes an empty pool for timeout and cancellation tests.
+//
+// @purpose Lets a test drive Acquire's timeout branch without spawning real agy workers.
+// @rationale NewPool needs an auth manager and starts subprocesses; this exposes the same struct
+// with a lease channel nobody feeds, so Acquire's real select loop is exercised verbatim.
+// @preconditions cfg must be non-nil; only Pool.AcquireTimeout is read.
+// @param cfg (*config.Config) - Config supplying the acquire timeout.
+// @returns (*Pool) - Pool with an empty lease channel and no workers.
+// @throws None.
+// @invariants O(1); the returned pool owns no goroutines or processes.
+func NewTestPoolWithNoWorkers(cfg *config.Config) *Pool {
+	return &Pool{cfg: cfg, leaseCh: make(chan *Worker)}
 }
 
 func (p *Pool) log() *slog.Logger {
@@ -110,7 +136,13 @@ func (p *Pool) Acquire(ctx context.Context, requiresPaidTier bool) (*Worker, err
 	for {
 		select {
 		case <-timeoutCtx.Done():
-			return nil, errors.New("timeout acquiring worker from pool (queue saturated)")
+			// Distinguish caller cancellation from our own acquire timeout. A client that hung up
+			// is not capacity exhaustion; reporting it as a retryable 503 would invite a retry on
+			// a connection the caller already abandoned.
+			if cause := ctx.Err(); cause != nil {
+				return nil, cause
+			}
+			return nil, ErrQueueSaturated
 		case w := <-p.leaseCh:
 			// Ensure bound account is refreshed from auth manager if missing or previously expired
 			if p.authMgr != nil {
@@ -256,4 +288,26 @@ func (p *Pool) Close() {
 			w.Close()
 		}
 	}
+}
+
+// Availability reports how many workers are currently ready to serve a lease.
+//
+// @purpose Backs the /readyz probe with real pool state instead of a static string.
+// @rationale A gateway with zero warm workers accepts connections it cannot serve; failing readiness
+// lets the orchestrator stop routing traffic until workers recover.
+// @preconditions None. Safe on a nil or closed pool.
+// @returns total and available worker counts (available = queued in the lease channel).
+// @throws None.
+// @invariants O(1) under p.mu; channel length read is non-blocking.
+func (p *Pool) Availability() (total int, available int) {
+	if p == nil {
+		return 0, 0
+	}
+	p.mu.Lock()
+	total = len(p.workers)
+	p.mu.Unlock()
+	if p.leaseCh != nil {
+		available = len(p.leaseCh)
+	}
+	return total, available
 }

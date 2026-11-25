@@ -31,6 +31,30 @@ type Transport struct {
 
 	closed atomic.Bool
 	doneCh chan struct{}
+
+	// autoApprove controls whether permission requests are approved automatically. When false, the
+	// agent is told `cancelled` and the session is cancelled so the turn unwinds deterministically.
+	autoApprove atomic.Bool
+}
+
+// SetAutoApprovePermissions configures the permission policy for this transport.
+//
+// @purpose Wires execution.auto_approve_permissions into the permission decision path.
+// @rationale The policy was previously unconditional, so an operator could not disable it.
+// @param enabled True to auto-approve allow* options; false to always answer cancelled.
+// @returns None.
+// @invariants Atomic store; safe to call before the first turn.
+func (t *Transport) SetAutoApprovePermissions(enabled bool) {
+	t.autoApprove.Store(enabled)
+}
+
+// AutoApprovePermissions reports the current permission policy.
+//
+// @purpose Read accessor for the permission policy.
+// @returns True when permission requests are auto-approved.
+// @invariants Atomic load.
+func (t *Transport) AutoApprovePermissions() bool {
+	return t.autoApprove.Load()
 }
 
 // NewTransport creates an initialized Transport wrapping input and output streams.
@@ -43,21 +67,36 @@ func NewTransport(in io.WriteCloser, out io.ReadCloser, maxScannerBuffer int, lo
 	}
 
 	t := &Transport{
-		in:      in,
-		out:     out,
-		logger:  logger,
-		pending: make(map[int64]chan *Response),
-		doneCh:  make(chan struct{}),
+		in:          in,
+		out:         out,
+		logger:      logger,
+		pending:     make(map[int64]chan *Response),
+		doneCh:      make(chan struct{}),
+		autoApprove: atomic.Bool{},
 	}
+	// Default matches the historical behaviour (auto-approve) until configuration overrides it.
+	t.autoApprove.Store(true)
 
 	go t.readLoop(maxScannerBuffer)
 	return t
 }
 
 // SetUpdateListener registers a callback function to receive asynchronous session updates.
+//
+// @purpose Routes session/update notifications for the duration of one leased turn.
+// @rationale There is exactly one listener slot and exactly one turn per worker at a time. Silently
+// replacing an existing listener means two turns would interleave their output, so replacement is
+// logged loudly to make a lease-discipline violation visible instead of corrupting both streams.
+//
+// @param fn Listener callback, or nil to clear the slot at end of turn.
+// @returns None.
+// @invariants Write-locked; the previous listener (if any and not nil) is reported.
 func (t *Transport) SetUpdateListener(fn func(update SessionUpdateParams)) {
 	t.updateListenerMu.Lock()
 	defer t.updateListenerMu.Unlock()
+	if t.updateListener != nil && fn != nil {
+		t.logger.Error("update listener replaced while one was active; worker lease discipline violated")
+	}
 	t.updateListener = fn
 }
 
@@ -278,6 +317,20 @@ func (t *Transport) processLine(line []byte) {
 	}
 }
 
+// dispatchResponse routes a decoded JSON-RPC response to its pending caller.
+//
+// @purpose Delivers the response to the single waiter registered for this request id.
+// @rationale The delivery MUST happen while holding pendingMu. Close() closes every pending channel
+// under the same lock; releasing the lock before sending leaves a window where a concurrent Close()
+// closes the channel and this goroutine panics with "send on closed channel", killing the whole
+// process (the panic occurs on the transport read goroutine, which the HTTP recovery middleware
+// cannot catch). Channels are capacity-1, so the send never blocks while the lock is held.
+//
+// @preconditions resp must be non-nil with a numeric ID.
+// @param resp Decoded response envelope.
+// @returns None.
+// @throws None; unmatched ids are logged at Debug.
+// @invariants O(1); lock scope contains only one non-blocking send.
 func (t *Transport) dispatchResponse(resp *Response) {
 	var id int64
 	switch v := resp.ID.(type) {
@@ -285,19 +338,31 @@ func (t *Transport) dispatchResponse(resp *Response) {
 		id = int64(v)
 	case int64:
 		id = v
+	case json.Number:
+		parsed, err := v.Int64()
+		if err != nil {
+			t.logger.Warn("unexpected response ID number", "id", v)
+			return
+		}
+		id = parsed
 	default:
 		t.logger.Warn("unexpected response ID type", "id", resp.ID)
 		return
 	}
 
 	t.pendingMu.Lock()
-	ch, exists := t.pending[id]
-	t.pendingMu.Unlock()
+	defer t.pendingMu.Unlock()
 
-	if exists {
-		ch <- resp
-	} else {
+	ch, exists := t.pending[id]
+	if !exists {
 		t.logger.Debug("unmatched response ID received", "id", id)
+		return
+	}
+	select {
+	case ch <- resp:
+	default:
+		// Buffer already holds an unread response; dropping is safe because Call consumes exactly one.
+		t.logger.Warn("duplicate response for request id discarded", "id", id)
 	}
 }
 
@@ -320,66 +385,106 @@ func (t *Transport) handleIncomingRequest(req *Request) {
 	_ = t.send(resp)
 }
 
-// handlePermissionRequest implements the Layer 3 YOLO auto-approval interceptor.
-// Conforms to ACP v1 specification: if cancelled, returns outcome: "cancelled".
+// handlePermissionRequest answers a session/request_permission request from the agent.
+//
+// @purpose Prevents the agent turn from stalling while guaranteeing a deterministic, auditable decision.
+// @rationale Verified on agy 1.5.16: an unanswered permission request hangs the turn indefinitely and no
+// session/prompt response is ever produced. Selection is driven by the closed `kind` enum, never by
+// substrings of the agent-defined `optionId`, so a localised or randomised id cannot be misread.
+//
+// @preconditions req.Params must decode into RequestPermissionParams; the transport must be open.
+// @param req Incoming JSON-RPC request envelope.
+// @returns None.
+// @throws None; malformed payloads produce a `cancelled` outcome rather than silence.
+// @invariants Always emits exactly one response for req.ID; never blocks.
 func (t *Transport) handlePermissionRequest(req *Request) {
 	var params RequestPermissionParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		t.logger.Error("failed to unmarshal permission request", "error", err)
+		t.replyPermission(req.ID, PermissionOutcome{Outcome: "cancelled"}, "", "")
 		return
 	}
 
-	// Priority resolution: "allow_always" -> "allow_once" -> contains "allow" -> options[0]
-	var chosenOptionID string
-	for _, opt := range params.Options {
-		if opt.Kind == "allow_always" {
-			chosenOptionID = opt.OptionID
+	if !t.AutoApprovePermissions() {
+		t.logger.Info("permission request denied by policy",
+			"sessionID", params.SessionID, "toolCallId", params.ResolvedToolCallID())
+		t.replyPermission(req.ID, PermissionOutcome{Outcome: "cancelled"}, "", "")
+		if params.SessionID != "" {
+			_ = t.Notify("session/cancel", SessionCancelParams{SessionID: params.SessionID})
+		}
+		return
+	}
+
+	// Priority resolution over the closed kind enum: allow_always -> allow_once -> any "allow_*" kind.
+	// reject_once / reject_always are recognised and never selected.
+	var chosen *PermissionOption
+	for i := range params.Options {
+		if params.Options[i].Kind == "allow_always" {
+			chosen = &params.Options[i]
 			break
 		}
 	}
-	if chosenOptionID == "" {
-		for _, opt := range params.Options {
-			if opt.Kind == "allow_once" {
-				chosenOptionID = opt.OptionID
+	if chosen == nil {
+		for i := range params.Options {
+			if params.Options[i].Kind == "allow_once" {
+				chosen = &params.Options[i]
 				break
 			}
 		}
 	}
-	if chosenOptionID == "" {
-		for _, opt := range params.Options {
-			if strings.Contains(strings.ToLower(opt.OptionID), "allow") {
-				chosenOptionID = opt.OptionID
+	if chosen == nil {
+		for i := range params.Options {
+			if strings.HasPrefix(params.Options[i].Kind, "allow") {
+				chosen = &params.Options[i]
 				break
 			}
 		}
 	}
-	if chosenOptionID == "" && len(params.Options) > 0 {
-		chosenOptionID = params.Options[0].OptionID
+
+	if chosen == nil {
+		t.logger.Warn("permission request offered no allow option; cancelling",
+			"sessionID", params.SessionID,
+			"toolCallId", params.ResolvedToolCallID(),
+			"optionCount", len(params.Options))
+		t.replyPermission(req.ID, PermissionOutcome{Outcome: "cancelled"}, "", "")
+		return
 	}
 
-	outcome := PermissionOutcome{
-		Outcome:  "selected",
-		OptionID: chosenOptionID,
-	}
-	if chosenOptionID == "" {
-		outcome = PermissionOutcome{
-			Outcome: "cancelled",
-		}
-	}
+	t.logger.Info("auto-approved permission request",
+		"sessionID", params.SessionID,
+		"toolCallId", params.ResolvedToolCallID(),
+		"toolName", permissionToolName(&params),
+		"optionId", chosen.OptionID,
+		"kind", chosen.Kind)
+	t.replyPermission(req.ID, PermissionOutcome{Outcome: "selected", OptionID: chosen.OptionID}, chosen.OptionID, chosen.Kind)
+}
 
-	result := RequestPermissionResult{
-		Outcome: outcome,
+// permissionToolName extracts the tool name from whichever permission payload shape was received.
+func permissionToolName(p *RequestPermissionParams) string {
+	if p == nil || p.ToolCall == nil {
+		return ""
 	}
-	rawResult, _ := json.Marshal(result)
+	return p.ToolCall.Name
+}
 
-	resp := Response{
-		JSONRPC: JSONRPCVersion,
-		ID:      req.ID,
-		Result:  rawResult,
+// replyPermission writes the JSON-RPC response for a permission request.
+//
+// @purpose Single emission point so every path answers exactly once.
+// @rationale Prevents both silent stalls (no response) and double responses (protocol corruption).
+// @param reqID The JSON-RPC id being answered.
+// @param outcome The selected or cancelled outcome.
+// @returns None.
+// @invariants Never panics on marshal failure; logs and returns.
+func (t *Transport) replyPermission(reqID any, outcome PermissionOutcome, _, _ string) {
+	rawResult, err := json.Marshal(RequestPermissionResult{Outcome: outcome})
+	if err != nil {
+		t.logger.Error("failed to marshal permission response", "error", err)
+		return
 	}
-
-	t.logger.Info("auto-approved permission request", "toolCallId", params.ToolCallID, "optionId", chosenOptionID)
-	_ = t.send(resp)
+	resp := Response{JSONRPC: JSONRPCVersion, ID: reqID, Result: rawResult}
+	if err := t.send(resp); err != nil {
+		t.logger.Error("failed to send permission response", "error", err)
+	}
 }
 
 func (t *Transport) handleIncomingNotification(notif *Notification) {

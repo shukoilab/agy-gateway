@@ -19,13 +19,14 @@ import (
 
 // Worker represents a warm, isolated agy acp process instance.
 type Worker struct {
-	ID        int
-	HomeDir   string
-	TmpDir    string
-	Cwd       string
-	Account   *auth.Account
-	Process   *acp.Process
-	Transport *acp.Transport
+	ID           int
+	HomeDir      string
+	TmpDir       string
+	Cwd          string
+	Account      *auth.Account
+	Process      *acp.Process
+	Transport    *acp.Transport
+	Capabilities acp.AgentCapabilities
 
 	TaintedForRecycle atomic.Bool
 	RequestCount      atomic.Int64
@@ -65,7 +66,7 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	args := w.cfg.Binaries.AgyAcpArgs
 	if len(args) == 0 {
-		args = []string{"acp", "--dangerously-skip-permissions"}
+		args = []string{"acp"}
 	}
 
 	env := append(os.Environ(),
@@ -119,11 +120,26 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.Close()
 		return fmt.Errorf("acp initialize failed: %w", err)
 	}
+	w.Capabilities = acp.ParseAgentCapabilities(initResult)
 
-	// Warm-up pause to ensure ACP silent keyring authorization completes
-	time.Sleep(500 * time.Millisecond)
+	// Reject an agent that negotiated a protocol generation we do not speak. Running on an
+	// unknown protocol silently corrupts every downstream field mapping, so it is fatal here
+	// and the caller recycles the worker.
+	if v := w.Capabilities.ProtocolVersion; v != 0 && v != acp.SupportedProtocolVersion {
+		w.Close()
+		return fmt.Errorf("unsupported acp protocol version %d (gateway speaks %d)", v, acp.SupportedProtocolVersion)
+	}
+	w.Transport.SetAutoApprovePermissions(w.cfg.Execution.AutoApprovePermissions)
 
-	w.logger.Info("warm worker process started successfully", "pid", proc.PID())
+	w.logger.Info("warm worker process started successfully",
+		"pid", proc.PID(),
+		"protocolVersion", w.Capabilities.ProtocolVersion,
+		"capAppend", w.Capabilities.SupportsSystemPromptAppend,
+		"capOverride", w.Capabilities.SupportsSystemPromptOveride,
+		"capVendorPrompt", w.Capabilities.SupportsVendorSystemPrompt,
+		"capAddDirs", w.Capabilities.SupportsAdditionalDirs,
+		"capClose", w.Capabilities.SupportsSessionClose,
+	)
 	return nil
 }
 
@@ -137,15 +153,18 @@ func (w *Worker) CleanWorkspace() {
 	if !w.cfg.Execution.CleanWorkspaceBetweenRequests {
 		return
 	}
-	// 1. Purge transient workspace working directory files
-	entries, err := os.ReadDir(w.Cwd)
-	if err == nil {
+	// 1. Purge transient workspace working directory files, but only after proving the root is a
+	// disposable scratch directory. A misconfigured root must never destroy user data.
+	if err := validateWorkspaceRoot(w.cfg.Storage.WorkspacesRootDir, w.Cwd); err != nil {
+		w.logger.Error("refusing to clean workspace: guard rejected the path", "cwd", w.Cwd, "err", err)
+	} else if entries, err := os.ReadDir(w.Cwd); err == nil {
 		for _, entry := range entries {
-			name := entry.Name()
-			if name == ".git" {
+			if entry.Name() == ".git" {
 				continue
 			}
-			_ = os.RemoveAll(filepath.Join(w.Cwd, name))
+			if err := safeRemoveEntry(w.Cwd, entry.Name()); err != nil {
+				w.logger.Warn("failed to remove workspace entry", "entry", entry.Name(), "err", err)
+			}
 		}
 	}
 

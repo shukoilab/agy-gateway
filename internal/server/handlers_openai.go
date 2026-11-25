@@ -7,10 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -102,6 +100,23 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	// FR-07: agy advertises image support but the model rejects every image with INVALID_ARGUMENT.
+	if where := openAIVisionRequest(&req); where != "" && visionModeRejects(h.cfg) {
+		h.writeOpenAIError(w, http.StatusBadRequest,
+			fmt.Sprintf("Image content is not supported by the upstream agent (%s). Send a textual description instead, or set execution.vision_mode=flatten to degrade silently.", where),
+			"invalid_request_error", "image_not_supported", "messages")
+		return
+	}
+
+	// FR-14: report or reject fields the agent cannot honour instead of dropping them silently.
+	if _, err := applyUnsupportedParamPolicy(suppliedOpenAIUnsupportedParams(&req), h.cfg.OpenAI.UnsupportedParamPolicy, w); err != nil {
+		field, _ := IsUnsupportedParam(err)
+		h.writeOpenAIError(w, http.StatusBadRequest,
+			fmt.Sprintf("The parameter %q is not supported by the upstream agent", field),
+			"invalid_request_error", "unsupported_parameter", field)
+		return
+	}
+
 	// 1. Translate prompt and deduplicate JIT tools into ACP prompt blocks
 	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
 	if delimiter == "" {
@@ -146,379 +161,90 @@ func (h *OpenAIHandlers) handleSync(
 	completionID string,
 	createdTime int64,
 ) {
-	var fullText strings.Builder
-	var fullThoughts strings.Builder
-	var turnMu sync.Mutex
-
-	ttftDuration := h.cfg.Pool.FirstTokenTimeout
-	if ttftDuration <= 0 {
-		ttftDuration = 120 * time.Second
+	in := turnInput{
+		Ctx:           r.Context(),
+		ModelEntry:    modelEntry,
+		ThoughtLevel:  thoughtLevel,
+		SystemPrompt:  systemPrompt,
+		PromptBlocks:  promptBlocks,
+		StopSequences: normalizeStopSequences(req.Stop),
 	}
-	var ttftTimedOut atomic.Bool
+
+	if len(req.Tools) > 0 {
+		loopbackSessionID := newLoopbackSessionID()
+		state, err := h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
+		if err != nil {
+			h.writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "too_many_tools", "tools")
+			return
+		}
+		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+		in.LoopbackSessionID = loopbackSessionID
+		in.LoopbackToken = state.Token
+		in.LoopbackState = state
+		in.ClientToolNames = extractOpenAIToolNames(req.Tools)
+	}
 
 	maxRetries := h.cfg.Execution.MaxRetries
 	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
-	var interceptedTools []openai.ToolCall
-	var actualPromptTokens atomic.Int64
+	var outcome turnResult
 	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
-		turnMu.Lock()
-		fullText.Reset()
-		fullThoughts.Reset()
-		interceptedTools = nil
-		turnMu.Unlock()
-
-		// A. Call session/new (pure editor cwd boundary, 100% compliant with standard ACP)
-		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
-		defer cancelSess()
-
-		newParams := acp.SessionNewParams{
-			CWD: worker.Cwd,
+		res, err := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
+		if err != nil {
+			return err
 		}
-		var loopbackSessionID string
-		var loopbackState *mcp.SessionState
-		if len(req.Tools) > 0 {
-			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-			loopbackState = h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
-			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-
-			execPath, err := os.Executable()
-			if err != nil || execPath == "" {
-				execPath = "agy-gateway"
-			}
-			newParams.MCPServers = []acp.MCPServerInfo{
-				{
-					Name:    "client-tools",
-					Command: execPath,
-					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
-				},
-			}
-		}
-		effectiveSystemPrompt := systemPrompt
-		if effectiveSystemPrompt == "" {
-			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-		}
-		systemPromptMode := "override"
-		newParams.SystemPrompt = &acp.SystemPrompt{
-			Mode: systemPromptMode,
-			Content: []acp.PromptBlock{
-				{
-					Type: "text",
-					Text: effectiveSystemPrompt,
-				},
-			},
-		}
-		newParams.Meta = map[string]any{
-			"antigravity": map[string]any{
-				"systemPrompt": map[string]any{
-					systemPromptMode: effectiveSystemPrompt,
-				},
-			},
-		}
-		var newResult acp.SessionNewResult
-		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
-			var respErr *acp.ResponseError
-			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
-				time.Sleep(1 * time.Second)
-				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
-			}
-			if err != nil {
-				return err
-			}
-		}
-
-		defer func() {
-			if newResult.SessionID != "" {
-				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancelClose()
-				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
-					SessionID: newResult.SessionID,
-				}, nil)
-			}
-		}()
-
-		// B. Apply session config options
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDMode,
-			Value:     h.cfg.Execution.AcpSessionMode,
-		}, nil)
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDModel,
-			Value:     modelEntry.UpstreamModel,
-		}, nil)
-		if thoughtLevel != "" {
-			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-				SessionID: newResult.SessionID,
-				ConfigID:  acp.ConfigIDThoughtLevel,
-				Value:     thoughtLevel,
-			}, nil)
-		}
-
-		// TTFT Watchdog initialization for this attempt
-		var ttftDisarmed atomic.Bool
-		ttftTimer := time.NewTimer(ttftDuration)
-		defer ttftTimer.Stop()
-
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
-		go func() {
-			select {
-			case <-promptCtx.Done():
-			case <-ttftTimer.C:
-				if !ttftDisarmed.Load() {
-					ttftTimedOut.Store(true)
-					h.logger.Warn("time-to-first-token watchdog triggered", "timeout", ttftDuration)
-					cancelPrompt()
-				}
-			}
-		}()
-
-		// C. Register listener for turn updates with early stop-sequence detection
-		delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-		if delimiter == "" {
-			delimiter = "tool_call"
-		}
-		streamParser := openai.NewStreamParser(delimiter)
-		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
-			if !ttftDisarmed.Load() {
-				ttftDisarmed.Store(true)
-				ttftTimer.Stop()
-			}
-			turnMu.Lock()
-			defer turnMu.Unlock()
-
-			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				if streamParser.IsTerminated() {
-					cancelPrompt()
-					return
-				}
-				textChunk := update.Update.Content.Text
-				_, _ = streamParser.ParseChunk(textChunk)
-				fullText.WriteString(textChunk)
-				if streamParser.IsTerminated() {
-					h.logger.Debug("openai non-streaming turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
-					cancelPrompt()
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
-				fullThoughts.WriteString(update.Update.Content.Text)
-			} else if update.Update.SessionUpdate == acp.UpdateUsage {
-				if update.Update.Used != nil && *update.Update.Used > 0 {
-					actualPromptTokens.Store(*update.Update.Used)
-				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
-					actualPromptTokens.Store(update.Update.Usage.Used)
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
-				if loopbackState == nil {
-					return
-				}
-				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
-				if !matched {
-					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
-					return
-				}
-				if len(interceptedTools) > 0 {
-					return
-				}
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-				callID := update.Update.ToolCallID
-				if callID == "" {
-					callID = fmt.Sprintf("call_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-				}
-				args := string(update.Update.RawInput)
-				if args == "" || args == "null" {
-					args = "{}"
-				}
-
-				already := false
-				for _, tc := range interceptedTools {
-					if tc.ID == callID || tc.Function.Name == normalizedName {
-						already = true
-						break
-					}
-				}
-				if !already {
-					interceptedTools = append(interceptedTools, openai.ToolCall{
-						ID:   callID,
-						Type: "function",
-						Function: openai.FunctionCallData{
-							Name:      normalizedName,
-							Arguments: args,
-						},
-					})
-				}
-
-				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-					SessionID: newResult.SessionID,
-				})
-				time.AfterFunc(2500*time.Millisecond, func() {
-					cancelPrompt()
-				})
-				return
-			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-			}
-		})
-		defer worker.Transport.SetUpdateListener(nil)
-
-		if loopbackState != nil {
-			go func() {
-				select {
-				case call, ok := <-loopbackState.Calls:
-					if !ok {
-						return
-					}
-					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
-					if !matched {
-						return
-					}
-					turnMu.Lock()
-					already := false
-					for _, tc := range interceptedTools {
-						if tc.ID == call.ID || tc.Function.Name == normalizedName {
-							already = true
-							break
-						}
-					}
-					if !already {
-						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-						interceptedTools = append(interceptedTools, openai.ToolCall{
-							ID:   call.ID,
-							Type: "function",
-							Function: openai.FunctionCallData{
-								Name:      normalizedName,
-								Arguments: string(call.Arguments),
-							},
-						})
-					}
-					turnMu.Unlock()
-
-					_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-						SessionID: newResult.SessionID,
-					})
-					time.AfterFunc(2500*time.Millisecond, func() {
-						cancelPrompt()
-					})
-				case <-promptCtx.Done():
-					return
-				}
-			}()
-		}
-
-		// D. Send session/prompt turn
-		var promptResult acp.PromptResult
-		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
-			SessionID: newResult.SessionID,
-			Prompt:    promptBlocks,
-		}, &promptResult); err != nil {
-			if (streamParser.IsTerminated() || len(interceptedTools) > 0) && errors.Is(err, context.Canceled) {
-				// Turn was gracefully aborted via session/cancel or watchdog
-				err = nil
-			} else {
-				return err
-			}
-		}
-
-		if len(interceptedTools) > 0 {
-			h.logger.Debug("openai non-streaming turn completed: tool call intercepted", "workerId", worker.ID, "toolCount", len(interceptedTools))
-		} else if streamParser.IsTerminated() {
-			h.logger.Debug("openai non-streaming turn completed: early stop sequence detected", "workerId", worker.ID)
-		}
-
+		outcome = res
 		return nil
 	})
 
 	if err != nil {
-		if ttftTimedOut.Load() {
-			h.writeOpenAIError(w, http.StatusGatewayTimeout, fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttftDuration), "api_error", "first_token_timeout", "")
-			return
-		}
-		var respErr *acp.ResponseError
-		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
-			strings.Contains(err.Error(), "Authentication required") ||
-			strings.Contains(err.Error(), "transport is closed") {
-			h.writeOpenAIError(w, http.StatusServiceUnavailable, "No authenticated Antigravity accounts available. Please login an account via admin endpoint POST /admin/v1/accounts/login/init", "invalid_request_error", "account_auth_required", "")
-			return
-		}
-		h.writeOpenAIError(w, http.StatusInternalServerError, "Inference error: "+err.Error(), "api_error", "inference_error", "")
+		h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
 		return
 	}
 
-	// 3. Parse text and JIT consumer tool calls
-	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
-	cleanContent, toolCalls, hasTools := openai.ParseCompleteResponse(fullText.String(), delimiter)
-
-	var finalTools []openai.ToolCall
-	if len(interceptedTools) > 0 {
-		finalTools = interceptedTools
-	} else if hasTools {
-		finalTools = toolCalls
-	}
+	_, toolCalls := assembleOpenAITools(outcome)
 
 	finishReason := "stop"
-	var message openai.ChatMessage
-	if len(finalTools) > 0 {
+	if len(toolCalls) > 0 {
 		finishReason = "tool_calls"
-		var contentVal any
-		if cleanContent != "" {
-			contentVal = cleanContent
-		}
-		message = openai.ChatMessage{
-			Role:      "assistant",
-			Content:   contentVal,
-			ToolCalls: finalTools,
+	} else if outcome.StopMatched {
+		finishReason = "stop"
+	} else if openAI, _ := MapStopReason(outcome.StopReason); openAI != "" {
+		finishReason = openAI
+	}
+
+	var message openai.ChatMessage
+	if len(toolCalls) > 0 {
+		message = openai.ChatMessage{Role: "assistant", ToolCalls: toolCalls}
+		if strings.TrimSpace(outcome.Text) != "" {
+			message.Content = outcome.Text
 		}
 	} else {
-		if cleanContent == "" {
-			cleanContent = "I have completed the analysis."
+		text := outcome.Text
+		if strings.TrimSpace(text) == "" {
+			text = "I have completed the analysis."
 		}
-		message = openai.ChatMessage{
-			Role:    "assistant",
-			Content: cleanContent,
-		}
+		message = openai.ChatMessage{Role: "assistant", Content: text}
+	}
+	if h.cfg.OpenAI.ExposeReasoningContent && outcome.Thoughts != "" {
+		message.ReasoningContent = outcome.Thoughts
 	}
 
-	if h.cfg.OpenAI.ExposeReasoningContent && fullThoughts.Len() > 0 {
-		message.ReasoningContent = fullThoughts.String()
-	}
-
-	promptTokens := openai.CountTokens(promptBlocks[0].Text)
-	if actual := actualPromptTokens.Load(); actual > 0 {
-		promptTokens = int(actual)
-	}
-	compTokens := openai.CountTokens(cleanContent)
-	reasoningTokens := openai.CountTokens(fullThoughts.String())
+	usage := buildOpenAIUsage(h.cfg, outcome, promptBlocks)
 
 	resp := openai.ChatCompletionResponse{
 		ID:      completionID,
 		Object:  "chat.completion",
 		Created: createdTime,
 		Model:   req.Model,
-		Choices: []openai.ChatCompletionChoice{
-			{
-				Index:        0,
-				Message:      message,
-				FinishReason: finishReason,
-			},
-		},
-		Usage: openai.UsageDetails{
-			PromptTokens:     promptTokens,
-			CompletionTokens: compTokens + reasoningTokens,
-			TotalTokens:      promptTokens + compTokens + reasoningTokens,
-			PromptTokensDetails: &openai.PromptTokensDetails{
-				CachedTokens: 0,
-			},
-			CompletionTokensDetails: &openai.CompletionTokensDetails{
-				ReasoningTokens: reasoningTokens,
-			},
-		},
+		Choices: []openai.ChatCompletionChoice{{
+			Index:        0,
+			Message:      message,
+			FinishReason: finishReason,
+		}},
+		Usage: usage,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -540,29 +266,17 @@ func (h *OpenAIHandlers) handleStreaming(
 
 	sseWriter, err := openai.NewSSEWriter(w)
 	if err != nil {
-		h.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported: "+err.Error(), "api_error", "streaming_error", "")
+		h.writeOpenAIError(w, http.StatusInternalServerError, "Streaming initialization failed: "+err.Error(), "api_error", "stream_init_failed", "")
 		return
 	}
 
-	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
-	if delimiter == "" {
-		delimiter = "tool_call"
-	}
-	streamParser := openai.NewStreamParser(delimiter)
-	firstChunkSent := false
-	hasToolCalls := false
-
-	var totalText strings.Builder
-	var totalThoughts strings.Builder
-
-	// Start keepalive ticker
+	// Keepalive ticker: stopped when the client disconnects.
 	keepaliveInterval := h.cfg.Server.SSEKeepaliveInterval
 	if keepaliveInterval <= 0 {
 		keepaliveInterval = 15 * time.Second
 	}
 	keepaliveTicker := time.NewTicker(keepaliveInterval)
 	defer keepaliveTicker.Stop()
-
 	go func() {
 		for {
 			select {
@@ -574,500 +288,345 @@ func (h *OpenAIHandlers) handleStreaming(
 		}
 	}()
 
-	ttftDuration := h.cfg.Pool.FirstTokenTimeout
-	if ttftDuration <= 0 {
-		ttftDuration = 120 * time.Second
+	// Single writer: every SSE emission takes streamMu so provider event ordering is guaranteed.
+	var streamMu sync.Mutex
+	firstChunkSent := false
+	emitDelta := func(delta openai.ChatCompletionChunkDelta, finish *string) {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		if delta.Content == nil && delta.ReasoningContent == nil && len(delta.ToolCalls) == 0 && finish == nil {
+			return
+		}
+		if !firstChunkSent {
+			delta.Role = "assistant"
+			firstChunkSent = true
+		}
+		chunk := openai.ChatCompletionChunk{
+			ID:      completionID,
+			Object:  "chat.completion.chunk",
+			Created: createdTime,
+			Model:   req.Model,
+			Choices: []openai.ChatCompletionChunkChoice{{
+				Index:        0,
+				Delta:        delta,
+				FinishReason: finish,
+			}},
+		}
+		_ = sseWriter.WriteChunk(&chunk)
 	}
-	var ttftTimedOut atomic.Bool
+
+	in := turnInput{
+		Ctx:           r.Context(),
+		ModelEntry:    modelEntry,
+		ThoughtLevel:  thoughtLevel,
+		SystemPrompt:  systemPrompt,
+		PromptBlocks:  promptBlocks,
+		StopSequences: normalizeStopSequences(req.Stop),
+	}
+
+	if len(req.Tools) > 0 {
+		loopbackSessionID := newLoopbackSessionID()
+		state, regErr := h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
+		if regErr != nil {
+			h.writeOpenAIError(w, http.StatusBadRequest, regErr.Error(), "invalid_request_error", "too_many_tools", "tools")
+			return
+		}
+		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
+		in.LoopbackSessionID = loopbackSessionID
+		in.LoopbackToken = state.Token
+		in.LoopbackState = state
+		in.ClientToolNames = extractOpenAIToolNames(req.Tools)
+	}
+
+	in.OnText = func(chunk string) {
+		emitDelta(openai.ChatCompletionChunkDelta{Content: &chunk}, nil)
+	}
+	in.OnThought = func(chunk string) {
+		if !h.cfg.OpenAI.ExposeReasoningContent {
+			return
+		}
+		emitDelta(openai.ChatCompletionChunkDelta{ReasoningContent: &chunk}, nil)
+	}
+	in.OnTool = func(entry toolCollectorEntry) {
+		idx := 0
+		emitDelta(openai.ChatCompletionChunkDelta{ToolCalls: []openai.ToolCall{{
+			Index: &idx,
+			ID:    entry.ID,
+			Type:  "function",
+			Function: openai.FunctionCallData{
+				Name:      entry.Name,
+				Arguments: string(entry.Arguments),
+			},
+		}}}, nil)
+	}
+	in.OnInternalToolProgress = func(text string) {
+		if !h.cfg.OpenAI.ExposeReasoningContent {
+			return
+		}
+		emitDelta(openai.ChatCompletionChunkDelta{ReasoningContent: &text}, nil)
+	}
 
 	maxRetries := h.cfg.Execution.MaxRetries
 	if maxRetries <= 0 && h.cfg.Accounts.MaxFailoverRetries > 0 {
 		maxRetries = h.cfg.Accounts.MaxFailoverRetries
 	}
 
-	var actualPromptTokens atomic.Int64
+	var outcome turnResult
+	firstChunkSentPtr := func() bool {
+		streamMu.Lock()
+		defer streamMu.Unlock()
+		return firstChunkSent
+	}
+
 	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
-		turnStartTime := time.Now()
-		totalText.Reset()
-		totalThoughts.Reset()
-		streamParser = openai.NewStreamParser(delimiter)
-		firstChunkSent = false
-		hasToolCalls = false
-
-		sessCtx, cancelSess := context.WithTimeout(ctx, h.cfg.Pool.HandshakeTimeout)
-		defer cancelSess()
-
-		newParams := acp.SessionNewParams{
-			CWD: worker.Cwd,
+		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
+		outcome = res
+		if attemptErr != nil {
+			if firstChunkSentPtr() {
+				// Tokens are already on the wire; a retry would duplicate them.
+				return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, attemptErr)
+			}
+			return attemptErr
 		}
-		var loopbackSessionID string
-		var loopbackState *mcp.SessionState
-		if len(req.Tools) > 0 {
-			loopbackSessionID = fmt.Sprintf("sess_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-			loopbackState = h.loopbackServer.RegisterSession(loopbackSessionID, req.Tools)
-			defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-
-			execPath, err := os.Executable()
-			if err != nil || execPath == "" {
-				execPath = "agy-gateway"
-			}
-			newParams.MCPServers = []acp.MCPServerInfo{
-				{
-					Name:    "client-tools",
-					Command: execPath,
-					Args:    []string{"mcp-bridge", "--session-id", loopbackSessionID, "--port", fmt.Sprintf("%d", h.cfg.Server.Port)},
-				},
-			}
-		}
-		effectiveSystemPrompt := systemPrompt
-		if effectiveSystemPrompt == "" {
-			effectiveSystemPrompt = acp.DefaultExecutionProtocol
-		}
-		systemPromptMode := "override"
-		newParams.SystemPrompt = &acp.SystemPrompt{
-			Mode: systemPromptMode,
-			Content: []acp.PromptBlock{
-				{
-					Type: "text",
-					Text: effectiveSystemPrompt,
-				},
-			},
-		}
-		newParams.Meta = map[string]any{
-			"antigravity": map[string]any{
-				"systemPrompt": map[string]any{
-					systemPromptMode: effectiveSystemPrompt,
-				},
-			},
-		}
-		var newResult acp.SessionNewResult
-		if err := worker.Transport.Call(sessCtx, "session/new", newParams, &newResult); err != nil {
-			var respErr *acp.ResponseError
-			if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
-				time.Sleep(1 * time.Second)
-				err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
-			}
-			if err != nil {
-				return err
-			}
-		}
-
-		defer func() {
-			if newResult.SessionID != "" {
-				closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
-				defer cancelClose()
-				_ = worker.Transport.Call(closeCtx, "session/close", acp.SessionCloseParams{
-					SessionID: newResult.SessionID,
-				}, nil)
-			}
-		}()
-
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDMode,
-			Value:     h.cfg.Execution.AcpSessionMode,
-		}, nil)
-		_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-			SessionID: newResult.SessionID,
-			ConfigID:  acp.ConfigIDModel,
-			Value:     modelEntry.UpstreamModel,
-		}, nil)
-		if thoughtLevel != "" {
-			_ = worker.Transport.Call(sessCtx, "session/set_config_option", acp.SetConfigOptionParams{
-				SessionID: newResult.SessionID,
-				ConfigID:  acp.ConfigIDThoughtLevel,
-				Value:     thoughtLevel,
-			}, nil)
-		}
-
-		// TTFT Watchdog initialization for this streaming attempt
-		var ttftDisarmed atomic.Bool
-		ttftTimer := time.NewTimer(ttftDuration)
-		defer ttftTimer.Stop()
-
-		promptCtx, cancelPrompt := context.WithTimeout(ctx, h.cfg.Pool.InferenceTimeout)
-		defer cancelPrompt()
-
-		go func() {
-			select {
-			case <-promptCtx.Done():
-			case <-ttftTimer.C:
-				if !ttftDisarmed.Load() {
-					ttftTimedOut.Store(true)
-					h.logger.Warn("streaming time-to-first-token watchdog triggered", "timeout", ttftDuration)
-					cancelPrompt()
-				}
-			}
-		}()
-
-		worker.Transport.SetUpdateListener(func(update acp.SessionUpdateParams) {
-			if !ttftDisarmed.Load() {
-				ttftDisarmed.Store(true)
-				ttftTimer.Stop()
-				h.logger.Debug("openai stream first token received", "workerId", worker.ID, "ttft", time.Since(turnStartTime))
-			}
-			if update.Update.SessionUpdate == acp.UpdateAgentMessageChunk && update.Update.Content != nil {
-				if streamParser.IsTerminated() {
-					cancelPrompt()
-					return
-				}
-				textChunk := update.Update.Content.Text
-				textDelta, toolCalls := streamParser.ParseChunk(textChunk)
-				if streamParser.IsTerminated() {
-					h.logger.Debug("openai stream turn detected early stop sequence, unblocking prompt immediately", "workerId", worker.ID)
-					cancelPrompt()
-				}
-				if textDelta != "" {
-					totalText.WriteString(textDelta)
-				}
-
-				if len(toolCalls) > 0 {
-					hasToolCalls = true
-					for _, tc := range toolCalls {
-						h.logger.Debug("openai stream tool call parsed", "workerId", worker.ID, "toolCallId", tc.ID, "name", tc.Function.Name)
-					}
-				}
-
-				if textDelta != "" || len(toolCalls) > 0 {
-					var delta openai.ChatCompletionChunkDelta
-					if !firstChunkSent {
-						delta.Role = "assistant"
-						firstChunkSent = true
-					}
-					if textDelta != "" {
-						delta.Content = &textDelta
-					}
-					if len(toolCalls) > 0 {
-						delta.ToolCalls = toolCalls
-					}
-
-					chunk := openai.ChatCompletionChunk{
-						ID:      completionID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   req.Model,
-						Choices: []openai.ChatCompletionChunkChoice{
-							{
-								Index: 0,
-								Delta: delta,
-							},
-						},
-					}
-					_ = sseWriter.WriteChunk(&chunk)
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateAgentThoughtChunk && update.Update.Content != nil {
-				thoughtChunk := update.Update.Content.Text
-				totalThoughts.WriteString(thoughtChunk)
-
-				if h.cfg.OpenAI.ExposeReasoningContent {
-					chunk := openai.ChatCompletionChunk{
-						ID:      completionID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   req.Model,
-						Choices: []openai.ChatCompletionChunkChoice{
-							{
-								Index: 0,
-								Delta: openai.ChatCompletionChunkDelta{
-									ReasoningContent: &thoughtChunk,
-								},
-							},
-						},
-					}
-					_ = sseWriter.WriteChunk(&chunk)
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateUsage {
-				if update.Update.Used != nil && *update.Update.Used > 0 {
-					actualPromptTokens.Store(*update.Update.Used)
-				} else if update.Update.Usage != nil && update.Update.Usage.Used > 0 {
-					actualPromptTokens.Store(update.Update.Usage.Used)
-				}
-			} else if update.Update.SessionUpdate == acp.UpdateToolCall {
-				if loopbackState == nil {
-					return
-				}
-				normalizedName, matched := loopbackState.MatchAndNormalizeToolName(update.Update.Name)
-				if !matched {
-					// Internal agent tool (e.g. update_steps, update_focus) - do not intercept or cancel
-					return
-				}
-				if hasToolCalls {
-					return
-				}
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-				callID := update.Update.ToolCallID
-				if callID == "" {
-					callID = fmt.Sprintf("call_%s", strings.ReplaceAll(uuid.New().String()[:12], "-", ""))
-				}
-				args := string(update.Update.RawInput)
-				if args == "" || args == "null" {
-					args = "{}"
-				}
-
-				hasToolCalls = true
-				toolIdx := 0
-				tc := openai.ToolCall{
-					Index: &toolIdx,
-					ID:    callID,
-					Type:  "function",
-					Function: openai.FunctionCallData{
-						Name:      normalizedName,
-						Arguments: args,
-					},
-				}
-
-				var delta openai.ChatCompletionChunkDelta
-				if !firstChunkSent {
-					delta.Role = "assistant"
-					firstChunkSent = true
-				}
-				delta.ToolCalls = []openai.ToolCall{tc}
-
-				chunk := openai.ChatCompletionChunk{
-					ID:      completionID,
-					Object:  "chat.completion.chunk",
-					Created: createdTime,
-					Model:   req.Model,
-					Choices: []openai.ChatCompletionChunkChoice{
-						{
-							Index: 0,
-							Delta: delta,
-						},
-					},
-				}
-				_ = sseWriter.WriteChunk(&chunk)
-
-				_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-					SessionID: newResult.SessionID,
-				})
-				time.AfterFunc(2500*time.Millisecond, func() {
-					cancelPrompt()
-				})
-				return
-			} else if update.Update.SessionUpdate == acp.UpdateToolCallUpdate {
-				telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-			}
-		})
-		defer worker.Transport.SetUpdateListener(nil)
-
-		if loopbackState != nil {
-			go func() {
-				select {
-				case call, ok := <-loopbackState.Calls:
-					if !ok {
-						return
-					}
-					normalizedName, matched := loopbackState.MatchAndNormalizeToolName(call.Name)
-					if !matched {
-						return
-					}
-					if !hasToolCalls {
-						telemetry.DefaultMetrics.ToolCallsTotal.Add(1)
-						hasToolCalls = true
-						toolIdx := 0
-						tc := openai.ToolCall{
-							Index: &toolIdx,
-							ID:    call.ID,
-							Type:  "function",
-							Function: openai.FunctionCallData{
-								Name:      normalizedName,
-								Arguments: string(call.Arguments),
-							},
-						}
-
-						var delta openai.ChatCompletionChunkDelta
-						if !firstChunkSent {
-							delta.Role = "assistant"
-							firstChunkSent = true
-						}
-						delta.ToolCalls = []openai.ToolCall{tc}
-
-						chunk := openai.ChatCompletionChunk{
-							ID:      completionID,
-							Object:  "chat.completion.chunk",
-							Created: createdTime,
-							Model:   req.Model,
-							Choices: []openai.ChatCompletionChunkChoice{
-								{
-									Index: 0,
-									Delta: delta,
-								},
-							},
-						}
-						_ = sseWriter.WriteChunk(&chunk)
-
-						_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{
-							SessionID: newResult.SessionID,
-						})
-						time.AfterFunc(2500*time.Millisecond, func() {
-							cancelPrompt()
-						})
-					}
-				case <-promptCtx.Done():
-					return
-				}
-			}()
-		}
-
-		var promptResult acp.PromptResult
-		if err := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
-			SessionID: newResult.SessionID,
-			Prompt:    promptBlocks,
-		}, &promptResult); err != nil {
-			if (streamParser.IsTerminated() || hasToolCalls) && errors.Is(err, context.Canceled) {
-				// Turn was gracefully aborted via session/cancel or watchdog
-				err = nil
-			} else {
-				if firstChunkSent {
-					return fmt.Errorf("%w: %v", pool.ErrNonRetryableStream, err)
-				}
-				return err
-			}
-		}
-
-		if hasToolCalls {
-			h.logger.Debug("openai stream turn completed: tool call intercepted", "workerId", worker.ID)
-		} else if streamParser.IsTerminated() {
-			h.logger.Debug("openai stream turn completed: early stop sequence detected", "workerId", worker.ID)
-		}
-
-		// Flush any remaining buffered tokens or unclosed tool tags from stream parser
-		flushDelta, flushTools := streamParser.Flush()
-		if len(flushTools) > 0 {
-			hasToolCalls = true
-		}
-		if flushDelta != "" || len(flushTools) > 0 {
-			var delta openai.ChatCompletionChunkDelta
-			if !firstChunkSent {
-				delta.Role = "assistant"
-				firstChunkSent = true
-			}
-			if flushDelta != "" {
-				delta.Content = &flushDelta
-			}
-			if len(flushTools) > 0 {
-				delta.ToolCalls = flushTools
-			}
-			chunk := openai.ChatCompletionChunk{
-				ID:      completionID,
-				Object:  "chat.completion.chunk",
-				Created: createdTime,
-				Model:   req.Model,
-				Choices: []openai.ChatCompletionChunkChoice{
-					{
-						Index: 0,
-						Delta: delta,
-					},
-				},
-			}
-			_ = sseWriter.WriteChunk(&chunk)
-		}
-
 		return nil
 	})
 
 	if err != nil {
-		h.logger.Error("streaming turn failed", "err", err)
-		if ttftTimedOut.Load() {
-			_ = sseWriter.WriteError(fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttftDuration), "first_token_timeout")
+		if _, ok := IsUnsupportedParam(err); ok {
+			h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
 			return
 		}
-		var respErr *acp.ResponseError
-		if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
-			strings.Contains(err.Error(), "Authentication required") ||
-			strings.Contains(err.Error(), "transport is closed") {
-			_ = sseWriter.WriteError("No authenticated Antigravity accounts available. Please login an account via admin endpoint POST /admin/v1/accounts/login/init", "account_auth_required")
+		if !firstChunkSentPtr() {
+			h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
 			return
 		}
-		_ = sseWriter.WriteError("Inference error: "+err.Error(), "api_error")
+		// The 200 has already been sent, so the failure goes out in-band. Only the class is exposed:
+		// the full error is logged with the request id (FR-18).
+		kind := ClientErrorKind(err)
+		h.logger.Error("openai stream failed after first chunk",
+			"requestID", requestIDFromContext(r), "class", kind, "err", err)
+		_ = sseWriter.WriteError(ClientErrorMessage(kind), kind)
+		_ = sseWriter.Close()
 		return
 	}
 
-	// Double check tool presence across full collected text
-	if !hasToolCalls {
-		_, parsedTools, hasTools := openai.ParseCompleteResponse(totalText.String(), delimiter)
-		if hasTools || len(parsedTools) > 0 {
-			hasToolCalls = true
-		}
-	}
+	_, toolCalls := assembleOpenAITools(outcome)
+	_ = toolCalls
 
-	// Guard against empty assistant response (e.g. only thoughts produced, or tool call dropped)
-	if !hasToolCalls && totalText.Len() == 0 {
-		fallbackText := "I have completed the analysis."
-		totalText.WriteString(fallbackText)
-		var delta openai.ChatCompletionChunkDelta
-		if !firstChunkSent {
-			delta.Role = "assistant"
-			firstChunkSent = true
-		}
-		delta.Content = &fallbackText
-		chunk := openai.ChatCompletionChunk{
-			ID:      completionID,
-			Object:  "chat.completion.chunk",
-			Created: createdTime,
-			Model:   req.Model,
-			Choices: []openai.ChatCompletionChunkChoice{
-				{
-					Index: 0,
-					Delta: delta,
-				},
-			},
-		}
-		_ = sseWriter.WriteChunk(&chunk)
-	}
-
-	// Emit finish reason chunk
 	finishReason := "stop"
-	if hasToolCalls {
+	if len(outcome.Tools) > 0 {
 		finishReason = "tool_calls"
+	} else if outcome.StopMatched {
+		finishReason = "stop"
+	} else if mapped, _ := MapStopReason(outcome.StopReason); mapped != "" {
+		finishReason = mapped
 	}
 
-	finishChunk := openai.ChatCompletionChunk{
-		ID:      completionID,
-		Object:  "chat.completion.chunk",
-		Created: createdTime,
-		Model:   req.Model,
-		Choices: []openai.ChatCompletionChunkChoice{
-			{
-				Index:        0,
-				Delta:        openai.ChatCompletionChunkDelta{},
-				FinishReason: &finishReason,
-			},
-		},
+	if strings.TrimSpace(outcome.Text) == "" && len(outcome.Tools) == 0 {
+		fallback := "I have completed the analysis."
+		emitDelta(openai.ChatCompletionChunkDelta{Content: &fallback}, nil)
 	}
-	_ = sseWriter.WriteChunk(&finishChunk)
 
-	// Emit usage chunk if requested
-	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-		promptTokens := openai.CountTokens(promptBlocks[0].Text)
-		if actual := actualPromptTokens.Load(); actual > 0 {
-			promptTokens = int(actual)
-		}
-		compTokens := openai.CountTokens(totalText.String())
-		reasoningTokens := openai.CountTokens(totalThoughts.String())
+	emitDelta(openai.ChatCompletionChunkDelta{}, &finishReason)
 
+	if includeUsageChunk(req) {
+		usage := buildOpenAIUsage(h.cfg, outcome, promptBlocks)
+		streamMu.Lock()
 		usageChunk := openai.ChatCompletionChunk{
 			ID:      completionID,
 			Object:  "chat.completion.chunk",
 			Created: createdTime,
 			Model:   req.Model,
 			Choices: []openai.ChatCompletionChunkChoice{},
-			Usage: &openai.UsageDetails{
-				PromptTokens:     promptTokens,
-				CompletionTokens: compTokens + reasoningTokens,
-				TotalTokens:      promptTokens + compTokens + reasoningTokens,
-				PromptTokensDetails: &openai.PromptTokensDetails{
-					CachedTokens: 0,
-				},
-				CompletionTokensDetails: &openai.CompletionTokensDetails{
-					ReasoningTokens: reasoningTokens,
-				},
-			},
+			Usage:   &usage,
 		}
 		_ = sseWriter.WriteChunk(&usageChunk)
+		streamMu.Unlock()
 	}
 
 	_ = sseWriter.Close()
+}
+
+// normalizeStopSequences extracts stop sequences from the OpenAI `stop` field.
+//
+// @purpose Maps both accepted shapes (string and array) onto one list.
+// @rationale The field is genuinely honored gateway-side; it must not be reported as ignored.
+// @param stop Decoded `stop` value.
+// @returns Up to four non-empty sequences.
+// @invariants Pure; never returns more than four entries.
+func normalizeStopSequences(stop any) []string {
+	var sequences []string
+	switch v := stop.(type) {
+	case string:
+		if v != "" {
+			sequences = append(sequences, v)
+		}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok && s != "" {
+				sequences = append(sequences, s)
+			}
+			if len(sequences) >= 4 {
+				break
+			}
+		}
+	}
+	if len(sequences) > 4 {
+		sequences = sequences[:4]
+	}
+	return sequences
+}
+
+// includeUsageChunk reports whether the caller requested a final usage chunk.
+//
+// @purpose Implements stream_options.include_usage without silently accepting the field.
+// @param req Decoded request.
+// @returns true when usage should be emitted.
+// @invariants Pure.
+func includeUsageChunk(req *openai.ChatCompletionRequest) bool {
+	return req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+}
+
+// assembleOpenAITools renders collected tool calls in OpenAI shape.
+//
+// @purpose Single conversion point from sanitised collector entries to provider payloads.
+// @param outcome Executor result.
+// @returns The tool call list in first-seen order with stable indices.
+// @invariants Pure.
+func assembleOpenAITools(outcome turnResult) ([]openai.ToolCall, []openai.ToolCall) {
+	if len(outcome.Tools) == 0 {
+		return nil, nil
+	}
+	calls := make([]openai.ToolCall, 0, len(outcome.Tools))
+	for i, entry := range outcome.Tools {
+		idx := i
+		args := string(entry.Arguments)
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		calls = append(calls, openai.ToolCall{
+			Index: &idx,
+			ID:    entry.ID,
+			Type:  "function",
+			Function: openai.FunctionCallData{
+				Name:      entry.Name,
+				Arguments: args,
+			},
+		})
+	}
+	return calls, calls
+}
+
+// buildOpenAIUsage renders usage from the authoritative agent counters.
+//
+// @purpose Reports real token accounting instead of local estimation whenever available.
+// @param cfg Gateway configuration.
+// @param outcome Executor result.
+// @param promptBlocks Prompt blocks used for the fallback estimate.
+// @returns OpenAI usage details.
+// @invariants Pure.
+func buildOpenAIUsage(cfg *config.Config, outcome turnResult, promptBlocks []acp.PromptBlock) openai.UsageDetails {
+	promptTokens := 0
+	completionTokens := 0
+	totalTokens := 0
+	var cachedTokens int64
+	var reasoningTokens int
+
+	if outcome.UsageFromAgent {
+		promptTokens = int(outcome.Usage.InputTokens)
+		completionTokens = int(outcome.Usage.OutputTokens)
+		totalTokens = int(outcome.Usage.TotalTokens)
+		cachedTokens = outcome.Usage.CachedReadTokens
+		reasoningTokens = int(outcome.Usage.ThoughtTokens)
+	} else {
+		promptTokens = estimatePromptTokens(promptBlocks)
+		completionTokens = openai.CountTokens(outcome.Text)
+		reasoningTokens = openai.CountTokens(outcome.Thoughts)
+		completionTokens += reasoningTokens
+		totalTokens = promptTokens + completionTokens
+	}
+
+	return openai.UsageDetails{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      totalTokens,
+		PromptTokensDetails: &openai.PromptTokensDetails{
+			CachedTokens: int(cachedTokens),
+		},
+		CompletionTokensDetails: &openai.CompletionTokensDetails{
+			ReasoningTokens: reasoningTokens,
+		},
+	}
+}
+
+// estimatePromptTokens counts prompt tokens without indexing an empty slice.
+//
+// @purpose Removes four unchecked `promptBlocks[0]` index expressions.
+// @rationale A translator change returning an empty slice would panic the handler.
+// @param blocks Prompt blocks sent upstream.
+// @returns Token estimate, zero when no blocks exist.
+// @invariants Pure; nil-safe.
+func estimatePromptTokens(blocks []acp.PromptBlock) int {
+	total := 0
+	for _, block := range blocks {
+		total += openai.CountTokens(block.Text)
+	}
+	return total
+}
+
+// writeTurnError maps an executor error onto the correct OpenAI HTTP response.
+//
+// @purpose Single error-mapping point implementing the FR-18 table.
+// @rationale Both handlers previously re-implemented this mapping, and neither sanitised internals.
+// @param w Response writer.
+// @param err Executor error.
+// @param ttft configured first-token timeout for the message.
+// @invariants Writes exactly one response.
+func (h *OpenAIHandlers) writeTurnError(w http.ResponseWriter, err error, ttft time.Duration) {
+	if field, ok := IsUnsupportedParam(err); ok {
+		h.writeOpenAIError(w, http.StatusBadRequest, "parameter "+field+" is not supported upstream", "invalid_request_error", "unsupported_parameter", field)
+		return
+	}
+	if errors.Is(err, ErrFirstTokenTimeout) {
+		h.writeOpenAIError(w, http.StatusGatewayTimeout,
+			fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttft),
+			"api_error", "first_token_timeout", "")
+		return
+	}
+	if errors.Is(err, pool.ErrQueueSaturated) {
+		h.writeOpenAIError(w, http.StatusServiceUnavailable,
+			"All workers are busy; retry shortly", "api_error", "pool_saturated", "")
+		return
+	}
+	var respErr *acp.ResponseError
+	if (errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired) ||
+		strings.Contains(err.Error(), "Authentication required") ||
+		strings.Contains(err.Error(), "transport is closed") {
+		h.writeOpenAIError(w, http.StatusServiceUnavailable,
+			"No authenticated Antigravity accounts available. Please login an account via admin endpoint POST /admin/v1/accounts/login/init",
+			"invalid_request_error", "account_auth_required", "")
+		return
+	}
+	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeInvalidParams {
+		h.writeOpenAIError(w, http.StatusBadRequest, "upstream rejected the request: "+respErr.Message, "invalid_request_error", "model_not_available", "model")
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		h.writeOpenAIError(w, http.StatusGatewayTimeout, "inference turn was cancelled", "api_error", "inference_cancelled", "")
+		return
+	}
+	h.logger.Error("openai turn failed", "err", err)
+	h.writeOpenAIError(w, http.StatusInternalServerError, "Inference error", "api_error", "inference_error", "")
+}
+
+// newLoopbackSessionID mints a full-entropy loopback session identifier.
+//
+// @purpose Prevents session-id guessing on the unauthenticated-shape internal endpoint.
+// @rationale The previous 12-character slice left ~48 bits of entropy; a full UUID costs nothing.
+// @returns A session id prefixed with "sess_".
+// @invariants O(1).
+func newLoopbackSessionID() string {
+	return "sess_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 }
 
 // HandleListModels serves GET /v1/models.
@@ -1146,4 +705,28 @@ func (h *OpenAIHandlers) writeOpenAIError(w http.ResponseWriter, statusCode int,
 	_ = json.NewEncoder(w).Encode(openai.ErrorResponse{
 		Error: details,
 	})
+}
+
+// formatInternalToolProgress formats an internal ACP tool_call update into a concise
+// human-readable reasoning status line for streaming clients.
+//
+// @purpose Surfaces internal agent tool execution progress to clients via reasoning/thinking streams.
+// @rationale Low-reasoning models (e.g. gemini-4-hydrogen-low) may execute multiple internal tools without
+// emitting thought chunks, causing clients to appear frozen. Emitting a concise status line keeps SSE active.
+// @preconditions None.
+// @param u The ACP SessionUpdate containing tool metadata.
+// @returns Formatted status line ending with newline.
+// @invariants Pure function, zero side effects, O(1) execution.
+func formatInternalToolProgress(u acp.SessionUpdate) string {
+	label := strings.TrimSpace(u.Title)
+	if label == "" {
+		label = strings.TrimSpace(u.Name)
+	}
+	if label == "" {
+		label = strings.TrimSpace(u.Kind)
+	}
+	if label == "" {
+		label = "internal_tool"
+	}
+	return fmt.Sprintf("\n> [Executing: %s]\n", label)
 }

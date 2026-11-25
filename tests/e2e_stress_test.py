@@ -24,7 +24,7 @@ import urllib.error
 BASE_URL = os.environ.get("GATEWAY_BASE_URL", "http://localhost:8182")
 API_KEY = os.environ.get("API_KEY", os.environ.get("AGY_GW_CLIENT_KEY_1", "sk-bf-core"))
 OPENAI_MODEL = os.environ.get("OPENAI_TEST_MODEL", "gemini-3.8-flash")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_TEST_MODEL", "claude-sonnet-4-6")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_TEST_MODEL", "gemini-3.8-flash")
 ROOT_WORKSPACE = "/tmp/stress-workspaces"
 
 # Tool Schemas for OpenAI
@@ -581,6 +581,18 @@ def main():
         shutil.rmtree(ROOT_WORKSPACE)
     os.makedirs(ROOT_WORKSPACE, exist_ok=True)
 
+    # Size the fan-out to the pool's real capacity. Every turn holds a worker for its whole
+    # duration, so submitting more sessions than workers only produces saturated-queue
+    # rejections from the gateway -- not the concurrency the suite claims to measure.
+    try:
+        with urllib.request.urlopen(f"{BASE_URL}/readyz", timeout=10) as r:
+            pool_size = int(json.load(r).get("workers_total") or 0)
+    except Exception as e:
+        print(f"[warn] could not read pool capacity ({e}); assuming 1")
+        pool_size = 0
+    max_parallel = max(1, pool_size)
+    print(f"Pool capacity: {pool_size or 'unknown'} workers -> max {max_parallel} concurrent sessions")
+
     # Define parallel stress workload:
     # 4 concurrent workers covering both OpenAI and Anthropic adapters in streaming & sync modes
     workloads = [
@@ -594,7 +606,7 @@ def main():
     test_start = time.time()
     results = []
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(workloads)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
         future_map = {
             executor.submit(
                 run_worker_scenario,

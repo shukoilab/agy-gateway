@@ -212,6 +212,13 @@ func (c *AgyClient) DownloadAndInstall(ctx context.Context, manifest *AgyManifes
 	if runtime.GOOS == "windows" {
 		targetFilename = "agy.exe"
 	}
+	// Upstream renamed the archive member from `agy` to `antigravity` in 1.5.17 while the installed
+	// path stayed `agy`. Accept both names and always install under `agy`: the pool spawns that path.
+	// The canonical name wins if an archive ever ships both, so tar order cannot decide the result.
+	aliasFilename := "antigravity"
+	if runtime.GOOS == "windows" {
+		aliasFilename = "antigravity.exe"
+	}
 
 	for {
 		header, err := tr.Next()
@@ -225,22 +232,29 @@ func (c *AgyClient) DownloadAndInstall(ctx context.Context, manifest *AgyManifes
 		}
 
 		base := filepath.Base(header.Name)
-		if base == targetFilename && (header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA) {
-			foundBinary = true
-			outBinary, err := os.OpenFile(tmpBinaryPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
-			if err != nil {
-				_ = gzr.Close()
-				_ = f.Close()
-				return "", fmt.Errorf("failed to create temporary binary %s: %w", tmpBinaryPath, err)
-			}
-			// Guard against unbounded decompression bombs with 500MB safety ceiling
-			if _, err := io.Copy(outBinary, io.LimitReader(tr, 500*1024*1024)); err != nil {
-				_ = outBinary.Close()
-				_ = gzr.Close()
-				_ = f.Close()
-				return "", fmt.Errorf("failed to extract agy binary: %w", err)
-			}
+		isCanonical := base == targetFilename
+		isAlias := base == aliasFilename
+		if (!isCanonical && !isAlias) || (header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA) {
+			continue
+		}
+		foundBinary = true
+		outBinary, err := os.OpenFile(tmpBinaryPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+		if err != nil {
+			_ = gzr.Close()
+			_ = f.Close()
+			return "", fmt.Errorf("failed to create temporary binary %s: %w", tmpBinaryPath, err)
+		}
+		// Guard against unbounded decompression bombs with 500MB safety ceiling
+		if _, err := io.Copy(outBinary, io.LimitReader(tr, 500*1024*1024)); err != nil {
 			_ = outBinary.Close()
+			_ = gzr.Close()
+			_ = f.Close()
+			return "", fmt.Errorf("failed to extract agy binary: %w", err)
+		}
+		_ = outBinary.Close()
+		// A later canonical member overwrites an earlier alias (same truncating path), so keep
+		// scanning after an alias hit but stop as soon as the canonical name is found.
+		if isCanonical {
 			break
 		}
 	}

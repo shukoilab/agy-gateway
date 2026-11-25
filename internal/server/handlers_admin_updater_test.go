@@ -20,7 +20,7 @@ func TestAdminUpdaterEndpoints(t *testing.T) {
 
 	updaterSvc := updater.NewService(cfg, nil, nil)
 	adminHandlers := NewAdminHandlers(cfg, nil, nil, nil, updaterSvc)
-	opsHandlers := NewOpsHandlers()
+	opsHandlers := NewOpsHandlers(nil)
 	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil, nil)
 
 	// 1. GET /admin/v1/updater/status without auth -> 401

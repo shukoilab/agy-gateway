@@ -304,6 +304,13 @@ def main():
                 "content": output
             })
 
+        # The workflow is complete once the verification bash command passes. Without this the
+        # loop keeps calling the agent after success, and the model replays the task from the
+        # top -- overwriting the edits it already made.
+        if all_tests_passed:
+            print("[Turn Complete] Verification passed; stopping workflow.")
+            break
+
     # Verifications on Disk
     math_utils_path = os.path.join(TEST_DIR, "math_utils.py")
     if not os.path.exists(math_utils_path):

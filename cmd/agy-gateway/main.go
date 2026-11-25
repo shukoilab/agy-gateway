@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -124,6 +126,14 @@ func main() {
 
 	logger.Info("starting agy-gateway", "config", *configPath)
 
+	// 3b. Enforce the minimum agent version before any worker is spawned. Older agent
+	// builds reproduce the exact defects this gateway compensates for, so starting on
+	// one would silently degrade every response (FR-22).
+	if err := checkAgyVersion(cfg, logger); err != nil {
+		logger.Error("agent version gate failed", "err", err)
+		os.Exit(1)
+	}
+
 	// 4. Create base storage directories
 	for _, dir := range []string{
 		cfg.Storage.BaseDataDir,
@@ -176,11 +186,11 @@ func main() {
 	defer updaterSvc.Stop()
 
 	// 9. Wire HTTP handlers and server
-	loopbackServer := mcp.NewLoopbackServer()
+	loopbackServer := mcp.NewLoopbackServer(cfg.MCP.ClientToolCalling.MaxClientTools)
 	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
 	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
 	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry, updaterSvc)
-	opsHandlers := server.NewOpsHandlers()
+	opsHandlers := server.NewOpsHandlers(workerPool)
 
 	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, loopbackServer, logger)
 
@@ -337,6 +347,94 @@ func runModelsSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// @purpose: Compares two dotted numeric version strings semantically.
+// @rationale: Lexical comparison would rank "1.5.9" above "1.5.16"; the gate must be numeric.
+// @preconditions: Both inputs are non-empty; segments may carry a leading "v".
+// @param: a (string) - First version, e.g. "1.5.16".
+// @param: b (string) - Second version, e.g. "1.5.9".
+// @returns: -1 if a<b, 0 if equal, 1 if a>b. Missing segments count as 0.
+// @throws: None. A non-numeric segment is coerced to 0 instead of panicking.
+// @invariants: O(max(len(a), len(b))) time, O(1) space. Pure, thread-safe.
+func compareVersions(a, b string) int {
+	parse := func(v string) []int {
+		v = stringsToLower(strings.TrimSpace(v))
+		v = strings.TrimPrefix(v, "v")
+		parts := strings.Split(v, ".")
+		out := make([]int, 0, len(parts))
+		for _, p := range parts {
+			n, _ := strconv.Atoi(p)
+			out = append(out, n)
+		}
+		return out
+	}
+	av, bv := parse(a), parse(b)
+	n := len(av)
+	if len(bv) > n {
+		n = len(bv)
+	}
+	for i := 0; i < n; i++ {
+		var x, y int
+		if i < len(av) {
+			x = av[i]
+		}
+		if i < len(bv) {
+			y = bv[i]
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// @purpose: Blocks startup when the installed agent binary predates the version whose
+// behaviour this gateway is written against.
+// @rationale: Every compatibility compensation in this codebase (vendor systemPrompt
+// channel, wire effort values, configOptions gating) was verified against agy 1.5.16.
+// Running on an older build reproduces the original silent-drop defects while all gates
+// still pass, so the mismatch must be fatal and explicit rather than inferred at runtime.
+// @preconditions: cfg non-nil and validated; cfg.Binaries.AgyPath points at an executable.
+// @param: cfg (*config.Config) - Loaded configuration carrying agy_path and agy_min_version.
+// @param: logger (*slog.Logger) - Structured logger for the success line.
+// @returns: nil when the installed version satisfies the minimum, or a descriptive error.
+// @throws: None; all failures are returned as errors.
+// @invariants: Spawns exactly one short-lived child process; no goroutine or fd leak.
+func checkAgyVersion(cfg *config.Config, logger *slog.Logger) error {
+	minVersion := strings.TrimSpace(cfg.Binaries.AgyMinVersion)
+	if minVersion == "" {
+		return nil
+	}
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	out, err := exec.CommandContext(probeCtx, cfg.Binaries.AgyPath, "--version").Output()
+	if err != nil {
+		return fmt.Errorf("cannot determine installed agent version via %q --version: %w", cfg.Binaries.AgyPath, err)
+	}
+
+	installed := strings.TrimSpace(string(out))
+	if fields := strings.Fields(installed); len(fields) > 0 {
+		for _, f := range fields {
+			if f != "" && (f[0] >= '0' && f[0] <= '9') {
+				installed = f
+				break
+			}
+		}
+	}
+	installed = strings.TrimPrefix(installed, "v")
+
+	if compareVersions(installed, minVersion) < 0 {
+		return fmt.Errorf("binary agy %s is older than required %s", installed, minVersion)
+	}
+
+	logger.Info("agent version gate satisfied", "installed", installed, "minimum", minVersion)
+	return nil
 }
 
 // @purpose: Runs the auto-updater CLI subcommand.

@@ -42,7 +42,13 @@ func NewServer(
 	// 1. Operational Endpoints (Unauthenticated)
 	mux.HandleFunc("GET /healthz", opsHandlers.HandleHealthz)
 	mux.HandleFunc("GET /readyz", opsHandlers.HandleReadyz)
-	mux.HandleFunc("GET /metrics", opsHandlers.HandleMetrics)
+	if cfg.Observability.MetricsEnabled {
+		metricsPath := cfg.Observability.MetricsPath
+		if metricsPath == "" {
+			metricsPath = "/metrics"
+		}
+		mux.HandleFunc("GET "+metricsPath, opsHandlers.HandleMetrics)
+	}
 
 	// 1b. Internal Loopback MCP Bridge Endpoint (Localhost JSON-RPC 2.0 router for agy acp stdio bridge)
 	if loopbackServer != nil {
