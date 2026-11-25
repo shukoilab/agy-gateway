@@ -20,6 +20,7 @@ import (
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/openai"
 	"agy-gateway/internal/pool"
+	"agy-gateway/internal/retry"
 	"agy-gateway/internal/telemetry"
 )
 
@@ -341,13 +342,10 @@ func executeTurnAttempt(
 	var drainWG sync.WaitGroup
 	drainStop := make(chan struct{})
 	if loopbackState != nil {
-		// Discard calls a previous attempt left buffered, so they cannot leak into this turn.
+		// Discard calls a previous attempt left buffered, so they cannot leak into this turn. On a
+		// buffered channel len>0 guarantees the receive succeeds, so this drain never blocks.
 		for len(loopbackState.Calls) > 0 {
-			select {
-			case <-loopbackState.Calls:
-			default:
-				break
-			}
+			<-loopbackState.Calls
 		}
 		drainWG.Add(1)
 		go func() {
@@ -447,6 +445,14 @@ func executeTurnAttempt(
 		result.Usage = usage
 		mu.Unlock()
 		result.UsageFromAgent = true
+	}
+
+	if callErr == nil && result.StopReason == "end_turn" &&
+		result.Text == "" && result.Thoughts == "" && len(result.Tools) == 0 {
+		// A turn that ends "successfully" with no text, no thoughts and no tool calls produced nothing.
+		// agy answers an internally-exhausted quota this way, so surfacing it as a normal completion
+		// would report success for work that never happened.
+		return result, retry.ErrEmptyCompletion
 	}
 
 	if callErr != nil {

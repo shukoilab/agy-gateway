@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/openai"
 	"agy-gateway/internal/pool"
+	"agy-gateway/internal/retry"
 	"agy-gateway/internal/telemetry"
 )
 
@@ -190,7 +193,7 @@ func (h *OpenAIHandlers) handleSync(
 	}
 
 	var outcome turnResult
-	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.UpstreamModel, modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		res, err := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
 		if err != nil {
 			return err
@@ -378,7 +381,7 @@ func (h *OpenAIHandlers) handleStreaming(
 		return firstChunkSent
 	}
 
-	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.UpstreamModel, modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
 		outcome = res
 		if attemptErr != nil {
@@ -596,6 +599,28 @@ func (h *OpenAIHandlers) writeTurnError(w http.ResponseWriter, err error, ttft t
 	if errors.Is(err, pool.ErrQueueSaturated) {
 		h.writeOpenAIError(w, http.StatusServiceUnavailable,
 			"All workers are busy; retry shortly", "api_error", "pool_saturated", "")
+		return
+	}
+	if errors.Is(err, pool.ErrNoAccounts) || errors.Is(err, pool.ErrNoEligibleAccounts) {
+		// Every account is cooling or unusable: a quota condition the client can wait out, not a
+		// gateway fault. The retry hint is derived from the earliest cooldown expiry.
+		if retryAfter := h.failover.NextAvailableIn(time.Now()); retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+		}
+		message := "All Antigravity accounts are temporarily unavailable; retry later"
+		code := "all_accounts_cooling"
+		if errors.Is(err, pool.ErrNoAccounts) {
+			message = "No Antigravity accounts are configured; an administrator must add one"
+			code = "no_accounts"
+		}
+		h.writeOpenAIError(w, http.StatusTooManyRequests, message, "api_error", code, "")
+		return
+	}
+	if errors.Is(err, retry.ErrEmptyCompletion) {
+		// The agent ended the turn without producing anything. Reporting 200 here would claim success
+		// for work that never happened.
+		h.writeOpenAIError(w, http.StatusBadGateway,
+			"Upstream agent returned an empty completion; retry the request", "api_error", "empty_completion", "")
 		return
 	}
 	var respErr *acp.ResponseError

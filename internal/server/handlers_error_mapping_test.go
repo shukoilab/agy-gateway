@@ -126,13 +126,13 @@ func TestAcquireReturnsCallerCancellation(t *testing.T) {
 	cfg.Pool.AcquireTimeout = 20 * time.Millisecond
 	p := pool.NewTestPoolWithNoWorkers(cfg)
 
-	if _, err := p.Acquire(context.Background(), false); !errors.Is(err, pool.ErrQueueSaturated) {
+	if _, err := p.Acquire(context.Background(), "gemini-3.8-flash", false); !errors.Is(err, pool.ErrQueueSaturated) {
 		t.Fatalf("empty pool must report saturation after its own timeout, got %v", err)
 	}
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := p.Acquire(cancelled, false); !errors.Is(err, context.Canceled) {
+	if _, err := p.Acquire(cancelled, "gemini-3.8-flash", false); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled caller must surface context.Canceled, got %v", err)
 	}
 }

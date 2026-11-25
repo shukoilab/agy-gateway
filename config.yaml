@@ -55,12 +55,14 @@ pool:
 
 accounts:
   auto_rotate_enabled: true
-  allocation_strategy: "dedicated_per_worker"
+  allocation_strategy: "round_robin"
   quota_poll_interval: "30s"
   min_remaining_quota_pct: 5.0
   default_cooldown_5h: "30m"
-  default_cooldown_weekly: "6h"
+  default_cooldown_weekly: "24h"
   max_failover_retries: 3
+  # Bounded retry for a runtime credential fault; a vault-reported expiry stays permanent.
+  auth_expired_retry_interval: "5m"
 
 admin:
   command_timeout: "15s"

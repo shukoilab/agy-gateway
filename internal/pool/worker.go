@@ -19,11 +19,18 @@ import (
 
 // Worker represents a warm, isolated agy acp process instance.
 type Worker struct {
-	ID           int
-	HomeDir      string
-	TmpDir       string
-	Cwd          string
-	Account      *auth.Account
+	ID      int
+	HomeDir string
+	TmpDir  string
+	Cwd     string
+	// account holds the *auth.Account this worker authenticates as.
+	//
+	// @purpose Makes the worker's account binding safe to read while another goroutine rebinds it.
+	// @rationale Lease-time reconciliation writes the binding (pool.go) while failover and account
+	// sharing read it (failover.go, accountsInUse), so a plain pointer is a data race. Access is
+	// confined to GetAccount/SetAccount; never read the field directly.
+	// @invariants nil until the first binding; replaced wholesale, never mutated in place.
+	account      atomic.Pointer[auth.Account]
 	Process      *acp.Process
 	Transport    *acp.Transport
 	Capabilities acp.AgentCapabilities
@@ -45,17 +52,46 @@ func NewWorker(id int, homeDir, tmpDir, cwd string, account *auth.Account, cfg *
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Worker{
+	w := &Worker{
 		ID:         id,
 		HomeDir:    homeDir,
 		TmpDir:     tmpDir,
 		Cwd:        cwd,
-		Account:    account,
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
 		cfg:        cfg,
 		logger:     logger.With("workerID", id),
 	}
+	w.account.Store(account)
+	return w
+}
+
+// GetAccount returns the account this worker currently authenticates as, or nil.
+//
+// @purpose Gives every reader one synchronised accessor for the worker's account binding.
+// @rationale The binding is written by lease-time rotation and failover while other goroutines read
+// it; a single accessor is what makes that safe without a mutex on the hot path.
+// @preconditions None.
+// @param None.
+// @returns *auth.Account, or nil when no account is bound yet.
+// @throws None.
+// @invariants O(1); lock-free.
+func (w *Worker) GetAccount() *auth.Account {
+	return w.account.Load()
+}
+
+// SetAccount replaces the account this worker authenticates as.
+//
+// @purpose Publishes a new binding after the credential has been installed on disk.
+// @rationale Callers install the credential first and publish second, so a concurrent reader never
+// observes a binding whose credential is not yet on disk.
+// @preconditions The credential for acc has been materialised into this worker's HOME.
+// @param acc Account to publish; nil clears the binding.
+// @returns None.
+// @throws None.
+// @invariants O(1); lock-free; safe for concurrent use.
+func (w *Worker) SetAccount(acc *auth.Account) {
+	w.account.Store(acc)
 }
 
 // Start launches the agy acp subprocess and completes the initialize handshake.

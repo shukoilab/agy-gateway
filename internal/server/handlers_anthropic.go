@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"agy-gateway/internal/mcp"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/pool"
+	"agy-gateway/internal/retry"
 	"agy-gateway/internal/telemetry"
 )
 
@@ -233,7 +236,7 @@ func (h *AnthropicHandlers) handleSync(
 	}
 
 	var outcome turnResult
-	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+	err := h.failover.ExecuteWithFailover(r.Context(), modelEntry.UpstreamModel, modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
 		if attemptErr != nil {
 			return attemptErr
@@ -512,7 +515,7 @@ func (h *AnthropicHandlers) handleStreaming(
 	}
 
 	var outcome turnResult
-	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
+	err = h.failover.ExecuteWithFailover(r.Context(), modelEntry.UpstreamModel, modelEntry.RequiresPaidTier, maxRetries, func(ctx context.Context, worker *pool.Worker) error {
 		res, attemptErr := executeTurnAttempt(ctx, worker, h.cfg, h.logger, in)
 		outcome = res
 		if attemptErr != nil {
@@ -653,6 +656,26 @@ func (h *AnthropicHandlers) writeAnthropicTurnError(w http.ResponseWriter, err e
 	}
 	if errors.Is(err, pool.ErrQueueSaturated) {
 		h.writeAnthropicError(w, http.StatusServiceUnavailable, "api_error", "all workers are busy; retry shortly")
+		return
+	}
+	if errors.Is(err, pool.ErrNoAccounts) || errors.Is(err, pool.ErrNoEligibleAccounts) {
+		// Quota exhaustion across every account is retryable, so it maps to 429 with a hint rather
+		// than to a 5xx that implies the gateway itself is broken.
+		if retryAfter := h.failover.NextAvailableIn(time.Now()); retryAfter > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(retryAfter.Seconds()))))
+		}
+		if errors.Is(err, pool.ErrNoAccounts) {
+			h.writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
+				"no Antigravity accounts are configured (code: no_accounts); an administrator must add one")
+			return
+		}
+		h.writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
+			"all Antigravity accounts are temporarily unavailable (code: all_accounts_cooling); retry later")
+		return
+	}
+	if errors.Is(err, retry.ErrEmptyCompletion) {
+		h.writeAnthropicError(w, http.StatusBadGateway, "api_error",
+			"upstream agent returned an empty completion; retry the request")
 		return
 	}
 	var respErr *acp.ResponseError

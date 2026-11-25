@@ -44,7 +44,7 @@ func TestFailoverCoordinator_SuccessOnFirstAttempt(t *testing.T) {
 	fc := NewFailoverCoordinator(p, nil, nil)
 
 	invocations := 0
-	err := fc.ExecuteWithFailover(context.Background(), false, 3, func(ctx context.Context, w *Worker) error {
+	err := fc.ExecuteWithFailover(context.Background(), "", false, 3, func(ctx context.Context, w *Worker) error {
 		invocations++
 		return nil
 	})
@@ -69,7 +69,7 @@ func TestFailoverCoordinator_NonRetryableStreamError(t *testing.T) {
 	fc := NewFailoverCoordinator(p, nil, nil)
 
 	invocations := 0
-	err := fc.ExecuteWithFailover(context.Background(), false, 3, func(ctx context.Context, w *Worker) error {
+	err := fc.ExecuteWithFailover(context.Background(), "", false, 3, func(ctx context.Context, w *Worker) error {
 		invocations++
 		return ErrNonRetryableStream
 	})
@@ -117,15 +117,15 @@ func TestFailoverCoordinator_AutoSwitchOnQuotaExhausted(t *testing.T) {
 	fc := NewFailoverCoordinator(p, authMgr, nil)
 
 	attempts := 0
-	err := fc.ExecuteWithFailover(context.Background(), false, 2, func(ctx context.Context, w *Worker) error {
+	err := fc.ExecuteWithFailover(context.Background(), "", false, 2, func(ctx context.Context, w *Worker) error {
 		attempts++
 		if attempts == 1 {
 			// Simulate quota exhaustion on acc1
 			return errors.New("upstream error: RESOURCE_EXHAUSTED (429 Too Many Requests)")
 		}
 		// On second attempt, verify that worker account switched to acc2
-		if w.Account == nil || w.Account.ID != "acc_secondary" {
-			t.Errorf("expected worker to be switched to acc_secondary, got %+v", w.Account)
+		if w.GetAccount() == nil || w.GetAccount().ID != "acc_secondary" {
+			t.Errorf("expected worker to be switched to acc_secondary, got %+v", w.GetAccount())
 		}
 		return nil
 	})
@@ -153,7 +153,7 @@ func TestFailoverCoordinator_AuthExpiredCode(t *testing.T) {
 	fc := NewFailoverCoordinator(p, nil, nil)
 
 	attempts := 0
-	err := fc.ExecuteWithFailover(context.Background(), false, 2, func(ctx context.Context, w *Worker) error {
+	err := fc.ExecuteWithFailover(context.Background(), "", false, 2, func(ctx context.Context, w *Worker) error {
 		attempts++
 		if attempts == 1 {
 			return &acp.ResponseError{Code: acp.ErrCodeAuthRequired, Message: "Authentication required"}

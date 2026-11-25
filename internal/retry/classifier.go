@@ -13,6 +13,19 @@ import (
 	"agy-gateway/internal/acp"
 )
 
+// ErrEmptyCompletion reports that the agent finished a turn without producing any output.
+//
+// @purpose Gives the gateway a typed, testable signal for a silently-failed turn.
+// @rationale agy can answer an exhausted quota internally and still end the turn normally with no
+// assistant content. Returning that as HTTP 200 tells the client the work succeeded when nothing
+// happened, which is worse than an explicit error.
+// @preconditions None.
+// @param None.
+// @returns A shared sentinel matched with errors.Is.
+// @throws None.
+// @invariants Immutable; safe for concurrent use.
+var ErrEmptyCompletion = errors.New("agent returned an empty completion")
+
 // FailureClass enumerates the deterministic category of a runtime error.
 type FailureClass int
 
@@ -38,6 +51,10 @@ const (
 	// FailureClassTransientCLI indicates transient SQLite vault lock contention or fork pressure.
 	FailureClassTransientCLI
 
+	// FailureClassEmptyCompletion indicates the agent finished the turn successfully but produced no
+	// text, thoughts, or tool calls.
+	FailureClassEmptyCompletion
+
 	// FailureClassNonRetryable indicates client aborts, validation failures, or unrecoverable application errors.
 	FailureClassNonRetryable
 )
@@ -59,6 +76,8 @@ func (f FailureClass) String() string {
 		return "FIRST_TOKEN_TIMEOUT"
 	case FailureClassTransientCLI:
 		return "TRANSIENT_CLI"
+	case FailureClassEmptyCompletion:
+		return "EMPTY_COMPLETION"
 	default:
 		return "NON_RETRYABLE"
 	}
@@ -72,6 +91,7 @@ func (f FailureClass) IsRetryable() bool {
 		FailureClassTransientOverload,
 		FailureClassTransportClosed,
 		FailureClassFirstTokenTimeout,
+		FailureClassEmptyCompletion,
 		FailureClassTransientCLI:
 		return true
 	default:
@@ -104,6 +124,12 @@ func ClassifyFailure(err error) FailureClass {
 		if respErr.Code == acp.ErrCodeAuthRequired {
 			return FailureClassAuthExpired
 		}
+	}
+
+	// Empty completion is a sentinel produced by the turn executor, so it must be matched before the
+	// string heuristics below (which could otherwise misclassify its wording).
+	if errors.Is(err, ErrEmptyCompletion) {
+		return FailureClassEmptyCompletion
 	}
 
 	// 3. Check for typed network / syscall errors

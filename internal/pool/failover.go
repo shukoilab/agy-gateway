@@ -35,6 +35,34 @@ func NewFailoverCoordinator(pool *Pool, authMgr *auth.Manager, logger *slog.Logg
 	}
 }
 
+// NextAvailableIn reports how long until some account can serve requests again.
+//
+// @purpose Supplies an honest Retry-After value when every account is unavailable.
+// @rationale A 429 without a hint forces the client to guess; the earliest cooldown expiry is known
+// precisely and is the most useful thing the gateway can tell it. CooldownUntil also carries the
+// bounded retry deadline of a runtime credential fault, which is equally worth waiting for, so the
+// hint stays correct for both cases.
+// @preconditions None; safe to call with a nil coordinator or nil auth manager.
+// @param now Reference instant, injected so the value is testable.
+// @returns The duration until the earliest known cooldown expiry, or zero when unknown/expired.
+// @throws None.
+// @invariants O(accounts); takes no subprocess and no filesystem action.
+func (fc *FailoverCoordinator) NextAvailableIn(now time.Time) time.Duration {
+	if fc == nil || fc.authMgr == nil {
+		return 0
+	}
+	var earliest time.Time
+	for _, acc := range fc.authMgr.GetAccounts() {
+		if acc.CooldownUntil.After(now) && (earliest.IsZero() || acc.CooldownUntil.Before(earliest)) {
+			earliest = acc.CooldownUntil
+		}
+	}
+	if earliest.IsZero() {
+		return 0
+	}
+	return earliest.Sub(now)
+}
+
 // ExecuteWithFailover leases a worker, attempts the operation, and if a recoverable
 // failure (e.g. auth expired, quota exhausted, model overloaded, pipe closed, TTFT timeout)
 // occurs pre-first-token, intelligently switches accounts, applies jittered backoff, and retries.
@@ -51,6 +79,7 @@ func NewFailoverCoordinator(pool *Pool, authMgr *auth.Manager, logger *slog.Logg
 // @invariants Releases leased workers on every code path; guarantees zero worker leakage.
 func (fc *FailoverCoordinator) ExecuteWithFailover(
 	ctx context.Context,
+	model string,
 	requiresPaidTier bool,
 	maxRetries int,
 	op func(ctx context.Context, w *Worker) error,
@@ -77,7 +106,7 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 			return ctx.Err()
 		}
 
-		w, err := fc.pool.Acquire(ctx, requiresPaidTier)
+		w, err := fc.pool.Acquire(ctx, model, requiresPaidTier)
 		if err != nil {
 			return fmt.Errorf("failed to acquire worker from pool: %w", err)
 		}
@@ -112,20 +141,23 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 		}
 
 		var currentAccID string
-		if w.Account != nil {
-			currentAccID = w.Account.ID
+		if bound := w.GetAccount(); bound != nil {
+			currentAccID = bound.ID
 		}
 
 		switch failureClass {
 		case retry.FailureClassAuthExpired:
 			if currentAccID != "" && fc.authMgr != nil {
-				fc.authMgr.MarkAccountStatus(currentAccID, auth.StatusAuthExpired, 0)
+				// Bounded retry, not a tombstone: a momentary upstream rejection must not remove the
+				// account until an operator logs in again.
+				fc.authMgr.MarkAccountStatus(currentAccID, auth.StatusAuthExpired,
+					fc.pool.cfg.Accounts.AuthExpiredRetryInterval)
 			}
 			w.TaintedForRecycle.Store(true)
 
 			// Check for alternate eligible account in vault
 			if fc.authMgr != nil {
-				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, requiresPaidTier)
+				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, model, requiresPaidTier, fc.pool.accountsInUse(w))
 				if findErr == nil && nextAcc != nil {
 					fc.logger.Info("auth expired; auto-switching worker to alternate account",
 						"workerID", w.ID,
@@ -135,7 +167,7 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
 						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
 					}
-					w.Account = nextAcc
+					w.SetAccount(nextAcc)
 					fc.pool.Release(w)
 					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
 					continue
@@ -149,6 +181,8 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 			}
 
 		case retry.FailureClassQuotaExhausted:
+			// Duration comes from configuration; a literal here silently drifted from the operator's
+			// setting and could keep an account out of service far longer than its real reset.
 			cooldownDuration := 30 * time.Minute
 			if fc.pool != nil && fc.pool.cfg != nil && fc.pool.cfg.Accounts.DefaultCooldown5h > 0 {
 				cooldownDuration = fc.pool.cfg.Accounts.DefaultCooldown5h
@@ -160,7 +194,7 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 
 			// Ultra-smart auto-switch to alternate account if available
 			if fc.authMgr != nil {
-				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, requiresPaidTier)
+				nextAcc, findErr := fc.authMgr.FindNextEligibleAccount(currentAccID, model, requiresPaidTier, fc.pool.accountsInUse(w))
 				if findErr == nil && nextAcc != nil {
 					fc.logger.Info("quota exhausted; auto-switching worker to alternate account",
 						"workerID", w.ID,
@@ -170,7 +204,7 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
 						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
 					}
-					w.Account = nextAcc
+					w.SetAccount(nextAcc)
 					fc.pool.Release(w)
 					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
 					continue

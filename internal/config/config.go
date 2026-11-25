@@ -119,6 +119,12 @@ type AccountsConfig struct {
 	DefaultCooldown5h     time.Duration `yaml:"default_cooldown_5h"`
 	DefaultCooldownWeekly time.Duration `yaml:"default_cooldown_weekly"`
 	MaxFailoverRetries    int           `yaml:"max_failover_retries"`
+	CredentialOpTimeout   time.Duration `yaml:"credential_op_timeout"`
+	// AuthExpiredRetryInterval bounds how long a runtime-detected credential fault removes an account
+	// from service before it is retried. A vault-reported expiry is permanent (it needs
+	// `agy-auth login`), but a materialisation or upstream auth failure must not strand a healthy
+	// account forever if the cause was transient.
+	AuthExpiredRetryInterval time.Duration `yaml:"auth_expired_retry_interval"`
 }
 
 type OAuthOnboardingConfig struct {
@@ -352,8 +358,11 @@ func DefaultConfig() *Config {
 			QuotaPollInterval:     30 * time.Second,
 			MinRemainingQuotaPct:  5.0,
 			DefaultCooldown5h:     30 * time.Minute,
-			DefaultCooldownWeekly: 6 * time.Hour,
+			DefaultCooldownWeekly: 24 * time.Hour,
 			MaxFailoverRetries:    3,
+			CredentialOpTimeout:   20 * time.Second,
+
+			AuthExpiredRetryInterval: 5 * time.Minute,
 		},
 		Admin: AdminConfig{
 			CommandTimeout:        15 * time.Second,
@@ -554,6 +563,15 @@ func applyEnvOverrides(cfg *Config) {
 	// 4. Accounts & Failover Overrides
 	if v := os.Getenv("AGY_GW_AUTO_ROTATE_ENABLED"); v != "" {
 		cfg.Accounts.AutoRotateEnabled = parseBoolEnv(v, cfg.Accounts.AutoRotateEnabled)
+	}
+	if v := os.Getenv("AGY_GW_ALLOCATION_STRATEGY"); v != "" {
+		cfg.Accounts.AllocationStrategy = v
+	}
+	if v := os.Getenv("AGY_GW_CREDENTIAL_OP_TIMEOUT"); v != "" {
+		cfg.Accounts.CredentialOpTimeout = parseDurationEnv(v, cfg.Accounts.CredentialOpTimeout)
+	}
+	if v := os.Getenv("AGY_GW_AUTH_EXPIRED_RETRY_INTERVAL"); v != "" {
+		cfg.Accounts.AuthExpiredRetryInterval = parseDurationEnv(v, cfg.Accounts.AuthExpiredRetryInterval)
 	}
 	if v := os.Getenv("AGY_GW_QUOTA_POLL_INTERVAL"); v != "" {
 		cfg.Accounts.QuotaPollInterval = parseDurationEnv(v, cfg.Accounts.QuotaPollInterval)
@@ -965,6 +983,31 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Pool.ConfigSwitchTimeout <= 0 {
 		return fmt.Errorf("pool.config_switch_timeout must be > 0")
+	}
+	if !validAllocationStrategy(cfg.Accounts.AllocationStrategy) {
+		return fmt.Errorf("accounts.allocation_strategy must be one of %v, got %q",
+			allocationStrategies, cfg.Accounts.AllocationStrategy)
+	}
+	// Normalise after validation so the runtime never sees a legacy alias or an empty string.
+	cfg.Accounts.AllocationStrategy = NormalizeAllocationStrategy(cfg.Accounts.AllocationStrategy)
+	if cfg.Accounts.MinRemainingQuotaPct < 0 || cfg.Accounts.MinRemainingQuotaPct > 100 {
+		return fmt.Errorf("accounts.min_remaining_quota_pct must be between 0 and 100, got %v",
+			cfg.Accounts.MinRemainingQuotaPct)
+	}
+	if cfg.Accounts.DefaultCooldown5h <= 0 {
+		return fmt.Errorf("accounts.default_cooldown_5h must be > 0")
+	}
+	if cfg.Accounts.DefaultCooldownWeekly <= 0 {
+		return fmt.Errorf("accounts.default_cooldown_weekly must be > 0")
+	}
+	if cfg.Accounts.CredentialOpTimeout <= 0 {
+		return fmt.Errorf("accounts.credential_op_timeout must be > 0")
+	}
+	if cfg.Accounts.AuthExpiredRetryInterval <= 0 {
+		return fmt.Errorf("accounts.auth_expired_retry_interval must be > 0")
+	}
+	if cfg.Accounts.QuotaPollInterval > 0 && cfg.Accounts.QuotaPollInterval < 10*time.Second {
+		return fmt.Errorf("accounts.quota_poll_interval must be >= 10s, got %v", cfg.Accounts.QuotaPollInterval)
 	}
 
 	// Compile admin regexes

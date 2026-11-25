@@ -72,8 +72,26 @@ func newTurnAttemptTestWorker(t *testing.T, cfg *config.Config, onPrompt func(io
 			case "session/set_config_option", "session/close":
 				writeFrame(inWriter, req.ID, `{}`)
 			case "session/prompt":
+				// A turn that produces nothing is now rejected as EMPTY_COMPLETION, because agy signals
+				// an internally exhausted quota exactly that way. Emit a real session/update notification
+				// so the fake peer represents a successful turn rather than a silently empty one.
 				if onPrompt != nil {
 					onPrompt(inWriter)
+					time.Sleep(20 * time.Millisecond)
+				} else {
+					notif := map[string]any{
+						"jsonrpc": "2.0",
+						"method":  "session/update",
+						"params": map[string]any{
+							"sessionId": "mock_sess_1",
+							"update": map[string]any{
+								"sessionUpdate": acp.UpdateAgentMessageChunk,
+								"content":       map[string]any{"type": "text", "text": "ok"},
+							},
+						},
+					}
+					raw, _ := json.Marshal(notif)
+					_, _ = inWriter.Write(append(raw, '\n'))
 					time.Sleep(20 * time.Millisecond)
 				}
 				writeFrame(inWriter, req.ID, `{"stopReason":"end_turn"}`)

@@ -53,7 +53,7 @@ A common challenge when bridging developer IDEs and autonomous coding agents (su
 This project explores a sustainable, standards-compliant alternative:
 1. **Standard ACP Emulation**: The gateway emulates a native code editor client (such as Zed) communicating directly with the official Google Antigravity CLI (`agy acp`) using standard JSON-RPC 2.0. The underlying CLI runtime operates in its natural state without file injection or binary tampering.
 2. **Native ACP System Prompt Integration**: Rather than altering core system files or injecting artificial wrapper tags into conversation turns, developer instructions and tool schemas are forwarded directly upstream via official ACP `_meta.antigravity.systemPrompt.append` parameters during session creation (`session/new`). This prevents prompt-injection false positives in safety filters (such as Claude Sonnet) while maintaining pure conversational turn symmetry.
-3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy /usage`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
+3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy-auth usage --all`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
 4. **Drop-in Compatibility**: Exposes standards-compliant REST endpoints for both `/v1/chat/completions` and `/v1/messages`, enabling developers to benchmark models like Gemini 3.8 Flash (supporting up to 1M+ token context windows) using existing tooling.
 
 ---
@@ -74,8 +74,10 @@ This project explores a sustainable, standards-compliant alternative:
   - Active execution loop priming (`BuildActiveContinuationCue`) and structured turn symmetry, keeping autonomous agents (OpenCode, Claude Code, Cursor, Cline, Roo Code, Continue.dev) executing continuously without premature stalls.
   - Streaming parser with closing tag prefix buffering and resilient flush recovery, guaranteeing zero unclosed or fragmented tool calls across network chunk boundaries.
 - **Live Quota Tracking & Zero-Downtime Failover**:
-  - Real-time account quota polling via `agy /usage`, tracking remaining percentages across rolling 5-hour and weekly bucket limits.
-  - Automatic cooldown scheduling and seamless standby worker rotation upon rate limit detection (`429`).
+  - Real-time per-account quota polling via `agy-auth usage --all --json`, tracking remaining percentages across rolling 5-hour and weekly bucket limits for **every** stored account independently.
+  - Model-aware eligibility: quota families are tracked separately, so an account with a nearly spent *Claude and GPT models* bucket is still selected for pure Gemini traffic (and vice versa).
+  - Deterministic one-account-per-worker credential materialisation: each worker receives its own account's credential, exported per account and installed atomically (`0600`, `fsync` + `rename`), so no two workers ever share a refresh token.
+  - Proactive cooldown scheduling derived from the limiting bucket's own reset time, with automatic recovery once the window reopens and seamless standby worker rotation upon rate-limit detection (`429`).
 - **Headless OAuth Onboarding & Terminal Dashboard**:
   - Browser-free authentication flow for headless servers and containerized deployments.
   - Interactive terminal dashboard (`agy-accounts` CLI) for simple account switching, quota inspection, and vault maintenance.
@@ -332,6 +334,49 @@ docker exec agy-gateway agy-accounts list -json
 docker exec agy-gateway agy-gateway models list
 docker exec agy-gateway agy-gateway models set claude-3-7-sonnet claude-sonnet-4-6
 ```
+
+---
+
+### Multi-Account Rotation & Quota Families
+
+The gateway treats each stored account as an independent quota source and binds exactly one account per worker.
+
+**How selection works**
+
+| Stage | Behaviour |
+| :--- | :--- |
+| Allocation | `allocation_strategy` assigns accounts to workers at startup: `round_robin` (default), `least_used` (highest remaining headroom first), or `sticky`. |
+| Credential install | The assigned account's credential is exported per account and installed atomically into that worker's isolated `HOME` (`0600`, `fsync` + `rename`). A failed export leaves the previous credential untouched. |
+| Lease-time reconciliation | On every lease the worker's account is re-judged against live quota. An ineligible account is replaced from the vault and the new credential is installed before the turn runs. |
+| Polling | `quota_poll_interval` refreshes every account's buckets. A bucket below `min_remaining_quota_pct` moves that account into cooldown until the bucket's **own** reset time. |
+| Recovery | A cooldown that has elapsed returns the account to `HEALTHY` on the next poll, with no external trigger. |
+
+**Quota families are independent.** Google meters *Gemini Models* and *Claude and GPT models* as separate buckets, so eligibility is evaluated only against the family the requested model uses. An account at 1% on the third-party bucket still serves Gemini models at full capacity.
+
+**Capacity guidance.** Keep `pool.worker_count` less than or equal to the number of stored accounts. Two workers sharing one account means two `agy` processes refreshing the same refresh token concurrently, and Google invalidates all but the first — the sharing condition is logged as a `WARN` at startup.
+
+**Key settings** (`config.yaml` → `accounts:` or `AGY_GW_*` environment variables):
+
+| Setting | Env var | Default | Purpose |
+| :--- | :--- | :--- | :--- |
+| `allocation_strategy` | `AGY_GW_ALLOCATION_STRATEGY` | `round_robin` | Worker-to-account assignment policy. |
+| `auto_rotate_enabled` | `AGY_GW_AUTO_ROTATE_ENABLED` | `true` | Derive cooldowns from live quota. When `false`, quota data is still refreshed but statuses never change. |
+| `quota_poll_interval` | `AGY_GW_QUOTA_POLL_INTERVAL` | `30s` | Background poll cadence (minimum `10s`). |
+| `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Bucket floor before an account is demoted. |
+| `default_cooldown_5h` | `AGY_GW_DEFAULT_COOLDOWN_5H` | `30m` | Fallback cooldown when a 5-hour bucket reports no reset time. |
+| `default_cooldown_weekly` | `AGY_GW_DEFAULT_COOLDOWN_WEEKLY` | `24h` | Fallback cooldown when a weekly bucket reports no reset time. |
+| `credential_op_timeout` | `AGY_GW_CREDENTIAL_OP_TIMEOUT` | `20s` | Deadline for one credential export/install, including process-group kill on expiry. |
+| `auth_expired_retry_interval` | `AGY_GW_AUTH_EXPIRED_RETRY_INTERVAL` | `5m` | How long a runtime credential fault keeps an account out of service before it is retried. A vault-reported expiry is permanent and needs `agy-auth login`. |
+
+**Client-visible failure modes**
+
+| Condition | HTTP status | Error code | Retry-After |
+| :--- | :--- | :--- | :--- |
+| Every account cooling or ineligible | `429` | `all_accounts_cooling` | Earliest cooldown expiry |
+| Vault holds no accounts | `429` | `no_accounts` | omitted |
+| Agent ended the turn with no output | `502` | `empty_completion` | omitted |
+
+The last row matters: `agy` reports an internally exhausted quota as a successful `end_turn` with no content. Reporting `200` there would claim that work happened when it did not, so it is surfaced as a retryable `502` instead.
 
 ---
 

@@ -123,6 +123,48 @@ var visionModes = []string{"reject", "flatten"}
 // @rationale Silent stripping is the bug this knob exists to eliminate.
 var unsupportedParamPolicies = []string{"strip_and_warn", "reject"}
 
+// allocationStrategies enumerates how the pool assigns accounts to workers.
+//
+// @purpose Validation set for accounts.allocation_strategy.
+// @rationale The value was previously unused, so any typo silently behaved like the hardcoded
+// round-robin. Round robin spreads load; least_used follows live quota; sticky avoids churn on a
+// worker that already holds a usable account.
+var allocationStrategies = []string{"round_robin", "least_used", "sticky"}
+
+// allocationStrategyLegacyAliases maps values that existed before the knob was wired up.
+//
+// @purpose Keeps existing config files and containers working after the setting became effective.
+// @rationale "dedicated_per_worker" was the shipped default while the field did nothing; rejecting it
+// now would break a running deployment on restart for no behavioural reason.
+var allocationStrategyLegacyAliases = map[string]string{
+	"dedicated_per_worker": "round_robin",
+}
+
+// NormalizeAllocationStrategy maps a configured value onto a supported strategy.
+//
+// @purpose Single point where a legacy or empty value becomes a concrete strategy.
+// @rationale Validation and runtime selection must agree; normalising once avoids two code paths that
+// can disagree about what an unset value means.
+// @preconditions None.
+// @param v Raw configured value.
+// @returns A supported strategy name; empty input yields "round_robin".
+// @throws None; unknown values are returned unchanged so Validate can reject them.
+// @invariants O(1); no allocation beyond one map lookup.
+func NormalizeAllocationStrategy(v string) string {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" {
+		return "round_robin"
+	}
+	if canonical, ok := allocationStrategyLegacyAliases[v]; ok {
+		return canonical
+	}
+	return v
+}
+
+func validAllocationStrategy(v string) bool {
+	return contains(allocationStrategies, NormalizeAllocationStrategy(v))
+}
+
 func validSessionMode(v string) bool            { return contains(sessionModes, v) }
 func validSystemPromptChannel(v string) bool    { return contains(systemPromptChannels, v) }
 func validVisionMode(v string) bool             { return contains(visionModes, v) }
