@@ -3,7 +3,7 @@
 FROM golang:1.25-bookworm AS go-builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG VERSION=3.16.1
+ARG VERSION=3.16.2
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

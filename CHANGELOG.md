@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.2] - 2026-11-26
+
+### Bug Fixes
+
+* **release:** strip any heading level the tag action emits ([2e9a5b4](https://github.com/shukoilab/agy-gateway/commit/2e9a5b4a955b73da86fff2e339c78bce9bd03a73))
+
 ## [3.16.1] - 2026-11-26
 
 ### Bug Fixes

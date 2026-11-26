@@ -6,7 +6,7 @@
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker" alt="Docker Ready"></a>
   <a href="https://github.com/shukoilab/agy-gateway/pkgs/container/agy-gateway"><img src="https://img.shields.io/badge/GHCR-Package-blue?logo=github" alt="GHCR"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/shukoilab/agy-gateway/releases"><img src="https://img.shields.io/badge/Release-v3.16.1-purple.svg" alt="Release"></a>
+  <a href="https://github.com/shukoilab/agy-gateway/releases"><img src="https://img.shields.io/badge/Release-v3.16.2-purple.svg" alt="Release"></a>
 </p>
 
 <p align="center">
