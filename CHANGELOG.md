@@ -9,9 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.16.0] - 2026-11-26
 
-## [3.16.0](https://github.com/shukoilab/agy-gateway/compare/v3.15.1...v3.16.0) (2026-11-26)
-
-
 ### Features
 
 * **release:** enforce single-source version synchronization ([8c4b276](https://github.com/shukoilab/agy-gateway/commit/8c4b276d187ab810484c3e40e46d469cff24ca5a))
