@@ -952,7 +952,7 @@ info:
     url: https://github.com/shukoilab/agy-gateway/blob/main/LICENSE
   termsOfService: https://github.com/shukoilab/agy-gateway
   title: agy-gateway API
-  version: 3.12.0
+  version: 3.15.1
 paths:
   /admin/v1/accounts:
     get:

@@ -62,7 +62,11 @@ jobs:
   release:
     name: Auto Bump Version, Release & GHCR Package
     needs: [ci]
-    if: github.repository == 'shukoilab/agy-gateway' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.repository == 'shukoilab/agy-gateway' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      !startsWith(github.event.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -99,7 +103,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "no version delta to commit; tagging HEAD"
           else
-            git commit -m "chore(release): v$VERSION [skip ci]"
+            git commit -m "chore(release): v$VERSION"
           fi
           # Retry-safe: an existing tag (fetched via fetch-depth: 0) must not abort the step.
           if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
