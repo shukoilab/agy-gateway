@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.1] - 2026-11-26
+
+### [3.16.1](https://github.com/shukoilab/agy-gateway/compare/v3.16.0...v3.16.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* **release:** stop nesting the changelog heading on release ([3567ff3](https://github.com/shukoilab/agy-gateway/commit/3567ff39d0c69d0dbd2257cf16db8b1e15343e42))
+
 ## [3.16.0] - 2026-11-26
 
 ### Features
