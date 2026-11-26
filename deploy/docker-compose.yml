@@ -1,6 +1,6 @@
 services:
   agy-gateway:
-    image: agy-gateway:3.15.1
+    image: agy-gateway:3.16.0
     build:
       context: ..
       dockerfile: deploy/Dockerfile

@@ -13,7 +13,7 @@
             "name": "MIT",
             "url": "https://github.com/shukoilab/agy-gateway/blob/main/LICENSE"
         },
-        "version": "3.15.1"
+        "version": "3.16.0"
     },
     "host": "localhost:8080",
     "basePath": "/",
