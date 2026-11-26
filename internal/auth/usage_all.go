@@ -26,6 +26,16 @@ type AccountUsage struct {
 	Active    bool
 	Groups    []AgyUsageGroup
 	FetchedAt time.Time
+	// UsageError carries the provider's reason when this account's quota could not be read.
+	//
+	// @purpose Makes a per-account quota fetch failure visible instead of indistinguishable from
+	// "this account has no limits".
+	// @rationale `agy-auth usage --all --json` reports a failed account as `usage_error` with the
+	// `groups` key absent, and still exits 0. Without this field the decoder sees an empty group
+	// slice, eligibility's bucket loop never iterates, and the account ranks as healthy — the exact
+	// fail-open that let an unverified account be selected as if it had unlimited quota.
+	// @invariants Empty exactly when the read succeeded; never a substitute for QuotasKnown.
+	UsageError string
 }
 
 // usageAllEnvelope mirrors `agy-auth usage --all --json`.
@@ -47,6 +57,9 @@ type usageAllEnvelope struct {
 			Alias  string          `json:"alias"`
 			Active bool            `json:"active"`
 			Groups []AgyUsageGroup `json:"groups"`
+			// UsageError is set by agy-auth when this account's quota read failed; the groups key is
+			// then absent rather than empty.
+			UsageError string `json:"usage_error"`
 		} `json:"accounts"`
 	} `json:"data"`
 }
@@ -74,6 +87,23 @@ func (m *Manager) FetchAllAccountUsage(ctx context.Context) (map[string]AccountU
 		return nil, fmt.Errorf("agy-auth usage --all failed: %w", err)
 	}
 
+	return decodeUsagePayload(out)
+}
+
+// decodeUsagePayload converts an `agy-auth usage --all --json` payload into per-account usage.
+//
+// @purpose Isolates the wire decode so the real parsing rules can be tested without a subprocess.
+// @rationale This is where the D4 fail-open lived: the payload's per-account `usage_error` was not
+// part of the decoded shape, so an account the provider refused to report on arrived as an account
+// with no limits. Testing through the subprocess would require a fake binary just to assert a struct
+// field, so the decode is separated and exercised directly.
+// @preconditions out is the raw stdout of the command.
+// @param out Raw JSON payload.
+// @returns Per-account usage keyed by account id.
+// @throws Returns an error when the payload is not JSON, or when it names accounts but none carries
+// an id (an unattributable response is a contract break, not an empty vault).
+// @invariants O(accounts); never returns a nil map alongside a nil error.
+func decodeUsagePayload(out []byte) (map[string]AccountUsage, error) {
 	var env usageAllEnvelope
 	if err := json.Unmarshal(out, &env); err != nil {
 		return nil, fmt.Errorf("failed to decode agy-auth usage payload: %w", err)
@@ -88,11 +118,12 @@ func (m *Manager) FetchAllAccountUsage(ctx context.Context) (map[string]AccountU
 			continue
 		}
 		usage[acc.ID] = AccountUsage{
-			AccountID: acc.ID,
-			Email:     acc.Email,
-			Active:    acc.Active,
-			Groups:    acc.Groups,
-			FetchedAt: now,
+			AccountID:  acc.ID,
+			Email:      acc.Email,
+			Active:     acc.Active,
+			Groups:     acc.Groups,
+			FetchedAt:  now,
+			UsageError: acc.UsageError,
 		}
 	}
 
@@ -128,11 +159,19 @@ func QuotaGroups(groups []AgyUsageGroup) map[string]QuotaGroup {
 			if key == "" {
 				key = fmt.Sprintf("%s-%s", grp.Name, b.Window)
 			}
+			// Clamp at the boundary: a malformed upstream fraction must not produce a negative or
+			// >100 percentage, because both ranking and the operator-facing report read this value.
+			fraction := b.RemainingFraction
+			if fraction < 0 {
+				fraction = 0
+			} else if fraction > 1 {
+				fraction = 1
+			}
 			quotas[key] = QuotaGroup{
 				Name:         fmt.Sprintf("%s - %s", grp.Name, b.Name),
-				RemainingPct: b.RemainingFraction * 100,
+				RemainingPct: fraction * 100,
 				ResetTime:    reset,
-				IsExhausted:  b.RemainingFraction <= 0,
+				IsExhausted:  fraction <= 0,
 			}
 		}
 	}

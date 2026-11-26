@@ -28,14 +28,22 @@ type QuotaGroup struct {
 
 // Account represents an individual Google Antigravity credential managed by the gateway.
 type Account struct {
-	ID             string        `json:"id" example:"acc_9f3b18e2"`
-	Email          string        `json:"email" example:"dev@shukoilab.com"`
-	Alias          string        `json:"alias,omitempty" example:"primary-account"`
-	AuthMethod     string        `json:"auth_method" example:"oauth"`
-	Tier           string        `json:"tier" example:"payg"` // "free", "payg", "standard"
-	Status         AccountStatus `json:"status" example:"HEALTHY"`
-	Enabled        bool          `json:"enabled" example:"true"`
-	AssignedWorker int           `json:"assigned_worker" example:"0"` // -1 if unassigned
+	ID         string        `json:"id" example:"acc_9f3b18e2"`
+	Email      string        `json:"email" example:"dev@shukoilab.com"`
+	Alias      string        `json:"alias,omitempty" example:"primary-account"`
+	AuthMethod string        `json:"auth_method" example:"oauth"`
+	Tier       string        `json:"tier" example:"payg"` // "free", "payg", "standard"
+	Status     AccountStatus `json:"status" example:"HEALTHY"`
+	Enabled    bool          `json:"enabled" example:"true"`
+	// ActiveInVault mirrors the vault's own "this is the current account" flag.
+	//
+	// @purpose Seeds sticky affinity on a first boot so the initial layout matches `agy-auth current`.
+	// @rationale The flag was already present in the `agy-auth list` payload but parsed into a local
+	// struct field that nothing consumed, so an operator's choice of active account had no effect on
+	// gateway allocation.
+	// @invariants True when the vault reports this account as active; at most one account per sync.
+	ActiveInVault  bool `json:"active_in_vault,omitempty"`
+	AssignedWorker int  `json:"assigned_worker" example:"0"` // -1 if unassigned
 	// VaultExpired records that the AUTH_EXPIRED state came from the vault's own report rather than
 	// from a runtime failure.
 	//
@@ -56,7 +64,26 @@ type Account struct {
 	// @invariants Keys are quota families; absent means no active cooldown for that family.
 	FamilyCooldowns map[string]time.Time  `json:"family_cooldowns,omitempty"`
 	Quotas          map[string]QuotaGroup `json:"quotas,omitempty"`
-	LastUsed        time.Time             `json:"last_used" example:"2026-11-24T10:00:00Z"`
+	// QuotasKnown records whether Quotas reflects a successful upstream read.
+	//
+	// @purpose Keeps "this account has no limits" distinguishable from "we could not ask", which the
+	// gateway previously could not tell apart at all.
+	// @rationale `agy-auth usage --all --json` reports a failed account as `usage_error` with the
+	// `groups` key absent, and still exits 0. Decoding that into an empty map made eligibility's
+	// bucket loop iterate zero times and return true, so an account whose quota was unreadable ranked
+	// exactly like an account with unlimited quota. Two fields are needed because the boolean drives
+	// ranking (cheap, no string parsing on a hot path) while the message explains the failure to an
+	// operator.
+	// @invariants True after a successful poll; false after a failed one or before the first poll.
+	QuotasKnown bool `json:"quotas_known"`
+	// UsageError carries the last quota-read failure reason for observability.
+	//
+	// @purpose Surfaces `forbidden`/`timeout` on the admin API instead of a silent `buckets: 0`.
+	// @rationale Purely diagnostic: it is never parsed to make a decision, so an upstream vocabulary
+	// change cannot alter behaviour. Bounded before storage so a vendor error cannot flood logs.
+	// @invariants Empty exactly when the last read succeeded; never consulted by ranking.
+	UsageError string    `json:"usage_error,omitempty"`
+	LastUsed   time.Time `json:"last_used" example:"2026-11-24T10:00:00Z"`
 }
 
 // QuotaFamilyGemini and QuotaFamilyThirdParty are the quota-family keys derived from bucket ids.
@@ -139,36 +166,42 @@ func QuotaFamilyOfBucket(bucketID string) string {
 	}
 }
 
-// IsEligibleForModel reports whether this account can serve one model's quota family.
+// EligibilityRank orders accounts by how confidently they can serve one model's quota family.
 //
-// @purpose Makes account selection model-aware so a healthy Gemini account is not skipped merely
-// because its third-party bucket is nearly spent (and vice versa).
-// @rationale Iteration is by map key rather than by value because the key is the bucket id, which
-// is the only reliable family discriminator available without another API call.
-// @preconditions model may be empty, in which case every family is checked.
-// @param model Upstream model id; empty or unrecognised means check all families.
+// @purpose Turns eligibility into a total ordering so a known-good account always beats one whose
+// quota state is merely unknown, instead of the two being indistinguishable.
+// @rationale A boolean cannot express "usable but unproven", and treating unknown as ineligible would
+// let a single failed `agy-auth usage` call take every account out of service — an outage in exchange
+// for a diagnostic. Treating unknown as fully healthy is the fail-open that let an account the
+// provider refuses to report on be selected as if it had unlimited quota. A three-valued rank is the
+// smallest structure that avoids both.
+// @preconditions None; safe on a nil receiver (returns 0).
+// @param model Upstream model id; empty or unrecognised means every family is checked.
 // @param requiresPaidTier Reject free accounts when the model demands a paid tier.
-// @param minRemainingPct Minimum remaining percentage required within the family.
-// @returns True when enabled, healthy, tier-eligible, and every relevant bucket is above the floor.
-// @throws None.
-// @invariants O(number of buckets); no allocation.
-func (a *Account) IsEligibleForModel(model string, requiresPaidTier bool, minRemainingPct float64) bool {
+// @param minRemainingPct Floor below which a known bucket counts as exhausted.
+// @returns 2 when quota is known and every relevant bucket is safe; 1 when the account is otherwise
+// serviceable but its quota state is unknown or no bucket covers this family; 0 when it must not be
+// used at all.
+// @throws None; never panics.
+// @invariants Pure and deterministic: no locks, no IO, no receiver mutation. O(number of buckets) in
+// both time and space, with no allocation.
+func (a *Account) EligibilityRank(model string, requiresPaidTier bool, minRemainingPct float64) int {
 	if a == nil || !a.Enabled {
-		return false
+		return 0
 	}
 	// A credential-level fault removes every family at once; bucket cooldowns do not.
 	if a.Status == StatusAuthExpired || a.Status == StatusDisabled {
-		return false
+		return 0
 	}
 	// Legacy/unknown cooldown source: a quota-status set without any per-family window (a fixture, or
 	// state written before FamilyCooldowns existed) cannot be attributed to one family, so it is
 	// treated as all-family to fail safe. The poller and MarkAccountStatus always populate the map,
 	// so a genuine partial cooldown never takes this branch.
 	if len(a.FamilyCooldowns) == 0 && (a.Status == StatusCooldown5h || a.Status == StatusCooldownWeekly) {
-		return false
+		return 0
 	}
 	if requiresPaidTier && a.Tier == "free" {
-		return false
+		return 0
 	}
 
 	family := QuotaFamilyForModel(model)
@@ -177,21 +210,49 @@ func (a *Account) IsEligibleForModel(model string, requiresPaidTier bool, minRem
 		// Unknown model: every family the account knows about must still be serviceable.
 		for _, until := range a.FamilyCooldowns {
 			if now.Before(until) {
-				return false
+				return 0
 			}
 		}
 	} else if until, ok := a.FamilyCooldowns[family]; ok && now.Before(until) {
 		// Only the family this model draws from is disqualified; other families stay usable.
-		return false
+		return 0
 	}
 
+	sawBucket := false
 	for bucketID, q := range a.Quotas {
 		if family != "" && QuotaFamilyOfBucket(bucketID) != family {
 			continue
 		}
+		sawBucket = true
 		if q.IsExhausted || q.RemainingPct < minRemainingPct {
-			return false
+			return 0
 		}
 	}
-	return true
+
+	// No data at all for this family: usable, but unproven. Never preferred over a known-good peer,
+	// never removed from service either — a real turn is the only way to learn the truth, and failover
+	// already handles the case where it goes wrong.
+	if !a.QuotasKnown || !sawBucket {
+		return 1
+	}
+	return 2
+}
+
+// IsEligibleForModel reports whether this account can serve one model's quota family.
+//
+// @purpose Keeps every existing caller's strict "can this be used at all" semantics unchanged while
+// the ranking logic lives in EligibilityRank.
+// @rationale Selection needs a total ordering (FR-01), but callers that only ask a yes/no question
+// must not silently start accepting unknown-quota accounts that they previously rejected on a
+// populated map. Delegating with `rank > 0` preserves the old observable contract for every caller
+// and keeps one implementation of the rules.
+// @preconditions None; safe on a nil receiver.
+// @param model Upstream model id; empty or unrecognised means check all families.
+// @param requiresPaidTier Reject free accounts when the model demands a paid tier.
+// @param minRemainingPct Minimum remaining percentage required within the family.
+// @returns True when EligibilityRank reports the account as usable (rank above zero).
+// @throws None.
+// @invariants O(number of buckets); no allocation; no receiver mutation.
+func (a *Account) IsEligibleForModel(model string, requiresPaidTier bool, minRemainingPct float64) bool {
+	return a.EligibilityRank(model, requiresPaidTier, minRemainingPct) > 0
 }

@@ -129,7 +129,29 @@ var unsupportedParamPolicies = []string{"strip_and_warn", "reject"}
 // @rationale The value was previously unused, so any typo silently behaved like the hardcoded
 // round-robin. Round robin spreads load; least_used follows live quota; sticky avoids churn on a
 // worker that already holds a usable account.
-var allocationStrategies = []string{"round_robin", "least_used", "sticky"}
+var allocationStrategies = []string{
+	AllocationStrategyRoundRobin, AllocationStrategyLeastUsed, AllocationStrategySticky,
+}
+
+// AllocationStrategy* are the supported pool allocation policies.
+//
+// @purpose Gives callers a compile-time-checked name instead of repeating string literals, which is
+// how the value previously drifted from its documented behaviour without anyone noticing.
+// @rationale `sticky` in particular is load-bearing: the pool persists worker affinity to disk, and
+// the persistence layer must compare against the same constant the config validator accepts.
+// @preconditions None.
+// @param None.
+// @returns None.
+// @throws None.
+// @invariants Immutable constants; safe for concurrent use.
+const (
+	// AllocationStrategyRoundRobin spreads distinct accounts across workers by index.
+	AllocationStrategyRoundRobin = "round_robin"
+	// AllocationStrategyLeastUsed is quota-aware greedy over live headroom.
+	AllocationStrategyLeastUsed = "least_used"
+	// AllocationStrategySticky keeps each worker on its account across restarts.
+	AllocationStrategySticky = "sticky"
+)
 
 // allocationStrategyLegacyAliases maps values that existed before the knob was wired up.
 //
@@ -153,7 +175,7 @@ var allocationStrategyLegacyAliases = map[string]string{
 func NormalizeAllocationStrategy(v string) string {
 	v = strings.ToLower(strings.TrimSpace(v))
 	if v == "" {
-		return "round_robin"
+		return AllocationStrategyRoundRobin
 	}
 	if canonical, ok := allocationStrategyLegacyAliases[v]; ok {
 		return canonical

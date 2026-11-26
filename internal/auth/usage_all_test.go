@@ -227,3 +227,106 @@ func TestReadSingleCredential_EnforcesExactlyOneFile(t *testing.T) {
 		}
 	})
 }
+
+// TestQuotaGroups_ClampsOutOfRangeFraction pins FR-09.
+//
+// @purpose Proves a malformed upstream fraction cannot produce an impossible percentage.
+// @rationale Ranking and the operator-facing report both read RemainingPct; a negative or >100 value
+// would corrupt both. The clamp belongs at the decode boundary, where the bad data enters.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestQuotaGroups_ClampsOutOfRangeFraction(t *testing.T) {
+	groups := []AgyUsageGroup{{
+		Name: "Gemini Models",
+		Buckets: []AgyUsageBucket{
+			{ID: "gemini-weekly", Window: "weekly", RemainingFraction: 1.5},
+			{ID: "gemini-5h", Window: "5h", RemainingFraction: -0.2},
+		},
+	}}
+
+	got := QuotaGroups(groups)
+
+	if pct := got["gemini-weekly"].RemainingPct; pct != 100 {
+		t.Fatalf("fraction 1.5 -> %v%%, want 100", pct)
+	}
+	if pct := got["gemini-5h"].RemainingPct; pct != 0 {
+		t.Fatalf("fraction -0.2 -> %v%%, want 0", pct)
+	}
+	if !got["gemini-5h"].IsExhausted {
+		t.Fatal("a clamped-to-zero bucket must be reported as exhausted")
+	}
+	if got["gemini-weekly"].IsExhausted {
+		t.Fatal("a clamped-to-100 bucket must not be reported as exhausted")
+	}
+}
+
+// TestDecodeUsagePayload_PropagatesUsageError pins the D4 wire contract.
+//
+// @purpose Proves a per-account quota failure is visible to the caller instead of decoding into an
+// empty, apparently unlimited account.
+// @rationale `agy-auth usage --all --json` reports a failed account as `usage_error` with the `groups`
+// key absent and still exits 0. Without this field the decoder saw nothing wrong, eligibility's bucket
+// loop iterated zero times, and the account ranked exactly like one with unlimited quota — which is
+// how an unverified account was selected in production. This exercises the real decoder, not a
+// re-implementation of it.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic; no subprocess.
+func TestDecodeUsagePayload_PropagatesUsageError(t *testing.T) {
+	payload := []byte(`{"schema_version":1,"command":"usage","data":{"accounts":[
+		{"id":"acct_ok","email":"ok@example.com","active":true,"groups":[
+			{"name":"Gemini Models","buckets":[
+				{"id":"gemini-weekly","window":"weekly","remaining_fraction":0.9,"reset_time":"2026-12-01T00:00:00Z"}]}]},
+		{"id":"acct_bad","email":"bad@example.com","active":false,"usage_error":"forbidden"}
+	]}}`)
+
+	usage, err := decodeUsagePayload(payload)
+	if err != nil {
+		t.Fatalf("decodeUsagePayload: %v", err)
+	}
+
+	ok := usage["acct_ok"]
+	if ok.UsageError != "" {
+		t.Fatalf("acct_ok UsageError = %q, want empty", ok.UsageError)
+	}
+	if len(ok.Groups) == 0 {
+		t.Fatal("acct_ok must carry its groups")
+	}
+
+	bad := usage["acct_bad"]
+	if bad.UsageError != "forbidden" {
+		t.Fatalf("acct_bad UsageError = %q, want %q", bad.UsageError, "forbidden")
+	}
+	if len(bad.Groups) != 0 {
+		t.Fatalf("acct_bad Groups = %d, want 0 (the wire omits them)", len(bad.Groups))
+	}
+}
+
+// TestDecodeUsagePayload_RejectsUnattributableAccounts pins the id-less contract.
+//
+// @purpose Proves a response naming accounts without ids is an error, not an empty success.
+// @rationale An empty map under a nil error reads as "no accounts", which polling would then treat as
+// "nothing to update" while the vault is actually full.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestDecodeUsagePayload_RejectsUnattributableAccounts(t *testing.T) {
+	if _, err := decodeUsagePayload([]byte(`{"data":{"accounts":[{"email":"x@example.com"}]}}`)); err == nil {
+		t.Fatal("expected an error when accounts are present but none carries an id")
+	}
+	// An empty account list is a legitimate success.
+	usage, err := decodeUsagePayload([]byte(`{"data":{"accounts":[]}}`))
+	if err != nil {
+		t.Fatalf("an empty account list must decode successfully: %v", err)
+	}
+	if len(usage) != 0 {
+		t.Fatalf("expected no entries, got %v", usage)
+	}
+}

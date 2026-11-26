@@ -614,3 +614,157 @@ func TestGetAccountsSnapshotIsolatedFromPoller(t *testing.T) {
 		}
 	}
 }
+
+// TestQuotaPoller_UsageErrorDoesNotWipeKnownQuotas pins FR-03.
+//
+// @purpose Proves a failed quota read never erases data the gateway already had.
+// @rationale Poll previously assigned QuotaGroups(live.Groups) unconditionally, so a `usage_error`
+// response overwrote a healthy known map with an empty one — turning a transient provider error into
+// "this account has no limits" and, worse, discarding the real depletion windows.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestQuotaPoller_UsageErrorDoesNotWipeKnownQuotas(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.MinRemainingQuotaPct = 5
+	cfg.Accounts.AutoRotateEnabled = true
+	mgr := NewManager(cfg, nil)
+	mgr.SetAccountsForTest([]Account{{
+		ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+		QuotasKnown: true,
+		Quotas: map[string]QuotaGroup{
+			"gemini-weekly": {RemainingPct: 42},
+		},
+		FamilyCooldowns: map[string]time.Time{},
+	}})
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_a": {AccountID: "acct_a", Email: "a@example.com", UsageError: "forbidden"},
+		}, nil
+	})
+
+	NewQuotaPoller(mgr, cfg, nil).Poll(context.Background())
+
+	acc := mgr.GetAccounts()[0]
+	if acc.QuotasKnown {
+		t.Fatal("QuotasKnown must be false after a failed read")
+	}
+	if acc.Quotas["gemini-weekly"].RemainingPct != 42 {
+		t.Fatalf("known quota was wiped by a failed read: %v", acc.Quotas)
+	}
+	if acc.UsageError != "forbidden" {
+		t.Fatalf("UsageError = %q, want %q", acc.UsageError, "forbidden")
+	}
+}
+
+// TestQuotaPoller_SuccessClearsUsageError pins the recovery direction.
+//
+// @purpose Proves a later successful read restores full rank and clears the diagnostic.
+// @rationale Otherwise a single transient failure would permanently demote the account to rank 1.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestQuotaPoller_SuccessClearsUsageError(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.MinRemainingQuotaPct = 5
+	cfg.Accounts.AutoRotateEnabled = true
+	reset := time.Now().Add(2 * time.Hour)
+	mgr := NewManager(cfg, nil)
+	mgr.SetAccountsForTest([]Account{{
+		ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+		QuotasKnown: false, UsageError: "timeout",
+		Quotas:          map[string]QuotaGroup{},
+		FamilyCooldowns: map[string]time.Time{},
+	}})
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_a": {AccountID: "acct_a", Email: "a@example.com", Active: true,
+				Groups: []AgyUsageGroup{{Name: "Gemini Models", Buckets: []AgyUsageBucket{
+					{ID: "gemini-weekly", Window: "weekly", RemainingFraction: 0.9,
+						ResetTime: reset.UTC().Format(time.RFC3339)},
+				}}}},
+		}, nil
+	})
+
+	NewQuotaPoller(mgr, cfg, nil).Poll(context.Background())
+
+	acc := mgr.GetAccounts()[0]
+	if !acc.QuotasKnown {
+		t.Fatal("QuotasKnown must be true after a successful read")
+	}
+	if acc.UsageError != "" {
+		t.Fatalf("UsageError = %q, want empty after success", acc.UsageError)
+	}
+	if acc.Quotas["gemini-weekly"].RemainingPct != 90 {
+		t.Fatalf("expected the refreshed quota, got %v", acc.Quotas)
+	}
+}
+
+// TestQuotaPoller_UnknownAccountStaysUsableButDemoted pins FR-02's balance.
+//
+// @purpose Proves an account with unreadable quota is still assignable, yet ranks below a known-good
+// peer.
+// @rationale Refusing every unknown account would turn one failing `agy-auth usage` call into a total
+// outage; treating it as fully healthy is the fail-open that caused the production defect. Rank 1
+// expresses exactly the middle ground.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestQuotaPoller_UnknownAccountStaysUsableButDemoted(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.MinRemainingQuotaPct = 5
+	cfg.Accounts.AutoRotateEnabled = true
+	mgr := NewManager(cfg, nil)
+	mgr.SetAccountsForTest([]Account{
+		{ID: "acct_unknown", Email: "u@example.com", Enabled: true, Status: StatusHealthy,
+			QuotasKnown: true, Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+		{ID: "acct_known", Email: "k@example.com", Enabled: true, Status: StatusHealthy,
+			QuotasKnown: false, Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+	})
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_unknown": {AccountID: "acct_unknown", Email: "u@example.com", UsageError: "forbidden"},
+			"acct_known": {AccountID: "acct_known", Email: "k@example.com", Active: true,
+				Groups: []AgyUsageGroup{{Name: "Gemini Models", Buckets: []AgyUsageBucket{
+					{ID: "gemini-weekly", Window: "weekly", RemainingFraction: 0.9},
+				}}}},
+		}, nil
+	})
+
+	NewQuotaPoller(mgr, cfg, nil).Poll(context.Background())
+
+	accounts := mgr.GetAccounts()
+	ranks := map[string]int{}
+	for i := range accounts {
+		ranks[accounts[i].ID] = accounts[i].EligibilityRank("gemini-3.8-flash", false, 5)
+	}
+	if ranks["acct_unknown"] != 1 {
+		t.Fatalf("unknown-quota rank = %d, want 1 (usable but demoted)", ranks["acct_unknown"])
+	}
+	if ranks["acct_known"] != 2 {
+		t.Fatalf("known-good rank = %d, want 2", ranks["acct_known"])
+	}
+
+	// The demoted account must still be selectable when nothing better is left.
+	next, err := mgr.FindNextEligibleAccount("acct_known", "gemini-3.8-flash", false, nil)
+	if err != nil {
+		t.Fatalf("the unknown-quota account must remain selectable: %v", err)
+	}
+	if next.ID != "acct_unknown" {
+		t.Fatalf("selected %s, want acct_unknown", next.ID)
+	}
+	// But with both available, the known-good one must win.
+	best, err := mgr.FindNextEligibleAccount("", "gemini-3.8-flash", false, nil)
+	if err != nil {
+		t.Fatalf("expected a selection: %v", err)
+	}
+	if best.ID != "acct_known" {
+		t.Fatalf("selected %s, want acct_known (rank 2 must beat rank 1)", best.ID)
+	}
+}

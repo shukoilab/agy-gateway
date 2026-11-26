@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -410,19 +413,20 @@ func TestMaterializeOnRotation_WritesAccountIdentity(t *testing.T) {
 	}
 }
 
-// TestAccountsInUse_ReportsOnlyOtherWorkersClaims pins the inputs rotation depends on.
+// TestAccountsInUse_ReportsClaimCounts pins the inputs rotation depends on.
 //
-// @purpose Guarantees the pool tells the manager which accounts are genuinely taken by a *different*
-// worker, so a worker's own binding never looks like a conflict and an already-shared account is not
-// reported at all.
-// @rationale Passing a wrong map would either strand a worker (its own claim treated as a conflict)
-// or hide a real conflict (a shared account counted as exclusive), so both directions are asserted.
+// @purpose Guarantees the pool reports how many OTHER workers hold each account, so a worker's own
+// binding never looks like a conflict and a heavily-shared account looks as contended as it is.
+// @rationale Passing a wrong map would either strand a worker (its own claim treated as a conflict) or
+// misrank rotation. The previous contract returned a single owner id and OMITTED any account held by
+// two or more workers, which made the most contended accounts look entirely free — so rotation piled
+// onto them while a one-way account sat idle. Claim counts remove that blind spot.
 // @preconditions None.
 // @param t Standard Go test handle.
 // @returns None.
 // @throws None; failures are reported through t.Errorf.
 // @invariants O(workers); no locks, no subprocess.
-func TestAccountsInUse_ReportsOnlyOtherWorkersClaims(t *testing.T) {
+func TestAccountsInUse_ReportsClaimCounts(t *testing.T) {
 	cfg := config.DefaultConfig()
 	p := NewTestPoolWithNoWorkers(cfg)
 
@@ -443,14 +447,17 @@ func TestAccountsInUse_ReportsOnlyOtherWorkersClaims(t *testing.T) {
 	if _, ok := inUse["acc_a"]; ok {
 		t.Errorf("own account reported as claimed; a worker must not conflict with itself")
 	}
-	if owner, ok := inUse["acc_b"]; !ok || owner != 1 {
-		t.Errorf("acc_b = (%d, %v), want (1, true)", owner, ok)
+	if got := inUse["acc_b"]; got != 1 {
+		t.Errorf("acc_b count = %d, want 1", got)
 	}
-	if _, ok := inUse["acc_shared"]; ok {
-		t.Errorf("an account already held by two workers was reported as exclusive")
+	if got := inUse["acc_shared"]; got != 2 {
+		t.Errorf("acc_shared count = %d, want 2 (both holders must be counted)", got)
 	}
-	if len(inUse) != 1 {
-		t.Errorf("inUse has %d entries, want only acc_b: %v", len(inUse), inUse)
+	if len(inUse) != 2 {
+		t.Errorf("inUse has %d entries, want acc_b and acc_shared: %v", len(inUse), inUse)
+	}
+	if inUse == nil {
+		t.Error("accountsInUse must never return a nil map")
 	}
 }
 
@@ -667,5 +674,268 @@ func TestQuotaPoller_DoesNotResurrectAuthExpired(t *testing.T) {
 	acc := mgr.GetAccounts()[0]
 	if acc.Status != auth.StatusAuthExpired {
 		t.Fatalf("status = %s, want AUTH_EXPIRED preserved through a poll", acc.Status)
+	}
+}
+
+// TestAssignAccounts_LeastUsedSpreadsAcrossWorkers is the test that would have caught D1.
+//
+// @purpose Proves least_used distributes distinct accounts instead of collapsing every worker onto
+// the single highest-quota account.
+// @rationale The strategy computed the highest score independently per worker and never read the
+// assignment counter it maintained, so with scores 99/81/8 and three workers all three rows were the
+// 99 account. An operator who set least_used to spread load got the exact opposite. The old test used
+// workerCount=1, which is why the defect survived review.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic; no filesystem, no subprocess.
+func TestAssignAccounts_LeastUsedSpreadsAcrossWorkers(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.AllocationStrategy = config.AllocationStrategyLeastUsed
+	p := &Pool{cfg: cfg}
+
+	accounts := []auth.Account{
+		accountWithQuotas("acct_best", 99, 99),
+		accountWithQuotas("acct_mid", 81, 81),
+		accountWithQuotas("acct_worst", 8, 8),
+	}
+
+	got := p.assignAccounts(accounts, 3)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 assignments, got %d", len(got))
+	}
+
+	seen := map[string]int{}
+	for _, acc := range got {
+		seen[acc.ID]++
+	}
+	if len(seen) != 3 {
+		t.Fatalf("least_used collapsed workers onto %d account(s) (%v); want 3 distinct", len(seen), seen)
+	}
+	// The highest-quota account must still be the first pick, so the strategy remains quota-aware and
+	// does not merely degenerate into round_robin.
+	if got[0].ID != "acct_best" {
+		t.Fatalf("first assignment = %s, want acct_best (highest remaining quota)", got[0].ID)
+	}
+}
+
+// TestAssignAccounts_LeastUsedFallsBackToReuse pins the behaviour when workers outnumber accounts.
+//
+// @purpose Proves the strategy reuses accounts evenly rather than failing or starving a worker.
+// @rationale Refusing to allocate would leave a configured worker permanently unusable; the correct
+// behaviour is the most even split available, with a logged warning.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestAssignAccounts_LeastUsedFallsBackToReuse(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.AllocationStrategy = config.AllocationStrategyLeastUsed
+	p := &Pool{cfg: cfg}
+
+	accounts := []auth.Account{
+		accountWithQuotas("acct_a", 90, 90),
+		accountWithQuotas("acct_b", 50, 50),
+	}
+
+	got := p.assignAccounts(accounts, 5)
+	if len(got) != 5 {
+		t.Fatalf("expected 5 assignments, got %d", len(got))
+	}
+	counts := map[string]int{}
+	for _, acc := range got {
+		counts[acc.ID]++
+	}
+	// 5 slots over 2 accounts: 3/2. The exact split matters less than the spread being even and both
+	// accounts used.
+	if counts["acct_a"] < 2 || counts["acct_b"] < 2 {
+		t.Fatalf("expected both accounts reused, got %v", counts)
+	}
+	if diff := counts["acct_a"] - counts["acct_b"]; diff < -1 || diff > 1 {
+		t.Fatalf("reuse is uneven (%v); no account may carry two more workers than another", counts)
+	}
+}
+
+// TestAssignAccounts_EmptyVaultReturnsEmpty pins EC-01.
+//
+// @purpose Proves an empty account list yields an empty assignment instead of a panic.
+// @rationale The previous implementation indexed accounts[0] for least_used, so an empty vault was a
+// nil-dereference in the startup path rather than an actionable error.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic; no allocation.
+func TestAssignAccounts_EmptyVaultReturnsEmpty(t *testing.T) {
+	for _, strategy := range []string{
+		config.AllocationStrategyRoundRobin,
+		config.AllocationStrategyLeastUsed,
+		config.AllocationStrategySticky,
+	} {
+		cfg := config.DefaultConfig()
+		cfg.Accounts.AllocationStrategy = strategy
+		p := &Pool{cfg: cfg}
+
+		if got := p.assignAccounts(nil, 3); len(got) != 0 {
+			t.Fatalf("%s: expected no assignments for an empty vault, got %d", strategy, len(got))
+		}
+	}
+}
+
+// TestAssignAccounts_SharingWarningFiresWhenCountsMatch pins FR-06.
+//
+// @purpose Proves the sharing warning reports the real condition instead of a count comparison.
+// @rationale The warning was gated on `workerCount > len(accounts)`, which is false in the common
+// balanced case (3 workers, 3 accounts) even when a strategy put all three on one account, so the
+// operator saw a silent, fully-shared pool. This drives the real `assignAccounts` path — an earlier
+// version called `warnOnSharedAccounts` directly, which let the gate be reintroduced without the test
+// noticing, making the claimed mutation proof false.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic; uses a captured log buffer.
+func TestAssignAccounts_SharingWarningFiresWhenCountsMatch(t *testing.T) {
+	var buf lockedBuffer
+	cfg := config.DefaultConfig()
+	cfg.Accounts.AllocationStrategy = config.AllocationStrategyLeastUsed
+	p := &Pool{cfg: cfg, logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+
+	// The case the old `workerCount > len(accounts)` gate missed: EQUAL counts (2 workers, 2 accounts)
+	// where one account is ineligible, so both workers necessarily share the surviving one.
+	spent := accountWithQuotas("acct_spent", 0, 0)
+	spent.Quotas["gemini-weekly"] = auth.QuotaGroup{RemainingPct: 0, IsExhausted: true}
+	spent.Quotas["3p-weekly"] = auth.QuotaGroup{RemainingPct: 0, IsExhausted: true}
+	accounts := []auth.Account{spent, accountWithQuotas("acct_ok", 90, 90)}
+
+	got := p.assignAccounts(accounts, 2)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 assignments, got %d", len(got))
+	}
+	if got[0].ID != got[1].ID {
+		t.Fatalf("fixture must force sharing, got %s and %s", got[0].ID, got[1].ID)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "multiple workers share one account") {
+		t.Fatalf("expected a sharing warning with equal worker/account counts, got %q", out)
+	}
+	if !strings.Contains(out, "acct_ok") {
+		t.Fatalf("warning must name the shared account, got %q", out)
+	}
+}
+
+// TestAssignAccounts_NoSharingWarningWhenOnePerWorker pins the warning's negative case.
+//
+// @purpose Proves a healthy one-account-per-worker pool produces no warning.
+// @rationale A warning that fires unconditionally would be noise an operator learns to ignore.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestAssignAccounts_NoSharingWarningWhenOnePerWorker(t *testing.T) {
+	var buf lockedBuffer
+	cfg := config.DefaultConfig()
+	cfg.Accounts.AllocationStrategy = config.AllocationStrategyRoundRobin
+	p := &Pool{cfg: cfg, logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))}
+
+	accounts := []auth.Account{
+		accountWithQuotas("acct_a", 90, 90),
+		accountWithQuotas("acct_b", 90, 90),
+		accountWithQuotas("acct_c", 90, 90),
+	}
+	got := p.assignAccounts(accounts, 3)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 assignments, got %d", len(got))
+	}
+	if out := buf.String(); strings.Contains(out, "multiple workers share") {
+		t.Fatalf("a one-account-per-worker pool must not warn, got %q", out)
+	}
+}
+
+// lockedBuffer is a concurrency-safe bytes.Buffer for log assertions.
+//
+// @purpose Lets a test capture slog output without racing the handler goroutine.
+// @rationale slog may write from another goroutine; a bare bytes.Buffer would be a data race under
+// -race even when only one goroutine is expected.
+// @preconditions None.
+// @param None.
+// @returns None.
+// @throws None.
+// @invariants O(len(p)) per write.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestInitWorkers_BootBindingIsLowestIdWins pins FINDING-R9.
+//
+// @purpose Drives the real boot path and proves `assigned_worker` is not stamped in loop order.
+// @rationale `initWorkers` called `MarkAccountBinding(acc.ID, i)` per iteration, so when one account
+// was assigned to several workers the field ended up owned by the HIGHEST holder ({0,2} ⇒ 2) until a
+// later publish corrected it — the same last-writer-wins defect as FINDING-R7, through boot. An
+// earlier version of this test called `reconcileBindings` itself, so removing the call from
+// `initWorkers` left it green: it has to run the real function.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Spawns no ACP process; the export seam is stubbed so provisioning is filesystem-only.
+func TestInitWorkers_BootBindingIsLowestIdWins(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Accounts.AllocationStrategy = config.AllocationStrategyRoundRobin
+	cfg.Pool.WorkerCount = 2
+	cfg.Storage.BaseDataDir = t.TempDir()
+	cfg.Storage.WorkersRootDir = t.TempDir()
+	cfg.Storage.WorkersTmpDir = t.TempDir()
+	cfg.Storage.WorkspacesRootDir = t.TempDir()
+
+	mgr := auth.NewManager(cfg, nil)
+	// ONE account for TWO workers: round_robin must share it, which is the shape that exposes the bug.
+	mgr.SetAccountsForTest([]auth.Account{
+		{ID: "acct_shared", Email: "shared@example.com", Enabled: true, Status: auth.StatusHealthy,
+			AssignedWorker: -1, Quotas: map[string]auth.QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+	})
+	mgr.SetExportForTest(func(_ context.Context, dir, _ string) error {
+		payload := `{"token":{"access_token":"a","token_type":"Bearer","refresh_token":"r","expiry":"2026-11-27T00:00:00Z"},"auth_method":"oauth","id_token":"i","id_token_email":"shared@example.com"}`
+		return os.WriteFile(filepath.Join(dir, "creds.json"), []byte(payload), 0o600)
+	})
+
+	// leaseCh is required: the warm-start goroutine ends with `p.leaseCh <- worker`, which blocks
+	// forever on a nil channel and leaks one goroutine per boot for the rest of the test binary's life.
+	p := &Pool{cfg: cfg, authMgr: mgr, workers: make([]*Worker, cfg.Pool.WorkerCount),
+		leaseCh: make(chan *Worker, cfg.Pool.WorkerCount),
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil))}
+	if err := p.initWorkers(context.Background()); err != nil {
+		t.Fatalf("initWorkers: %v", err)
+	}
+	t.Cleanup(func() {
+		for _, w := range p.workers {
+			if w != nil {
+				w.Close()
+			}
+		}
+	})
+
+	for _, acc := range mgr.GetAccounts() {
+		if acc.ID == "acct_shared" && acc.AssignedWorker != 0 {
+			t.Fatalf("boot binding = %d, want 0: a shared account must not be owned by its highest holder",
+				acc.AssignedWorker)
+		}
 	}
 }

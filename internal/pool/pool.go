@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -35,6 +37,14 @@ type Pool struct {
 	mu      sync.Mutex
 	bgWg    sync.WaitGroup
 	closed  bool
+	// bindingsMu serialises the load/compare/save of the sticky file.
+	//
+	// @purpose Closes the lost-update window where two concurrent leases each load, compare, and save.
+	// @rationale Without it the later save can carry a snapshot older than a SetAccount that landed in
+	// between. A dedicated mutex (never held across a subprocess or an account-mutex acquisition)
+	// costs one uncontended lock per publish and makes the write a true compare-and-swap.
+	// @invariants Never acquired while holding `mu`; never held across IO other than the bindings file.
+	bindingsMu sync.Mutex
 }
 
 // NewPool initializes and starts the worker pool.
@@ -109,6 +119,10 @@ func (p *Pool) initWorkers(ctx context.Context) error {
 		boundAcc := acc
 		w := NewWorker(i, homeDir, tmpDir, cwd, &boundAcc, p.cfg, p.logger)
 		p.workers[i] = w
+		// The startup binding is reconciled once, after this loop. It must NOT be stamped here:
+		// `MarkAccountBinding(acc.ID, i)` per iteration makes the field last-writer-wins, so a shared
+		// account boots owned by its HIGHEST holder ({0,2} ⇒ 2) instead of by the reconciled lowest
+		// id — the same defect class as FINDING-R7, reached through the boot path.
 
 		// Attempt background warm startup
 		go func(worker *Worker) {
@@ -120,6 +134,10 @@ func (p *Pool) initWorkers(ctx context.Context) error {
 			p.leaseCh <- worker
 		}(w)
 	}
+
+	// One reconciliation for the whole boot: deterministic lowest-id ownership for any account shared
+	// by several workers, and `assigned_worker` truthful before the first lease.
+	p.reconcileBindings()
 
 	return nil
 }
@@ -153,54 +171,341 @@ var ErrNoAccounts = errors.New("no accounts are available in the vault")
 // @purpose Decides which account each worker authenticates as at startup.
 // @rationale Every worker previously received whatever token happened to exist under the gateway HOME,
 // so the assignment was cosmetic. Assigning explicitly is what makes per-worker credentials possible.
-// Accounts are reused only when there are more workers than accounts; that is logged because a shared
-// account means two processes can race the same refresh token.
-// @preconditions accounts is non-empty.
-// @param accounts Accounts eligible for assignment, in vault order.
+// Each strategy now does what its name and documentation claim: round_robin spreads by index,
+// least_used is greedy over prior assignment counts (the counter was previously written and never
+// read, which collapsed every worker onto the single highest-quota account), and sticky honours
+// persisted affinity with an eligibility fallback. Accounts are reused only when no free eligible
+// account remains, and every such case is logged because a shared account means two processes can
+// race the same refresh token.
+// @preconditions accounts may be empty; workerCount is non-negative.
+// @param accounts Accounts available for assignment, in vault order.
 // @param workerCount Number of workers to assign.
-// @returns A slice of length workerCount.
-// @throws None; never returns fewer entries than workerCount.
-// @invariants O(workerCount × accounts) for least_used, O(workerCount) otherwise.
+// @returns A slice of length min(workerCount, capacity) — exactly workerCount when accounts is
+// non-empty, and empty when the vault holds no accounts.
+// @throws None; never indexes an empty slice.
+// @invariants O(workerCount × accounts) in the worst case; deterministic for identical inputs;
+// performs filesystem IO only for the sticky strategy.
 func (p *Pool) assignAccounts(accounts []auth.Account, workerCount int) []auth.Account {
+	if workerCount <= 0 || len(accounts) == 0 {
+		// Guards the previous `accounts[0]` dereference: an empty vault must produce an empty
+		// assignment rather than a panic in the startup path.
+		return nil
+	}
+
 	strategy := config.NormalizeAllocationStrategy(p.cfg.Accounts.AllocationStrategy)
-	assignments := make([]auth.Account, 0, workerCount)
+	assignments := make([]auth.Account, workerCount)
 	usedPerAccount := make(map[string]int, len(accounts))
+	// assigned[i] records whether slot i has been filled, so sticky can skip honoured bindings.
+	assigned := make([]bool, workerCount)
+	minPct := p.cfg.Accounts.MinRemainingQuotaPct
+
+	// eligible reports whether an account may be bound at all right now.
+	eligible := func(acc auth.Account) bool { return rankForAllocation(acc, minPct) }
+	byID := func(id string) (auth.Account, bool) {
+		for _, acc := range accounts {
+			if acc.ID == id {
+				return acc, true
+			}
+		}
+		return auth.Account{}, false
+	}
+
+	// greedy fills one slot using the least-used rule: fewest prior assignments, then highest
+	// remaining quota, then vault order. Only accounts not already claimed are considered, so the
+	// spread is maximised before any reuse happens.
+	greedy := func(slot int) bool {
+		// Fewest claims first is what spreads the pool evenly on its own: while any account is
+		// unused its count is 0, so it beats every used account regardless of quota. Quota only
+		// decides between accounts already carrying the same load, and vault order settles the rest.
+		bestIdx := -1
+		for i := range accounts {
+			if !eligible(accounts[i]) {
+				continue
+			}
+			if bestIdx < 0 {
+				bestIdx = i
+				continue
+			}
+			cur, best := accounts[i], accounts[bestIdx]
+			switch {
+			case usedPerAccount[cur.ID] < usedPerAccount[best.ID]:
+				bestIdx = i
+			case usedPerAccount[cur.ID] == usedPerAccount[best.ID] && quotaScore(cur) > quotaScore(best):
+				bestIdx = i
+			}
+		}
+		if bestIdx < 0 {
+			return false
+		}
+		chosen := accounts[bestIdx]
+		usedPerAccount[chosen.ID]++
+		assignments[slot] = chosen
+		assigned[slot] = true
+		return true
+	}
+
+	switch strategy {
+	case config.AllocationStrategySticky:
+		p.assignSticky(accounts, assignments, assigned, usedPerAccount, eligible, byID, greedy)
+	case config.AllocationStrategyLeastUsed:
+		for i := 0; i < workerCount; i++ {
+			if !greedy(i) {
+				break
+			}
+		}
+	default: // round_robin
+		for i := 0; i < workerCount; i++ {
+			chosen := accounts[i%len(accounts)]
+			usedPerAccount[chosen.ID]++
+			assignments[i] = chosen
+			assigned[i] = true
+		}
+	}
+
+	// Any slot left unfilled (fewer eligible accounts than workers) falls back to vault order so the
+	// pool still starts with a usable account per worker; materialisation reports a real error later
+	// if the credential turns out to be broken.
+	for i := 0; i < workerCount; i++ {
+		if !assigned[i] {
+			chosen := accounts[i%len(accounts)]
+			usedPerAccount[chosen.ID]++
+			assignments[i] = chosen
+		}
+	}
+
+	p.warnOnSharedAccounts(assignments, len(accounts))
+	return assignments
+}
+
+// assignSticky honours persisted worker affinity, then fills the remainder greedily.
+//
+// @purpose Makes `sticky` keep each worker on its account across restarts.
+// @rationale The strategy previously behaved exactly like round_robin: nothing read the value and no
+// binding was ever persisted, so a restart silently reshuffled every worker. A binding is honoured
+// only when the account still exists, is still usable, and is not already claimed by an earlier
+// worker; every other case falls back to the least-used rule rather than failing.
+// @preconditions accounts is non-empty and assignments/assigned are sized workerCount.
+// @param accounts Available accounts in vault order.
+// @param assignments Output slice mutated in place.
+// @param assigned Output flags mutated in place.
+// @param usedPerAccount Running claim counts, mutated in place.
+// @param eligible Predicate for "may be bound at all".
+// @param byID Vault lookup by account id.
+// @param greedy Fallback filler for one slot.
+// @returns None; mutates the output parameters.
+// @throws None; a cache failure is logged as a warning and ignored.
+// @invariants O(workerCount × accounts); at most one load and one save.
+func (p *Pool) assignSticky(
+	accounts []auth.Account,
+	assignments []auth.Account,
+	assigned []bool,
+	usedPerAccount map[string]int,
+	eligible func(auth.Account) bool,
+	byID func(string) (auth.Account, bool),
+	greedy func(slot int) bool,
+) {
+	workerCount := len(assignments)
+	path := bindingsPath(p.cfg)
+
+	persisted := map[int]string{}
+	if loaded, err := loadBindings(path); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// A cache that cannot be trusted is a warning, never a startup failure.
+			p.log().Warn("sticky bindings could not be loaded; allocating fresh",
+				"path", path, "err", err)
+		}
+	} else {
+		persisted = loaded
+	}
+
+	// First-boot seed: with no usable cache, start worker 0 on the vault's active account so the
+	// initial layout matches what the operator sees in `agy-auth current`. Only a seed — the greedy
+	// pass still fills every other slot, and a persisted binding always wins over it.
+	if len(persisted) == 0 && p.authMgr != nil {
+		if activeID := p.authMgr.VaultActiveAccountID(); activeID != "" {
+			if acc, ok := byID(activeID); ok && eligible(acc) {
+				persisted[0] = activeID
+				p.log().Info("seeding sticky affinity from the vault's active account",
+					"workerID", 0, "accountID", activeID)
+			}
+		}
+	}
+
+	// Iterate the persisted entries themselves, not an index range bounded by the map's size. A
+	// gapped file (e.g. only worker 1 recorded) is a legitimate state after a partial write or a
+	// hand-edited file, and a size-bounded range silently dropped every binding past the gap.
+	for i := 0; i < workerCount; i++ {
+		accountID, present := persisted[i]
+		if !present {
+			continue
+		}
+		acc, ok := byID(accountID)
+		if !ok {
+			p.log().Info("sticky binding references an account that no longer exists; reassigning",
+				"workerID", i, "accountID", accountID)
+			continue
+		}
+		if !eligible(acc) {
+			p.log().Info("sticky binding references an ineligible account; reassigning",
+				"workerID", i, "accountID", accountID)
+			continue
+		}
+		if usedPerAccount[accountID] > 0 {
+			p.log().Info("sticky binding duplicates an earlier worker's account; reassigning",
+				"workerID", i, "accountID", accountID)
+			continue
+		}
+		assignments[i] = acc
+		assigned[i] = true
+		usedPerAccount[accountID]++
+	}
 
 	for i := 0; i < workerCount; i++ {
-		var chosen auth.Account
-		switch strategy {
-		case "least_used":
-			// Highest remaining quota first; ties keep vault order for determinism.
-			chosen = accounts[0]
-			best := quotaScore(chosen)
-			for _, acc := range accounts[1:] {
-				if score := quotaScore(acc); score > best {
-					chosen, best = acc, score
-				}
-			}
-		default: // round_robin and sticky both spread one account per worker before reusing
-			chosen = accounts[i%len(accounts)]
+		if assigned[i] {
+			continue
 		}
-
-		usedPerAccount[chosen.ID]++
-		assignments = append(assignments, chosen)
-	}
-
-	// Surface the sharing condition once, with the remedy, instead of leaving it silent.
-	if workerCount > len(accounts) {
-		sharing := make(map[string][]int, len(accounts))
-		for i, acc := range assignments {
-			sharing[acc.ID] = append(sharing[acc.ID], i)
-		}
-		for accountID, workerIDs := range sharing {
-			if len(workerIDs) > 1 {
-				p.log().Warn("multiple workers share one account; concurrent token refresh can race",
-					"accountID", accountID, "workerIDs", workerIDs,
-					"remedy", "configure worker_count <= number of stored accounts")
-			}
+		if !greedy(i) {
+			break
 		}
 	}
-	return assignments
+
+	// Rewrite the file with exactly the live pool: stale worker indices are pruned, and a first boot
+	// seeds it so the next restart is stable.
+	//
+	// Partial allocation must not be persisted. When every account is momentarily ineligible the
+	// fallback still fills each slot with a vault-order account, but if even that fails (an empty
+	// slice) writing the resulting empty map would erase a perfectly good affinity cache because of a
+	// transient fleet-wide cooldown. A cache is only rewritten from a complete, real allocation.
+	complete := true
+	current := make(map[int]string, workerCount)
+	for i := 0; i < workerCount; i++ {
+		if !assigned[i] || assignments[i].ID == "" {
+			complete = false
+			break
+		}
+		current[i] = assignments[i].ID
+	}
+	if !complete {
+		p.log().Debug("skipping bindings write; allocation was incomplete",
+			"path", path, "workerCount", workerCount, "assigned", len(current))
+		return
+	}
+	// `current` is already bounded by workerCount, so no pruning pass is required: iterating 0..n and
+	// assigning only filled slots cannot produce a stale index. The former `pruneBindings` helper was
+	// unprovable dead code for exactly this reason.
+	//
+	// Only touch the disk when the content actually changes, and serialise the check against the write
+	// so a concurrent lease cannot interleave between them.
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+	if cached, err := loadBindings(path); err == nil && bindingsEqual(cached, current) {
+		return
+	}
+	if err := saveBindings(path, current); err != nil {
+		p.log().Warn("sticky bindings could not be persisted; affinity will not survive a restart",
+			"path", path, "err", err)
+	}
+}
+
+// reconcileBindings republishes every account's owning worker from the live worker set.
+//
+// @purpose Keeps `assigned_worker` truthful when an account is shared or when a worker rotates away.
+// @rationale `AssignedWorker` holds a single id, but the allocator may legitimately place one account
+// on several workers. Releasing by "any account naming this worker" therefore left a surviving worker
+// leasing an account the admin view reported as unassigned. Reading the truth from the workers makes
+// the operation idempotent and independent of which call ran last.
+// @preconditions Safe to call with no workers or no accounts.
+// @param None.
+// @returns None.
+// @throws None.
+// @invariants O(workers × accounts); takes accountsMu once per account update, never held across IO.
+func (p *Pool) reconcileBindings() {
+	if p.authMgr == nil {
+		return
+	}
+	// Lowest live worker id per account: deterministic, and never reports a shared account as free.
+	owner := make(map[string]int, len(p.workers))
+	for _, w := range p.workers {
+		if w == nil {
+			continue
+		}
+		acc := w.GetAccount()
+		if acc == nil || acc.ID == "" {
+			continue
+		}
+		if current, ok := owner[acc.ID]; !ok || w.ID < current {
+			owner[acc.ID] = w.ID
+		}
+	}
+	for _, acc := range p.authMgr.GetAccounts() {
+		want := -1
+		if id, ok := owner[acc.ID]; ok {
+			want = id
+		}
+		if acc.AssignedWorker != want {
+			p.authMgr.MarkAccountBinding(acc.ID, want)
+		}
+	}
+}
+
+// bindingsEqual reports whether two worker→account maps are identical.
+//
+// @purpose Lets the persistence path skip a write when nothing changed.
+// @rationale Reconcile runs on every lease; rewriting and fsyncing identical bytes on each one puts a
+// disk barrier in the request path for no benefit. Comparing is O(workers) against an in-memory map.
+// @preconditions None.
+// @param a First map.
+// @param b Second map.
+// @returns True when both have the same keys and values.
+// @throws None.
+// @invariants O(len(a)); no allocation.
+func bindingsEqual(a, b map[int]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if other, ok := b[k]; !ok || other != v {
+			return false
+		}
+	}
+	return true
+}
+
+// warnOnSharedAccounts reports every account held by more than one worker.
+//
+// @purpose Surfaces the refresh-token race before it causes a silent session loss.
+// @rationale The previous warning was gated on `workerCount > len(accounts)`, which is false in the
+// common balanced case (3 workers, 3 accounts) even when a bad strategy put all three on one
+// account. Gating on the real condition — more than one worker on the same account — reports the
+// situation that actually matters.
+// @preconditions assignments may be empty.
+// @param assignments Worker index → account map produced by allocation.
+// @param accountCount Number of distinct accounts available, used in the remedy text.
+// @returns None; logs a warning per shared account.
+// @throws None.
+// @invariants O(workerCount); deterministic ordering by account id for stable logs.
+func (p *Pool) warnOnSharedAccounts(assignments []auth.Account, accountCount int) {
+	if len(assignments) == 0 {
+		return
+	}
+	sharing := make(map[string][]int, len(assignments))
+	ids := make([]string, 0, len(assignments))
+	for i, acc := range assignments {
+		if _, seen := sharing[acc.ID]; !seen {
+			ids = append(ids, acc.ID)
+		}
+		sharing[acc.ID] = append(sharing[acc.ID], i)
+	}
+	sort.Strings(ids)
+	for _, accountID := range ids {
+		workerIDs := sharing[accountID]
+		if len(workerIDs) < 2 {
+			continue
+		}
+		p.log().Warn("multiple workers share one account; concurrent token refresh can race",
+			"accountID", accountID, "workerIDs", workerIDs, "accountsAvailable", accountCount,
+			"remedy", "add accounts or reduce worker_count so each worker has its own")
+	}
 }
 
 // quotaScore summarizes an account's remaining capacity for comparison.
@@ -326,26 +631,34 @@ func (p *Pool) Acquire(ctx context.Context, model string, requiresPaidTier bool)
 
 			w.LastActive = time.Now()
 			w.RequestCount.Add(1)
+			// Record the lease so `last_used` reports real traffic rather than the last vault sync.
+			// Throttled inside the manager to one write per account per second: this is the hot path
+			// and every write takes accountsMu.
+			if acc := w.GetAccount(); acc != nil {
+				p.authMgr.MarkAccountUsed(acc.ID, time.Now())
+			}
 			return w, nil
 		}
 	}
 }
 
-// accountsInUse reports which accounts other workers are currently authenticating as.
+// accountsInUse reports how many other workers currently hold each account.
 //
-// @purpose Keeps rotation from binding two workers to one account while an unused account exists.
+// @purpose Keeps rotation from binding two workers to one account while an unused account exists, and
+// from piling a third worker onto an account two already share while a one-way account is free.
 // @rationale Every worker holds its own copy of a refresh token; two workers refreshing the same
 // account's token concurrently race and only the first succeeds, leaving the other offline. Knowing
-// the current claims lets selection prefer a free account and only share when nothing else is left.
+// how CONTENDED each account is lets selection prefer the least-used one. The previous contract
+// returned a single owner ID and silently omitted any account held by two or more workers, which made
+// the most contended accounts look entirely free.
 // @preconditions None; safe to call at any time.
-// @param self Worker being reconciled, whose own claim is not a conflict.
-// @returns map[string]int of account ID to the single owning worker ID. A nil map when no worker is
-// bound. Accounts held by more than one worker are omitted: they are already shared state, so
-// excluding them would gain nothing.
+// @param self Worker being reconciled, whose own claim is not counted.
+// @returns map[string]int of account ID to the number of OTHER workers bound to it. Only accounts
+// held by at least one other worker appear. Never nil.
 // @throws None.
 // @invariants O(workers); reads each worker's Account pointer once; no locks held on return.
 func (p *Pool) accountsInUse(self *Worker) map[string]int {
-	claims := make(map[string]map[int]struct{}, len(p.workers))
+	inUse := make(map[string]int, len(p.workers))
 	for _, other := range p.workers {
 		if other == nil || other == self {
 			continue
@@ -354,20 +667,7 @@ func (p *Pool) accountsInUse(self *Worker) map[string]int {
 		if acc == nil {
 			continue
 		}
-		if claims[acc.ID] == nil {
-			claims[acc.ID] = make(map[int]struct{}, 1)
-		}
-		claims[acc.ID][other.ID] = struct{}{}
-	}
-
-	inUse := make(map[string]int, len(claims))
-	for accountID, owners := range claims {
-		if len(owners) != 1 {
-			continue
-		}
-		for ownerID := range owners {
-			inUse[accountID] = ownerID
-		}
+		inUse[acc.ID]++
 	}
 	return inUse
 }
@@ -411,6 +711,10 @@ func (p *Pool) reconcileWorkerAccount(ctx context.Context, w *Worker, model stri
 			}
 		}
 		if bound.IsEligibleForModel(model, requiresPaidTier, minPct) {
+			// The binding is already truthful for this worker; re-publishing it keeps
+			// `assigned_worker` correct for a worker that started before the manager existed and for
+			// any path that rebound the account without a rotation.
+			p.publishBinding(w.ID)
 			return nil
 		}
 	}
@@ -450,7 +754,74 @@ func (p *Pool) reconcileWorkerAccount(ctx context.Context, w *Worker, model stri
 		"model", model,
 		"reason", "lease_eligibility")
 	w.SetAccount(next)
+	// Publish only after SetAccount: reporting a binding whose credential failed to install would
+	// misattribute quota spend to a worker that never used the account. The old account needs no
+	// explicit release — publishBinding reconciles `assigned_worker` from the live workers, so once
+	// SetAccount has moved this worker the previous account is already unowned.
+	p.publishBinding(w.ID)
 	return nil
+}
+
+// publishBinding records a worker's account in the manager and, under sticky, on disk.
+//
+// @purpose Keeps the admin API's `assigned_worker` truthful and the affinity cache current.
+// @rationale Nothing ever wrote `AssignedWorker`, so it reported -1 forever. Persisting the affinity
+// cache here rather than only at boot is required because a worker recycled in place keeps its
+// *Worker and never re-runs allocation, so a boot-only write would go stale after the first rotation.
+// The two are deliberately separate from the lease path's error handling: neither can fail a lease.
+// @preconditions authMgr may be nil in tests; w is non-nil.
+// @param workerID Worker whose bindings are being republished; retained for diagnostics.
+// @returns None.
+// @throws None; a cache failure is logged as a warning.
+// @invariants O(workers) for the snapshot; performs file IO outside accountsMu.
+func (p *Pool) publishBinding(workerID int) {
+	if p.authMgr == nil {
+		return
+	}
+	// Ownership is derived from the workers themselves, never from an id passed in. An account can
+	// legitimately be shared by several workers, so a caller-supplied id cannot be trusted to be the
+	// account's owner: writing it would make the field last-publisher-wins and contradict the
+	// deterministic `reconcileBindings` rule. Every caller has already run `SetAccount`, which is the
+	// authoritative record of what the worker holds.
+	p.reconcileBindings()
+
+	if config.NormalizeAllocationStrategy(p.cfg.Accounts.AllocationStrategy) != config.AllocationStrategySticky {
+		return
+	}
+	// Persistence is driven from the live worker bindings rather than from the id being published, so
+	// a full pool is written even when this call is a release. File IO happens after
+	// MarkAccountBinding released accountsMu, so a slow disk can never serialise credential leasing.
+	bindings := make(map[int]string, len(p.workers))
+	for _, other := range p.workers {
+		if other == nil {
+			continue
+		}
+		if acc := other.GetAccount(); acc != nil {
+			bindings[other.ID] = acc.ID
+		}
+	}
+	path := bindingsPath(p.cfg)
+	// No pruning pass: `bindings` is keyed only from `p.workers`, so it is bounded by the live pool by
+	// construction. The former `idx < WorkerCount` filter was unprovable dead code — the same shape as
+	// the `pruneBindings` helper deleted for that reason.
+	// Same rule as the allocation path: only write a complete, changed snapshot. A partial pool (a
+	// worker mid-recycle has no account momentarily) must not overwrite a good cache.
+	if len(bindings) < p.cfg.Pool.WorkerCount {
+		p.log().Debug("skipping bindings write; pool bindings are incomplete",
+			"path", path, "bound", len(bindings), "workerCount", p.cfg.Pool.WorkerCount)
+		return
+	}
+	// Serialise load/compare/save: two concurrent leases otherwise both load, both decide "changed",
+	// and the later save writes a snapshot older than an intervening SetAccount.
+	p.bindingsMu.Lock()
+	defer p.bindingsMu.Unlock()
+	if cached, err := loadBindings(path); err == nil && bindingsEqual(cached, bindings) {
+		return
+	}
+	if err := saveBindings(path, bindings); err != nil {
+		p.log().Warn("sticky bindings could not be persisted; affinity will not survive a restart",
+			"path", path, "err", err)
+	}
 }
 
 // Release returns a worker back into the pool, recycling it if tainted or expired.

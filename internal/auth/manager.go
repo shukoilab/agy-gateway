@@ -84,8 +84,22 @@ type AccountQuotaInfo struct {
 	CooldownUntil  *time.Time            `json:"cooldown_until,omitempty"`
 	Groups         []QuotaGroupInfo      `json:"groups"`
 	Quotas         map[string]QuotaGroup `json:"quotas,omitempty"`
-	Overview       string                `json:"overview,omitempty" example:"Gemini: 70.38% (5h reset in 23m)"`
-	LastSynced     time.Time             `json:"last_synced" example:"2026-11-24T10:00:00Z"`
+	// QuotasKnown mirrors the account-level flag so a client can tell "no limits" from "could not ask".
+	//
+	// @purpose Stops the admin endpoint from being the last place that fails open.
+	// @rationale The account list already exposes this, but the quota detail endpoint is what an
+	// operator actually reads to debug selection; it reported `quota_available: true` with zero
+	// buckets for an account whose read had failed, which is the same defect at a different surface.
+	// @invariants Mirrors Account.QuotasKnown at snapshot time.
+	QuotasKnown bool `json:"quotas_known"`
+	// UsageError carries the provider's reason when the quota read failed.
+	//
+	// @purpose Lets an operator see `forbidden`/`timeout` instead of an empty bucket list.
+	// @rationale Diagnosis only; never parsed by the gateway.
+	// @invariants Empty exactly when the corresponding read succeeded.
+	UsageError string    `json:"usage_error,omitempty"`
+	Overview   string    `json:"overview,omitempty" example:"Gemini: 70.38% (5h reset in 23m)"`
+	LastSynced time.Time `json:"last_synced" example:"2026-11-24T10:00:00Z"`
 }
 
 // AccountsQuotaResponse wraps the list of accounts quota data.
@@ -221,6 +235,7 @@ func (m *Manager) Sync(ctx context.Context) error {
 
 		acc := Account{
 			ID:             raw.ID,
+			ActiveInVault:  raw.Active,
 			Email:          raw.Email,
 			Alias:          raw.Alias,
 			AuthMethod:     raw.AuthMethod,
@@ -230,7 +245,9 @@ func (m *Manager) Sync(ctx context.Context) error {
 			VaultExpired:   vaultExpired,
 			AssignedWorker: -1,
 			Quotas:         make(map[string]QuotaGroup),
-			LastUsed:       time.Now(),
+			// Deliberately zero, not time.Now(): this field reports the last LEASE, and a freshly
+			// synced account has never served one. Stamping the sync time made `last_used` an alias of
+			// "last poll" and hid which accounts were actually carrying traffic.
 		}
 
 		if prior, ok := previous[raw.ID]; ok {
@@ -239,6 +256,11 @@ func (m *Manager) Sync(ctx context.Context) error {
 			// FamilyCooldowns, so dropping it here would silently re-open a family the poller had
 			// just closed — the same class of state loss this carry-forward exists to prevent.
 			acc.Quotas = prior.Quotas
+			// Quota knowledge is runtime-owned: the vault knows credentials, not whether the last quota
+			// read succeeded. Dropping this would silently promote every account to "known healthy"
+			// on the next resync, which is the fail-open FR-02 exists to close.
+			acc.QuotasKnown = prior.QuotasKnown
+			acc.UsageError = prior.UsageError
 			acc.CooldownUntil = prior.CooldownUntil
 			acc.FamilyCooldowns = prior.FamilyCooldowns
 			acc.AssignedWorker = prior.AssignedWorker
@@ -380,6 +402,97 @@ func (m *Manager) SetAccountsForTest(accounts []Account) {
 	m.accounts = accounts
 }
 
+// VaultActiveAccountID reports which account the vault itself considers active.
+//
+// @purpose Seeds sticky affinity so the gateway's first-boot layout matches what an operator sees in
+// `agy-auth current`, instead of depending on vault ordering.
+// @rationale The vault's `active` flag was parsed by Sync and then discarded — FR-05 asked for it to
+// drive the first-boot seed, and `AccountUsage.Active` had no consumer at all. An operator who set an
+// account "current" expects the gateway to start with a worker on it.
+// @preconditions None; safe when no account is flagged.
+// @param None.
+// @returns The active account id, or "" when the vault flags none (or several, which is ambiguous).
+// @throws None.
+// @invariants O(accounts); takes accountsMu; no IO.
+func (m *Manager) VaultActiveAccountID() string {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	found := ""
+	for i := range m.accounts {
+		if !m.accounts[i].ActiveInVault {
+			continue
+		}
+		if found != "" {
+			// More than one flag is a vault inconsistency; refuse to guess rather than pick arbitrarily.
+			return ""
+		}
+		found = m.accounts[i].ID
+	}
+	return found
+}
+
+// MarkAccountBinding records which worker currently holds an account's credential.
+//
+// @purpose Makes the admin API's `assigned_worker` field truthful instead of permanently -1.
+// @rationale The field existed but nothing ever wrote it, so an operator inspecting the gateway could
+// not tell which worker was spending which account's quota. The pool is the only component that
+// knows this, and it must publish it after the credential is actually installed — not before, or the
+// report would claim a binding that failed to materialise.
+// @preconditions None; safe to call with an unknown account id.
+// @param accountID Account whose binding changed.
+// @param workerID Worker index now holding the account; -1 clears the binding.
+// @returns None; mutates manager state.
+// @throws None; an unknown account is logged at debug and ignored.
+// @invariants O(accounts); takes accountsMu briefly; performs no IO, so it never serialises a lease
+// behind a disk operation.
+func (m *Manager) MarkAccountBinding(accountID string, workerID int) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	for i := range m.accounts {
+		if m.accounts[i].ID != accountID {
+			continue
+		}
+		m.accounts[i].AssignedWorker = workerID
+		return
+	}
+	m.logger.Debug("binding reported for an unknown account; ignoring", "accountID", accountID, "workerID", workerID)
+}
+
+// MarkAccountUsed records that an account just served a lease.
+//
+// @purpose Makes `last_used` mean "last leased" rather than "last vault sync".
+// @rationale Sync previously stamped every account on every resync, so the field reported the poll
+// interval instead of real traffic. Per-lease writes are throttled because Acquire is on the hot path
+// and every write takes accountsMu; one update per second per account carries the same operational
+// meaning without creating a lock convoy.
+// @preconditions None.
+// @param accountID Account that served a lease.
+// @param now Reference instant, injected so the throttle is testable without sleeping.
+// @returns None; mutates manager state when the throttle permits.
+// @throws None.
+// @invariants O(accounts); takes accountsMu; at most one write per account per second.
+func (m *Manager) MarkAccountUsed(accountID string, now time.Time) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	const throttle = time.Second
+	for i := range m.accounts {
+		if m.accounts[i].ID != accountID {
+			continue
+		}
+		acc := &m.accounts[i]
+		// A backwards clock must not freeze the field forever: only a value inside the throttle window
+		// suppresses the write, so a negative delta refreshes it.
+		if !acc.LastUsed.IsZero() && now.Sub(acc.LastUsed) >= 0 && now.Sub(acc.LastUsed) < throttle {
+			return
+		}
+		acc.LastUsed = now
+		return
+	}
+}
+
 // MarkAccountStatus updates an account's status and its derived cooldown state.
 //
 // @purpose Applies a credential- or quota-level verdict to one account atomically.
@@ -500,24 +613,43 @@ func (m *Manager) findNextEligibleAccountLocked(excludeAccountID string, model s
 	// Two passes: prefer an account no other worker holds, then fall back to a shared one. Sharing is
 	// not free — concurrent refreshes against one stored refresh token race, and only the first wins —
 	// so a shared binding is a capacity-preserving last resort and is logged as such by the caller.
+	//
+	// Within a pass the choice is a total ordering, not first-match: (rank desc, claimCount asc, vault
+	// order asc). First-match would ignore that a later account may be known-healthy while an earlier
+	// one only has unknown quota, and would keep piling rotation onto an account three workers already
+	// share while a one-way account sat free.
 	pick := func(allowShared bool) *Account {
-		for _, acc := range m.accounts {
+		bestIdx := -1
+		bestRank := -1
+		bestClaims := 0
+		for i := range m.accounts {
+			acc := &m.accounts[i]
 			if acc.ID == excludeAccountID {
 				continue
 			}
-			if _, claimed := inUse[acc.ID]; !allowShared && claimed {
+			claims := inUse[acc.ID]
+			if !allowShared && claims > 0 {
 				continue
 			}
-			if acc.IsEligibleForModel(model, requiresPaidTier, m.cfg.Accounts.MinRemainingQuotaPct) {
-				// Deep-copy before returning: the caller keeps this value past the lock, and the
-				// poller mutates the live maps under accountsMu.
-				copyAcc := acc
-				copyAcc.Quotas = copyQuotaGroups(acc.Quotas)
-				copyAcc.FamilyCooldowns = copyCooldowns(acc.FamilyCooldowns)
-				return &copyAcc
+			rank := acc.EligibilityRank(model, requiresPaidTier, m.cfg.Accounts.MinRemainingQuotaPct)
+			if rank == 0 {
+				continue
+			}
+			// Strictly-better comparisons only, so earlier vault order wins every exact tie and the
+			// result stays deterministic regardless of map iteration.
+			if rank > bestRank || (rank == bestRank && claims < bestClaims) {
+				bestIdx, bestRank, bestClaims = i, rank, claims
 			}
 		}
-		return nil
+		if bestIdx < 0 {
+			return nil
+		}
+		// Deep-copy before returning: the caller keeps this value past the lock, and the poller
+		// mutates the live maps under accountsMu.
+		copyAcc := m.accounts[bestIdx]
+		copyAcc.Quotas = copyQuotaGroups(copyAcc.Quotas)
+		copyAcc.FamilyCooldowns = copyCooldowns(copyAcc.FamilyCooldowns)
+		return &copyAcc
 	}
 
 	if acc := pick(false); acc != nil {
@@ -653,16 +785,41 @@ func (m *Manager) GetQuota(ctx context.Context, query string) (*AccountsQuotaRes
 
 		// Only this account's own buckets may populate its entry. When the live fetch failed the
 		// entry carries the last known status but no invented percentages.
+		//
+		// The knowledge flag must come from THIS call's fetch, not only from the account snapshot.
+		// Reading the snapshot alone reproduces the fail-open whenever the last poll succeeded and the
+		// current fetch is the one that failed: the snapshot still says "known", so the endpoint would
+		// answer `quotas_known: true, quota_available: true` with zero buckets for an account the
+		// provider just refused to report on.
+		info.QuotasKnown = acc.QuotasKnown
+		info.UsageError = acc.UsageError
 		if usage, ok := usageByAccount[acc.ID]; ok {
-			info.Groups = toQuotaGroupInfos(usage.Groups)
-			info.Quotas = QuotaGroups(usage.Groups)
-			info.QuotaAvailable = acc.Status == StatusHealthy && acc.Enabled
-			for _, q := range info.Quotas {
-				if q.IsExhausted {
-					info.QuotaAvailable = false
-					break
+			// A per-account usage_error in a successful fetch means this account's groups are absent,
+			// which is the same unreadable state as a failed snapshot — treat it identically.
+			if usage.UsageError != "" {
+				info.Groups = nil
+				info.Quotas = nil
+				info.QuotasKnown = false
+				info.UsageError = usage.UsageError
+				info.QuotaAvailable = false
+			} else {
+				info.Groups = toQuotaGroupInfos(usage.Groups)
+				info.Quotas = QuotaGroups(usage.Groups)
+				info.QuotasKnown = true
+				info.UsageError = ""
+				// An unreadable quota is not "available": claiming it is what let an account the
+				// provider refuses to report on look like it had unlimited capacity.
+				info.QuotaAvailable = acc.Status == StatusHealthy && acc.Enabled
+				for _, q := range info.Quotas {
+					if q.IsExhausted {
+						info.QuotaAvailable = false
+						break
+					}
 				}
 			}
+		} else if !acc.QuotasKnown {
+			// No live entry and no trusted snapshot: nothing is known about this account.
+			info.QuotaAvailable = false
 		}
 
 		result = append(result, info)

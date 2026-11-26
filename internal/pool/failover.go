@@ -164,10 +164,23 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 						"fromAccount", currentAccID,
 						"toAccount", nextAcc.ID,
 					)
-					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
-						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
+					switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID)
+					if switchErr != nil {
+						// Publication asserts "this worker holds this credential". Writing it after a
+						// failed install would make the admin view and the sticky cache claim an account
+						// that was never materialised, and the next lease's fast path would then accept
+						// that binding without re-materialising — so a failed switch must not publish.
+						fc.logger.Warn("agy-auth switch failed; not publishing the failed binding",
+							"workerID", w.ID, "accountID", nextAcc.ID, "err", switchErr)
+						fc.pool.Release(w)
+						_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
+						continue
 					}
+					// Failover rebinds the worker exactly like a lease-time rotation does. Publication
+					// reconciles both `assigned_worker` and the sticky cache from the live worker set,
+					// so the pre-failover account is released as a side effect of SetAccount.
 					w.SetAccount(nextAcc)
+					fc.pool.publishBinding(w.ID)
 					fc.pool.Release(w)
 					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
 					continue
@@ -201,10 +214,23 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 						"fromAccount", currentAccID,
 						"toAccount", nextAcc.ID,
 					)
-					if switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID); switchErr != nil {
-						fc.logger.Warn("agy-auth switch failed; continuing with updated in-memory account", "err", switchErr)
+					switchErr := fc.authMgr.SwitchWorkerAccount(ctx, w.ID, nextAcc.ID)
+					if switchErr != nil {
+						// Publication asserts "this worker holds this credential". Writing it after a
+						// failed install would make the admin view and the sticky cache claim an account
+						// that was never materialised, and the next lease's fast path would then accept
+						// that binding without re-materialising — so a failed switch must not publish.
+						fc.logger.Warn("agy-auth switch failed; not publishing the failed binding",
+							"workerID", w.ID, "accountID", nextAcc.ID, "err", switchErr)
+						fc.pool.Release(w)
+						_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
+						continue
 					}
+					// Failover rebinds the worker exactly like a lease-time rotation does. Publication
+					// reconciles both `assigned_worker` and the sticky cache from the live worker set,
+					// so the pre-failover account is released as a side effect of SetAccount.
 					w.SetAccount(nextAcc)
+					fc.pool.publishBinding(w.ID)
 					fc.pool.Release(w)
 					_ = retry.SleepWithContext(ctx, 30*time.Millisecond)
 					continue

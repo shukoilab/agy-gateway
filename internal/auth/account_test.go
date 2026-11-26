@@ -1,6 +1,9 @@
 package auth
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestIsEligibleForModel_ScopesToFamily pins defect A12: an account whose third-party bucket is
 // nearly spent must remain eligible for Gemini traffic, and vice versa.
@@ -152,5 +155,135 @@ func TestQuotaFamilyClassification(t *testing.T) {
 		if got := QuotaFamilyOfBucket(tc.bucket); got != tc.want {
 			t.Errorf("QuotaFamilyOfBucket(%q) = %q, want %q", tc.bucket, got, tc.want)
 		}
+	}
+}
+
+// TestEligibilityRank_TotalOrdering pins FR-01/FR-02.
+//
+// @purpose Proves a known-healthy account always outranks one whose quota state is unknown, while
+// neither becomes unusable.
+// @rationale The previous boolean could not express "usable but unproven": an account whose
+// `agy-auth usage` call failed decoded to an empty quota map, its bucket loop never iterated, and it
+// ranked exactly like an account with unlimited quota. Treating unknown as ineligible would instead
+// let one failed poll take every account out of service.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Errorf/t.Fatalf.
+// @invariants Deterministic; no IO.
+func TestEligibilityRank_TotalOrdering(t *testing.T) {
+	base := func() Account {
+		return Account{
+			ID: "acct", Tier: "payg", Status: StatusHealthy, Enabled: true,
+			Quotas: map[string]QuotaGroup{
+				"gemini-weekly": {RemainingPct: 80},
+				"3p-weekly":     {RemainingPct: 80},
+			},
+			QuotasKnown:     true,
+			FamilyCooldowns: map[string]time.Time{},
+		}
+	}
+
+	cases := []struct {
+		name   string
+		mutate func(*Account)
+		want   int
+	}{
+		{"known healthy", func(a *Account) {}, 2},
+		{"quota unknown", func(a *Account) { a.QuotasKnown = false }, 1},
+		{"empty bucket map", func(a *Account) { a.Quotas = map[string]QuotaGroup{} }, 1},
+		{"disabled", func(a *Account) { a.Enabled = false }, 0},
+		{"auth expired", func(a *Account) { a.Status = StatusAuthExpired }, 0},
+		{"status disabled", func(a *Account) { a.Status = StatusDisabled }, 0},
+		{"family cooling", func(a *Account) {
+			a.FamilyCooldowns = map[string]time.Time{QuotaFamilyGemini: time.Now().Add(time.Hour)}
+		}, 0},
+		{"exhausted bucket", func(a *Account) {
+			a.Quotas["gemini-weekly"] = QuotaGroup{RemainingPct: 0, IsExhausted: true}
+		}, 0},
+		{"below floor", func(a *Account) {
+			a.Quotas["gemini-weekly"] = QuotaGroup{RemainingPct: 1}
+		}, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			acc := base()
+			tc.mutate(&acc)
+			if got := acc.EligibilityRank("gemini-3.8-flash", false, 5); got != tc.want {
+				t.Fatalf("EligibilityRank = %d, want %d", got, tc.want)
+			}
+			// The boolean delegate must agree with the rank at the zero boundary.
+			if eligible := acc.IsEligibleForModel("gemini-3.8-flash", false, 5); eligible != (tc.want > 0) {
+				t.Fatalf("IsEligibleForModel = %v, want %v for rank %d", eligible, tc.want > 0, tc.want)
+			}
+		})
+	}
+}
+
+// TestEligibilityRank_FamilyScopingIsPreserved pins that the ranking keeps per-family semantics.
+//
+// @purpose Proves a spent third-party bucket does not disqualify an account for Gemini traffic.
+// @rationale This is the whole reason FamilyCooldowns exists; a total ordering must not regress it.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestEligibilityRank_FamilyScopingIsPreserved(t *testing.T) {
+	acc := Account{
+		ID: "acct", Tier: "payg", Status: StatusHealthy, Enabled: true, QuotasKnown: true,
+		Quotas: map[string]QuotaGroup{
+			"gemini-weekly": {RemainingPct: 90},
+			"3p-weekly":     {RemainingPct: 0, IsExhausted: true},
+		},
+		FamilyCooldowns: map[string]time.Time{},
+	}
+
+	if got := acc.EligibilityRank("gemini-3.8-flash", false, 5); got != 2 {
+		t.Fatalf("Gemini rank = %d, want 2 (the 3p bucket must not affect it)", got)
+	}
+	if got := acc.EligibilityRank("claude-sonnet-4-6", false, 5); got != 0 {
+		t.Fatalf("Claude rank = %d, want 0 (the 3p bucket is spent)", got)
+	}
+}
+
+// TestEligibilityRank_RequiresPaidTierRejectsFree pins the tier gate survives the refactor.
+//
+// @purpose Proves the free-tier rejection is applied by the rank, not only by the boolean wrapper.
+// @rationale A total ordering silently admitting free accounts to paid models would be a billing and
+// availability defect.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestEligibilityRank_RequiresPaidTierRejectsFree(t *testing.T) {
+	acc := Account{
+		ID: "acct", Tier: "free", Status: StatusHealthy, Enabled: true, QuotasKnown: true,
+		Quotas:          map[string]QuotaGroup{"gemini-weekly": {RemainingPct: 90}},
+		FamilyCooldowns: map[string]time.Time{},
+	}
+	if got := acc.EligibilityRank("gemini-3.8-flash", true, 5); got != 0 {
+		t.Fatalf("rank = %d, want 0 for a free account serving a paid model", got)
+	}
+	if got := acc.EligibilityRank("gemini-3.8-flash", false, 5); got != 2 {
+		t.Fatalf("rank = %d, want 2 when no paid tier is required", got)
+	}
+}
+
+// TestEligibilityRank_NilReceiverIsZero pins the nil guard.
+//
+// @purpose Proves a nil account cannot panic the allocator.
+// @rationale Allocation iterates slices that can legitimately contain a zero Account after a partial
+// sync; a panic there would take down startup.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants Deterministic.
+func TestEligibilityRank_NilReceiverIsZero(t *testing.T) {
+	var nilAcc *Account
+	if got := nilAcc.EligibilityRank("gemini-3.8-flash", false, 5); got != 0 {
+		t.Fatalf("nil receiver rank = %d, want 0", got)
 	}
 }

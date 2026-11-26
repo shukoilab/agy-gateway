@@ -345,7 +345,7 @@ The gateway treats each stored account as an independent quota source and binds 
 
 | Stage | Behaviour |
 | :--- | :--- |
-| Allocation | `allocation_strategy` assigns accounts to workers at startup: `round_robin` (default), `least_used` (highest remaining headroom first), or `sticky`. |
+| Allocation | `allocation_strategy` assigns accounts to workers at startup: `round_robin` (default, spread by index), `least_used` (greedy over live quota — fewest current claims first, ties broken by highest remaining headroom), or `sticky` (persist per-worker affinity in `<base_data_dir>/state/worker-bindings.json`, honouring a binding only while the account still exists, is usable, and is not already claimed by an earlier worker). A corrupt or missing bindings file is a warning and never blocks startup. |
 | Credential install | The assigned account's credential is exported per account and installed atomically into that worker's isolated `HOME` (`0600`, `fsync` + `rename`). A failed export leaves the previous credential untouched. |
 | Lease-time reconciliation | On every lease the worker's account is re-judged against live quota. An ineligible account is replaced from the vault and the new credential is installed before the turn runs. |
 | Polling | `quota_poll_interval` refreshes every account's buckets. A bucket below `min_remaining_quota_pct` moves that account into cooldown until the bucket's **own** reset time. |
@@ -359,7 +359,8 @@ The gateway treats each stored account as an independent quota source and binds 
 
 | Setting | Env var | Default | Purpose |
 | :--- | :--- | :--- | :--- |
-| `allocation_strategy` | `AGY_GW_ALLOCATION_STRATEGY` | `round_robin` | Worker-to-account assignment policy. |
+| `allocation_strategy` | `AGY_GW_ALLOCATION_STRATEGY` | `round_robin` | Worker-to-account assignment policy: `round_robin`, `least_used`, or `sticky`. |
+| `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Floor below which a bucket counts as depleted. An account whose quota could not be read ranks **below** a known-good one but stays usable (rank 1), so one failed quota call never takes the pool offline. |
 | `auto_rotate_enabled` | `AGY_GW_AUTO_ROTATE_ENABLED` | `true` | Derive cooldowns from live quota. When `false`, quota data is still refreshed but statuses never change. |
 | `quota_poll_interval` | `AGY_GW_QUOTA_POLL_INTERVAL` | `30s` | Background poll cadence (minimum `10s`). |
 | `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Bucket floor before an account is demoted. |

@@ -136,7 +136,23 @@ func (qp *QuotaPoller) Poll(ctx context.Context) {
 			continue
 		}
 
+		// A failed per-account read is not evidence about the quota. `agy-auth usage --all --json`
+		// reports it as `usage_error` with the `groups` key absent, and still exits 0, so this is the
+		// only place the failure can be noticed. Keep the previously known map intact (a diagnostic
+		// failure must not erase good data) and mark the state unknown so ranking demotes the account
+		// instead of silently treating it as unlimited.
+		if live.UsageError != "" {
+			acc.QuotasKnown = false
+			acc.UsageError = truncateForError([]byte(live.UsageError))
+			qp.logger.Warn("quota read failed for account; retaining previous quota data",
+				"accountID", acc.ID, "usageError", acc.UsageError)
+			// Do not touch acc.Quotas, and do not derive family cooldowns from data we do not have.
+			continue
+		}
+
 		acc.Quotas = QuotaGroups(live.Groups)
+		acc.QuotasKnown = true
+		acc.UsageError = ""
 
 		// A credential-level fault is owned by the auth layer, not by quota data: refreshing the
 		// buckets must not replace AUTH_EXPIRED/DISABLED with a quota summary and thereby resurrect an

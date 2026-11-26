@@ -157,8 +157,8 @@ func TestFindNextEligibleAccount_PrefersUnclaimedAccount(t *testing.T) {
 	}
 	mgr.accountsMu.Unlock()
 
-	// acc_a is claimed by worker 0; acc_b is free.
-	inUse := map[string]int{"acc_a": 0}
+	// Claim counts, not owner ids: acc_a is held by one other worker; acc_b and acc_c are free.
+	inUse := map[string]int{"acc_a": 1}
 
 	next, err := mgr.FindNextEligibleAccount("", "", false, inUse)
 	if err != nil {
@@ -168,14 +168,16 @@ func TestFindNextEligibleAccount_PrefersUnclaimedAccount(t *testing.T) {
 		t.Fatalf("selection returned acc_a, which another worker already holds; want an unclaimed account")
 	}
 
-	// With every account claimed, sharing is the only option and must still succeed.
-	all := map[string]int{"acc_a": 0, "acc_b": 1, "acc_c": 2}
+	// With every account claimed, sharing is the only option and must still succeed. The least
+	// contended account must win, so rotation never piles onto the account three workers share while a
+	// one-way one is available.
+	all := map[string]int{"acc_a": 3, "acc_b": 1, "acc_c": 2}
 	shared, err := mgr.FindNextEligibleAccount("", "", false, all)
 	if err != nil {
 		t.Fatalf("expected a shared fallback account, got %v", err)
 	}
-	if shared.ID == "" {
-		t.Fatalf("shared fallback returned an empty account")
+	if shared.ID != "acc_b" {
+		t.Fatalf("shared fallback selected %s, want acc_b (the least contended account)", shared.ID)
 	}
 }
 
@@ -433,5 +435,307 @@ func TestSync_KeepsRuntimeAuthExpiredAcrossVaultRefresh(t *testing.T) {
 	}
 	if got := mgr.GetAccounts()[0].Status; got != StatusAuthExpired {
 		t.Fatalf("status = %s, want the runtime AUTH_EXPIRED to survive a vault refresh", got)
+	}
+}
+
+// TestMarkAccountBinding_SetsAndClears pins FR-08's binding half.
+//
+// @purpose Proves `assigned_worker` becomes truthful.
+// @rationale Nothing ever wrote this field, so the admin API reported -1 for every account no matter
+// which worker was actually spending its quota.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no IO.
+func TestMarkAccountBinding_SetsAndClears(t *testing.T) {
+	mgr := NewManager(config.DefaultConfig(), nil)
+	mgr.SetAccountsForTest([]Account{{
+		ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+		AssignedWorker: -1, Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{},
+	}})
+
+	mgr.MarkAccountBinding("acct_a", 2)
+	if got := mgr.GetAccounts()[0].AssignedWorker; got != 2 {
+		t.Fatalf("AssignedWorker = %d, want 2", got)
+	}
+
+	mgr.MarkAccountBinding("acct_a", -1)
+	if got := mgr.GetAccounts()[0].AssignedWorker; got != -1 {
+		t.Fatalf("AssignedWorker = %d, want -1 after clearing", got)
+	}
+
+	// An unknown account must be a no-op, not a panic or a phantom entry.
+	mgr.MarkAccountBinding("acct_missing", 0)
+	if got := len(mgr.GetAccounts()); got != 1 {
+		t.Fatalf("account count = %d, want 1", got)
+	}
+}
+
+// TestMarkAccountUsed_ThrottlesWrites pins FR-08's usage half.
+//
+// @purpose Proves `last_used` tracks real leases without writing on every request.
+// @rationale Acquire is the hot path and every write takes accountsMu; per-request writes would
+// create a lock convoy. One update per second per account carries the same operational meaning.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no IO.
+func TestMarkAccountUsed_ThrottlesWrites(t *testing.T) {
+	mgr := NewManager(config.DefaultConfig(), nil)
+	mgr.SetAccountsForTest([]Account{{
+		ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+		Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{},
+	}})
+
+	base := time.Now()
+	mgr.MarkAccountUsed("acct_a", base)
+	first := mgr.GetAccounts()[0].LastUsed
+	if !first.Equal(base) {
+		t.Fatalf("LastUsed = %v, want %v", first, base)
+	}
+
+	// Inside the window: no write.
+	mgr.MarkAccountUsed("acct_a", base.Add(200*time.Millisecond))
+	if got := mgr.GetAccounts()[0].LastUsed; !got.Equal(first) {
+		t.Fatalf("LastUsed changed inside the throttle window: %v -> %v", first, got)
+	}
+
+	// Past the window: the write happens.
+	later := base.Add(2 * time.Second)
+	mgr.MarkAccountUsed("acct_a", later)
+	if got := mgr.GetAccounts()[0].LastUsed; !got.Equal(later) {
+		t.Fatalf("LastUsed = %v, want %v after the window", got, later)
+	}
+}
+
+// TestSync_PreservesQuotaKnowledge pins the carry-forward extension.
+//
+// @purpose Stops a resync from promoting every account to "known healthy".
+// @rationale Sync rebuilds each account from the vault, which knows nothing about whether the last
+// quota read succeeded. Dropping QuotasKnown there would silently undo the fail-open fix on the next
+// resync — the same class of state loss the existing carry-forward exists to prevent.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestSync_PreservesQuotaKnowledge(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(cfg, nil)
+	mgr.SetAccountsForTest([]Account{{
+		ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+		QuotasKnown: false, UsageError: "forbidden",
+		Quotas:          map[string]QuotaGroup{"gemini-weekly": {RemainingPct: 42}},
+		FamilyCooldowns: map[string]time.Time{},
+	}})
+
+	mgr.listForTest = func(context.Context) ([]byte, error) {
+		return []byte(`{"data":{"accounts":[{"id":"acct_a","email":"a@example.com","expired":false}]}}`), nil
+	}
+	if err := mgr.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	acc := mgr.GetAccounts()[0]
+	if acc.QuotasKnown {
+		t.Fatal("QuotasKnown must survive a resync as false")
+	}
+	if acc.UsageError != "forbidden" {
+		t.Fatalf("UsageError = %q, want it preserved across a resync", acc.UsageError)
+	}
+	if acc.Quotas["gemini-weekly"].RemainingPct != 42 {
+		t.Fatalf("known quota was lost across a resync: %v", acc.Quotas)
+	}
+}
+
+// TestFindNextEligibleAccount_PrefersHigherRank pins FR-01's selection effect.
+//
+// @purpose Proves a known-healthy account is chosen over an unknown-quota one regardless of vault
+// order.
+// @rationale The previous first-match loop returned whichever eligible account came first, so an
+// unreadable account could be preferred purely because it was listed earlier.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no IO.
+func TestFindNextEligibleAccount_PrefersHigherRank(t *testing.T) {
+	mgr := NewManager(config.DefaultConfig(), nil)
+	mgr.SetAccountsForTest([]Account{
+		{ID: "acct_unknown", Email: "u@example.com", Tier: "payg", Status: StatusHealthy, Enabled: true,
+			QuotasKnown: false, Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+		{ID: "acct_known", Email: "k@example.com", Tier: "payg", Status: StatusHealthy, Enabled: true,
+			QuotasKnown:     true,
+			Quotas:          map[string]QuotaGroup{"gemini-weekly": {RemainingPct: 90}},
+			FamilyCooldowns: map[string]time.Time{}},
+	})
+
+	next, err := mgr.FindNextEligibleAccount("", "gemini-3.8-flash", false, nil)
+	if err != nil {
+		t.Fatalf("expected a selection: %v", err)
+	}
+	if next.ID != "acct_known" {
+		t.Fatalf("selected %s, want acct_known (rank 2 beats rank 1 despite vault order)", next.ID)
+	}
+}
+
+// TestGetAccountsQuota_UsageErrorIsNotReportedAvailable pins F-05.
+//
+// @purpose Proves the admin quota endpoint no longer reports an unread account as available.
+// @rationale The account list was fixed to expose the failure, but the quota DETAIL endpoint — the
+// one an operator actually reads to debug selection — still reported `quota_available: true` with zero
+// buckets, which is the same fail-open at a second surface.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestGetAccountsQuota_UsageErrorIsNotReportedAvailable(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(cfg, nil)
+	mgr.SetAccountsForTest([]Account{
+		{ID: "acct_bad", Email: "b@example.com", Enabled: true, Status: StatusHealthy,
+			QuotasKnown: false, UsageError: "forbidden",
+			Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+	})
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_bad": {AccountID: "acct_bad", Email: "b@example.com", UsageError: "forbidden"},
+		}, nil
+	})
+
+	resp, err := mgr.GetQuota(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetQuota: %v", err)
+	}
+	if len(resp.Accounts) != 1 {
+		t.Fatalf("expected 1 account, got %d", len(resp.Accounts))
+	}
+	info := resp.Accounts[0]
+	if info.QuotaAvailable {
+		t.Fatal("an account whose quota read failed must not report quota_available")
+	}
+	if info.QuotasKnown {
+		t.Fatal("quotas_known must be false for an unread account")
+	}
+	if info.UsageError != "forbidden" {
+		t.Fatalf("usage_error = %q, want %q exposed to the operator", info.UsageError, "forbidden")
+	}
+}
+
+// TestGetQuota_LiveUsageErrorOverridesHealthySnapshot pins FINDING-R4.
+//
+// @purpose Stops the quota detail endpoint from trusting a stale snapshot over the current fetch.
+// @rationale My first F-05 fix read only `acc.QuotasKnown`, so when the last poll succeeded and THIS
+// call's fetch came back with `usage_error: "forbidden"`, the endpoint still answered
+// `quotas_known=true quota_available=true` with zero buckets — the same fail-open, one call later.
+// @preconditions None.
+// @param Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestGetQuota_LiveUsageErrorOverridesHealthySnapshot(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(cfg, nil)
+	// Snapshot says the last poll succeeded.
+	mgr.SetAccountsForTest([]Account{
+		{ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
+			QuotasKnown:     true,
+			Quotas:          map[string]QuotaGroup{"gemini-weekly": {RemainingPct: 80}},
+			FamilyCooldowns: map[string]time.Time{}},
+	})
+	// ...but this fetch fails for that account specifically.
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_a": {AccountID: "acct_a", Email: "a@example.com", UsageError: "forbidden"},
+		}, nil
+	})
+
+	resp, err := mgr.GetQuota(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetQuota: %v", err)
+	}
+	info := resp.Accounts[0]
+	if info.QuotaAvailable {
+		t.Fatal("a live usage_error must not be reported as quota_available, even if the snapshot was healthy")
+	}
+	if info.QuotasKnown {
+		t.Fatal("quotas_known must be false when this call's fetch failed")
+	}
+	if info.UsageError != "forbidden" {
+		t.Fatalf("usage_error = %q, want the live reason", info.UsageError)
+	}
+	if len(info.Groups) != 0 || len(info.Quotas) != 0 {
+		t.Fatalf("a failed read must not serve stale buckets: groups=%v quotas=%v", info.Groups, info.Quotas)
+	}
+
+	// A healthy live fetch must still report availability.
+	mgr.SetFetchUsageForTest(func(context.Context) (map[string]AccountUsage, error) {
+		return map[string]AccountUsage{
+			"acct_a": {AccountID: "acct_a", Email: "a@example.com", Groups: []AgyUsageGroup{
+				{Name: "Gemini Models", Buckets: []AgyUsageBucket{
+					{ID: "gemini-weekly", Window: "weekly", RemainingFraction: 0.8},
+				}},
+			}},
+		}, nil
+	})
+	resp, err = mgr.GetQuota(context.Background(), "")
+	if err != nil {
+		t.Fatalf("GetQuota(healthy): %v", err)
+	}
+	if !resp.Accounts[0].QuotaAvailable || !resp.Accounts[0].QuotasKnown {
+		t.Fatalf("a healthy fetch must report available/known: %+v", resp.Accounts[0])
+	}
+}
+
+// TestSync_MapsVaultActiveFlag pins FINDING-R6 using a captured live payload.
+//
+// @purpose Proves the vault's `active` flag actually reaches `Account.ActiveInVault`.
+// @rationale The only test touching the flag injected it directly via SetAccountsForTest, so forcing
+// `ActiveInVault: false` in Sync left both packages green — the payload → field path was untested,
+// and F-07's first-boot seed therefore rested on an unverified mapping.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestSync_MapsVaultActiveFlag(t *testing.T) {
+	// Shape captured verbatim from `agy-auth list --all --json` on agy-auth 0.5.3: there is no
+	// `expired` key at all, and `groups` is present in the list payload.
+	payload := `{"schema_version":1,"command":"list","data":{"accounts":[
+		{"id":"acct_a","number":1,"email":"a@example.com","alias":"acct-a","active":false,
+		 "description":"","updated_at":"2026-11-26T00:00:00Z","groups":[]},
+		{"id":"acct_b","number":2,"email":"b@example.com","alias":"acct-b","active":true,
+		 "description":"","updated_at":"2026-11-26T00:00:00Z","groups":[]}
+	]}}`
+
+	cfg := config.DefaultConfig()
+	mgr := NewManager(cfg, nil)
+	mgr.listForTest = func(context.Context) ([]byte, error) { return []byte(payload), nil }
+	if err := mgr.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	byID := map[string]Account{}
+	for _, acc := range mgr.GetAccounts() {
+		byID[acc.ID] = acc
+	}
+	if len(byID) != 2 {
+		t.Fatalf("expected 2 accounts, got %d", len(byID))
+	}
+	if !byID["acct_b"].ActiveInVault {
+		t.Fatal("acct_b is flagged active in the payload but ActiveInVault is false")
+	}
+	if byID["acct_a"].ActiveInVault {
+		t.Fatal("acct_a is not flagged active but ActiveInVault is true")
+	}
+	// The mapping must be what actually drives the seed.
+	if got := mgr.VaultActiveAccountID(); got != "acct_b" {
+		t.Fatalf("VaultActiveAccountID() = %q, want acct_b", got)
+	}
+	if got := byID["acct_a"].Status; got != StatusHealthy {
+		t.Fatalf("status = %s: the live payload carries no `expired` key, so it must be HEALTHY", got)
 	}
 }

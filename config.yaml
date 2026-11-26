@@ -55,6 +55,9 @@ pool:
 
 accounts:
   auto_rotate_enabled: true
+  # round_robin: spread by index | least_used: greedy over live quota and claim counts |
+  # sticky: persist per-worker affinity in <base_data_dir>/state/worker-bindings.json, honouring a
+  # binding only while the account still exists, is usable, and is not claimed by an earlier worker.
   allocation_strategy: "round_robin"
   quota_poll_interval: "30s"
   min_remaining_quota_pct: 5.0

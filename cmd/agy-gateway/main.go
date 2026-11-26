@@ -164,7 +164,12 @@ func main() {
 	onboardingMgr := auth.NewOAuthOnboardingManager(cfg, authMgr, logger)
 	defer onboardingMgr.Close()
 
-	// 7. Initialize worker pool & failover coordinator
+	// 7. Initialize worker pool & failover coordinator.
+	//
+	// @rationale This MUST stay after the quota poller above: account allocation for the least_used
+	// and sticky strategies ranks candidates by live quota and eligibility, so pooling before the
+	// first poll would assign every worker from an empty quota map — silently degrading both
+	// strategies to vault order. The ordering is a load-bearing precondition, not incidental.
 	workerPool, err := pool.NewPool(ctx, cfg, authMgr, logger)
 	if err != nil {
 		logger.Error("failed to initialize worker pool", "err", err)
