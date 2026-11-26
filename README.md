@@ -426,6 +426,25 @@ Contributions, bug reports, and research discussions are welcome. This project i
    swag init -g cmd/agy-gateway/main.go -o docs
    ```
 
+### Version Synchronization
+
+The release version lives in exactly one place: `var Version` in `internal/version/version.go`.
+`scripts/version.sh` propagates it to every managed location (swag annotation, generated docs,
+`deploy/Dockerfile`, both compose files, README badge) and proves consistency.
+
+Releases are automatic: the `CI & Release Pipeline` workflow bumps, commits, tags, and pushes the
+image. To keep a local clone in sync after a release, configure rebase-on-pull once per clone and
+then verify:
+
+```bash
+git config pull.rebase true   # once per clone
+git pull
+scripts/version.sh verify     # exit 0 means the tree matches the released version
+```
+
+`scripts/version.sh current` prints the source-of-truth version; `bump X.Y.Z` rewrites all managed
+locations (used by CI, rarely by hand); `verify` is also a blocking CI gate so drift cannot land.
+
 ### Contribution Rules
 - **No Hardcoded Secrets or Paths**: All configuration must remain 12-factor and environment-driven.
 - **Thread Safety & Zero Race Invariant**: All shared state must be protected with appropriate synchronization primitives (`sync.RWMutex`, atomic variables).

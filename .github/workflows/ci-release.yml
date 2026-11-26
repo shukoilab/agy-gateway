@@ -45,6 +45,11 @@ jobs:
             exit 1
           fi
 
+      - name: Enforce Version Consistency
+        run: |
+          scripts/version.sh verify
+          scripts/version_test.sh
+
       - name: Run Go Vet
         run: go vet ./...
 
@@ -77,6 +82,33 @@ jobs:
           tag_prefix: "v"
           release_branches: "main"
           create_annotated_tag: true
+          dry_run: true
+
+      - name: Synchronize Version Across Repository
+        if: steps.tag_version.outputs.new_tag != ''
+        env:
+          VERSION: ${{ steps.tag_version.outputs.new_version }}
+          NOTES: ${{ steps.tag_version.outputs.changelog }}
+        run: |
+          printf '%s' "${NOTES:-}" | scripts/version.sh changelog "$VERSION"
+          scripts/version.sh bump "$VERSION"
+          scripts/version.sh verify
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u
+          if git diff --cached --quiet; then
+            echo "no version delta to commit; tagging HEAD"
+          else
+            git commit -m "chore(release): v$VERSION [skip ci]"
+          fi
+          # Retry-safe: an existing tag (fetched via fetch-depth: 0) must not abort the step.
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "tag v$VERSION already exists; reusing it"
+          else
+            git tag -a "v$VERSION" -m "v$VERSION"
+          fi
+          # Atomic so a rejected main push cannot strand a release tag on the remote.
+          git push --atomic origin "HEAD:main" "refs/tags/v$VERSION"
 
       - name: Normalize Repository Name for Container Registry
         id: repo_name

@@ -45,7 +45,9 @@ func TestTransport_LargePayloadWithoutErrTooLong(t *testing.T) {
 		LargeText string `json:"large_text"`
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 20 MiB through %q-escaped JSON marshalling plus a chunked pipe copy takes ~14s under
+	// -race instrumentation, so 10s raced the kernel and flaked the suite. Generous ceiling.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	err := transport.Call(ctx, "session/prompt", nil, &result)
