@@ -147,10 +147,11 @@ changelog() {
   notes="$(cat)"
   # Drop a single trailing newline so the notes block is not followed by a stray blank line.
   notes="${notes%$'\n'}"
-  # github-tag-action already prefixes its notes with a "## [x.y.z]" heading (often linked).
-  # Strip that leading heading and the blank lines around it, otherwise the section nests twice.
+  # github-tag-action already prefixes its notes with a "[x.y.z]" heading (## for minor/major,
+  # ### for patch, usually linked). Strip that leading heading and the blank lines around it,
+  # otherwise the section nests twice.
   notes="$(printf '%s\n' "$notes" | VER="$ver" awk '
-    BEGIN { pat = "^## \\[" ENVIRON["VER"] "\\]" }
+    BEGIN { pat = "^#{1,3} \\[" ENVIRON["VER"] "\\]" }
     !started {
       if ($0 ~ pat) next
       if ($0 ~ /^[[:space:]]*$/) next

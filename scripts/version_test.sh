@@ -152,12 +152,14 @@ out="$(cd "$WORK/s9" && ./scripts/version.sh current)"
 pass "current/verify agree on the fixture version"
 
 echo "S10: a notes block that already carries its own heading is not nested twice"
-fixture "$WORK/s10" 1.2.3
-printf '## [4.5.6](https://example/compare) (2026-01-01)\n\n### Features\n\n* landed\n' \
-  | (cd "$WORK/s10" && ./scripts/version.sh changelog 4.5.6) >/dev/null
-headings="$(grep -c '^## \[4\.5\.6\]' "$WORK/s10/CHANGELOG.md")"
-[[ "$headings" == "1" ]] || fail "S10 emitted $headings duplicate headings for 4.5.6"
-grep -q '^### Features$' "$WORK/s10/CHANGELOG.md" || fail "S10 dropped the notes body"
+for h in '##' '###'; do
+  fixture "$WORK/s10$h" 1.2.3
+  printf '%s [4.5.6](https://example/compare) (2026-01-01)\n\n### Features\n\n* landed\n' "$h" \
+    | (cd "$WORK/s10$h" && ./scripts/version.sh changelog 4.5.6) >/dev/null
+  headings="$(grep -c '^## \[4\.5\.6\]' "$WORK/s10$h/CHANGELOG.md")"
+  [[ "$headings" == "1" ]] || fail "S10 ($h notes) emitted $headings headings for 4.5.6"
+  grep -q '^### Features$' "$WORK/s10$h/CHANGELOG.md" || fail "S10 ($h notes) dropped the notes body"
+done
 pass "self-headed notes keep exactly one heading"
 
 echo
