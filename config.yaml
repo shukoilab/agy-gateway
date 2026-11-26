@@ -21,13 +21,10 @@ binaries:
   agy_path: "/usr/local/bin/agy"
   agy_min_version: "1.5.16"
   agy_auth_path: "/usr/local/bin/agy-auth"
-  agy_acp_args:
-    - "acp"
 
 execution:
-  acp_session_mode: "accept-edits"
-  auto_approve_permissions: true
-  system_prompt_channel: "auto" # auto|standard|vendor|both
+  # The ACP argv is fixed by the gateway (always --dangerously-skip-permissions) and the system
+  # prompt is always delivered append-only; neither is configurable.
   vision_mode: "reject"         # reject|flatten - agy cannot process images
   clean_workspace_between_requests: true
   max_retries: 3

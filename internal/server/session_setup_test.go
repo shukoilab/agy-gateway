@@ -17,89 +17,84 @@ import (
 	"agy-gateway/internal/pool"
 )
 
-func TestBuildACPSessionNewParams_CapabilityNegotiationAndDelegation(t *testing.T) {
+func TestBuildACPSessionNewParams_AppendOnly(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Server.Port = 8182
 	cfg.Execution.StrictClientToolDelegation = true
 
-	// 1. agy acp v1.5.16 capabilities (append only, no top-level override)
-	wAppend := &pool.Worker{
-		Cwd: "/var/lib/agy-gateway/workspaces/w0",
-		Capabilities: acp.AgentCapabilities{
-			// Vendor-dialect agent: agy 1.5.16 advertises only _meta.antigravity.systemPrompt.append.
-			SupportsVendorSystemPrompt:  true,
-			SupportsSystemPromptAppend:  true,
-			SupportsSystemPromptOveride: false,
-			SupportsSystemPrompt:        false,
-		},
+	worker := &pool.Worker{
+		Cwd:          "/var/lib/agy-gateway/workspaces/w0",
+		Capabilities: acp.AgentCapabilities{SupportsVendorSystemPrompt: true},
 	}
 
-	params, _ := buildACPSessionNewParams(SessionSetupInput{
-		Worker:               wAppend,
+	// 1. Consumer prompt plus declared tools travel on the single append carrier.
+	params := buildACPSessionNewParams(SessionSetupInput{
+		Worker:               worker,
 		Config:               cfg,
 		ConsumerSystemPrompt: "You are OpenCode running on host.",
 		LoopbackSessionID:    "sess_abc123",
 		ClientToolNames:      []string{"read", "bash"},
 	})
 
-	if params.SystemPrompt != nil {
-		t.Fatalf("expected nil top-level SystemPrompt when SupportsSystemPrompt is false, got %+v", params.SystemPrompt)
-	}
-
 	agyMeta, ok := params.Meta["antigravity"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected antigravity meta map")
+		t.Fatalf("expected antigravity meta map, got %+v", params.Meta)
 	}
 	sysMap, ok := agyMeta["systemPrompt"].(map[string]any)
 	if !ok {
-		t.Fatalf("expected systemPrompt meta map")
+		t.Fatalf("expected systemPrompt meta map, got %+v", agyMeta)
 	}
 	appended, ok := sysMap["append"].(string)
 	if !ok || appended == "" {
 		t.Fatalf("expected non-empty append systemPrompt, got %+v", sysMap)
 	}
 	if _, hasOverride := sysMap["override"]; hasOverride {
-		t.Fatalf("must not emit override key when agent only supports append")
+		t.Fatalf("override must never be emitted; it hangs the agent turn")
 	}
 	if !strings.Contains(appended, "You are OpenCode running on host.") {
-		t.Fatalf("expected consumer prompt inside append payload")
+		t.Fatalf("consumer prompt missing from append payload: %q", appended)
 	}
 	if !strings.Contains(appended, "mcp_client-tools_read") || !strings.Contains(appended, "mcp_client-tools_bash") {
-		t.Fatalf("expected ClientToolDelegationDirective inside append payload")
+		t.Fatalf("delegation directive missing from append payload: %q", appended)
 	}
 
+	// 2. Zero prompt injection: no default persona, no precedence banner.
+	if strings.Contains(appended, "AUTHORITATIVE SYSTEM INSTRUCTIONS") {
+		t.Fatalf("hardcoded precedence banner must never be injected: %q", appended)
+	}
+	if strings.Contains(appended, "Strict Language Mirroring") {
+		t.Fatalf("hardcoded default execution protocol must never be injected: %q", appended)
+	}
+
+	// 3. Empty consumer prompt omits _meta entirely rather than sending an empty payload.
+	emptyParams := buildACPSessionNewParams(SessionSetupInput{Worker: worker, Config: cfg})
+	if emptyParams.Meta != nil {
+		t.Fatalf("no prompt must mean no _meta, got %+v", emptyParams.Meta)
+	}
+
+	// 4. Whitespace-only prompt is treated as empty.
+	blankParams := buildACPSessionNewParams(SessionSetupInput{
+		Worker: worker, Config: cfg, ConsumerSystemPrompt: "   \n\t  ",
+	})
+	if blankParams.Meta != nil {
+		t.Fatalf("whitespace-only prompt must mean no _meta, got %+v", blankParams.Meta)
+	}
+
+	// 5. Prompt without declared tools carries no delegation directive.
+	noTools := buildACPSessionNewParams(SessionSetupInput{
+		Worker: worker, Config: cfg, ConsumerSystemPrompt: "Plain prompt",
+	})
+	plain := noTools.Meta["antigravity"].(map[string]any)["systemPrompt"].(map[string]any)["append"].(string)
+	if plain != "Plain prompt" {
+		t.Fatalf("prompt without tools must be forwarded verbatim, got %q", plain)
+	}
+
+	// 6. The loopback MCP server entry is still wired.
 	if len(params.MCPServers) != 1 || params.MCPServers[0].Name != "client-tools" {
 		t.Fatalf("expected client-tools MCPServer entry, got %+v", params.MCPServers)
 	}
 	if params.MCPServers[0].Env == nil {
 		t.Fatalf("expected non-nil empty Env slice on stdio MCPServerInfo")
-	}
-
-	// 2. Empty consumer prompt triggers DefaultExecutionProtocol
-	paramsDefault, _ := buildACPSessionNewParams(SessionSetupInput{
-		Worker: wAppend,
-		Config: cfg,
-	})
-	defaultAppend := paramsDefault.Meta["antigravity"].(map[string]any)["systemPrompt"].(map[string]any)["append"].(string)
-	if !strings.Contains(defaultAppend, "Strict Language Mirroring") {
-		t.Fatalf("expected DefaultExecutionProtocol when consumer prompt is empty, got %q", defaultAppend)
-	}
-
-	// 3. Canonical ACP v1 agent advertising override capability
-	wOverride := &pool.Worker{
-		Cwd: "/var/lib/agy-gateway/workspaces/w1",
-		Capabilities: acp.AgentCapabilities{
-			SupportsSystemPrompt:        true,
-			SupportsSystemPromptOveride: true,
-		},
-	}
-	paramsOv, _ := buildACPSessionNewParams(SessionSetupInput{
-		Worker:               wOverride,
-		Config:               cfg,
-		ConsumerSystemPrompt: "Custom prompt",
-	})
-	if paramsOv.SystemPrompt == nil || paramsOv.SystemPrompt.Mode != "override" {
-		t.Fatalf("expected top-level SystemPrompt mode 'override' when advertised, got %+v", paramsOv.SystemPrompt)
 	}
 }
 
@@ -124,62 +119,22 @@ func TestToolNameExtractionHelpers(t *testing.T) {
 	}
 }
 
-// @purpose Proves FR-02's fallback: when the agent advertises no system-prompt channel at all, the
-// prompt text is handed back so the caller can fold it into the first prompt block instead of
-// dropping it silently.
-// @rationale The original defect class was a silently discarded system prompt; a fallback that is
-// never asserted is the same defect with a comment.
-// @preconditions None.
-// @param t (*testing.T) - Go test harness.
-// @returns None.
-// @throws Calls t.Fatalf on any mismatch.
-// @invariants Pure, no process is spawned.
-func TestBuildACPSessionNewParams_NoChannelFoldsPrompt(t *testing.T) {
+// TestBuildACPSessionNewParams_UnadvertisedChannelStillSends proves the gateway does not silently
+// drop a consumer prompt just because the agent failed to advertise the append capability. The
+// warning is emitted at worker start; the payload itself is unchanged.
+func TestBuildACPSessionNewParams_UnadvertisedChannelStillSends(t *testing.T) {
 	cfg := config.DefaultConfig()
-	cfg.Server.Port = 8182
+	silent := &pool.Worker{Cwd: "/var/lib/agy-gateway/workspaces/w0"}
 
-	silent := &pool.Worker{
-		Cwd:          "/var/lib/agy-gateway/workspaces/w0",
-		Capabilities: acp.AgentCapabilities{}, // no standard and no vendor channel
-	}
-
-	params, fold := buildACPSessionNewParams(SessionSetupInput{
-		Worker:               silent,
-		Config:               cfg,
-		ConsumerSystemPrompt: "OPERATOR PROMPT",
+	params := buildACPSessionNewParams(SessionSetupInput{
+		Worker: silent, Config: cfg, ConsumerSystemPrompt: "OPERATOR PROMPT",
 	})
-	if fold == "" {
-		t.Fatal("expected the prompt to be folded into the first block when no channel is advertised")
+	agy, ok := params.Meta["antigravity"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected antigravity meta even for an unadvertised channel, got %+v", params.Meta)
 	}
-	if !strings.Contains(fold, "OPERATOR PROMPT") {
-		t.Fatalf("folded prompt lost the consumer prompt: %q", fold)
-	}
-	if params.SystemPrompt != nil {
-		t.Fatalf("no channel is advertised, so no systemPrompt may be sent: %+v", params.SystemPrompt)
-	}
-	if params.Meta != nil {
-		if agy, ok := params.Meta["antigravity"].(map[string]any); ok {
-			if _, has := agy["systemPrompt"]; has {
-				t.Fatalf("no vendor channel is advertised, so no _meta systemPrompt may be sent: %+v", params.Meta)
-			}
-		}
-	}
-
-	// A vendor-dialect agent must instead receive the prompt on that channel and fold nothing.
-	vendor := &pool.Worker{
-		Cwd:          "/var/lib/agy-gateway/workspaces/w0",
-		Capabilities: acp.AgentCapabilities{SupportsVendorSystemPrompt: true, SupportsSystemPromptAppend: true},
-	}
-	params2, fold2 := buildACPSessionNewParams(SessionSetupInput{
-		Worker:               vendor,
-		Config:               cfg,
-		ConsumerSystemPrompt: "OPERATOR PROMPT",
-	})
-	if fold2 != "" {
-		t.Fatalf("a supported channel must not also fold the prompt: %q", fold2)
-	}
-	if params2.Meta == nil {
-		t.Fatal("vendor-dialect agent must receive _meta.antigravity.systemPrompt")
+	if agy["systemPrompt"].(map[string]any)["append"] != "OPERATOR PROMPT" {
+		t.Fatalf("consumer prompt must be forwarded verbatim, got %+v", agy["systemPrompt"])
 	}
 }
 
@@ -276,7 +231,7 @@ func TestApplySessionConfigOptions_TracksLiveOptionSet(t *testing.T) {
 			Options: []acp.SessionConfigValue{{Value: "gemini-4-hydrogen"}, {Value: "claude-sonnet-4-6"}}},
 		{ID: acp.ConfigIDThoughtLevel, Type: "select", CurrentValue: "high",
 			Options: []acp.SessionConfigValue{{Value: "low"}, {Value: "medium"}, {Value: "high"}, {Value: "xhigh"}}},
-		{ID: acp.ConfigIDMode, Type: "select", CurrentValue: "default",
+		{ID: "mode", Type: "select", CurrentValue: "default",
 			Options: []acp.SessionConfigValue{{Value: "default"}, {Value: "accept-edits"}}},
 	}
 	// What agy answers after switching to claude-sonnet-4-6: no thought_level at all.
@@ -316,30 +271,29 @@ func TestApplySessionConfigOptions_TracksLiveOptionSet(t *testing.T) {
 				write(id, string(raw))
 			})
 
-			_, _, err := applySessionConfigOptions(context.Background(), worker,
+			_, err := applySessionConfigOptions(context.Background(), worker,
 				acp.SessionNewResult{SessionID: "sess_live", ConfigOptions: modelOnly},
-				tc.model, "medium", "accept-edits", time.Second, nil)
+				tc.model, "medium", time.Second, nil)
 			if err != nil {
 				t.Fatalf("applySessionConfigOptions: %v", err)
 			}
 
 			mu.Lock()
 			defer mu.Unlock()
-			levelSent := false
-			modeSent := false
+			levelSent, modeSent := false, false
 			for _, id := range sentIDs {
 				if id == acp.ConfigIDThoughtLevel {
 					levelSent = true
 				}
-				if id == acp.ConfigIDMode {
+				if id == "mode" {
 					modeSent = true
 				}
 			}
 			if levelSent != tc.wantLevelSent {
 				t.Fatalf("thought_level sent=%v, want %v (calls: %v)", levelSent, tc.wantLevelSent, sentIDs)
 			}
-			if !modeSent {
-				t.Fatalf("mode must still be applied after a model switch (calls: %v)", sentIDs)
+			if modeSent {
+				t.Fatalf("session mode must never be sent: plan vs build is the consumer's system prompt (calls: %v)", sentIDs)
 			}
 		})
 	}
@@ -363,7 +317,7 @@ func TestApplySessionConfigOptions_NoModelOptionStillAppliesLaterOptions(t *test
 	noModelOption := []acp.SessionConfigOption{
 		{ID: acp.ConfigIDThoughtLevel, Type: "select", CurrentValue: "high",
 			Options: []acp.SessionConfigValue{{Value: "low"}, {Value: "medium"}, {Value: "high"}, {Value: "xhigh"}}},
-		{ID: acp.ConfigIDMode, Type: "select", CurrentValue: "default",
+		{ID: "mode", Type: "select", CurrentValue: "default",
 			Options: []acp.SessionConfigValue{{Value: "default"}, {Value: "accept-edits"}}},
 	}
 
@@ -382,9 +336,9 @@ func TestApplySessionConfigOptions_NoModelOptionStillAppliesLaterOptions(t *test
 		write(id, string(raw))
 	})
 
-	_, appliedMode, err := applySessionConfigOptions(context.Background(), worker,
+	appliedModel, err := applySessionConfigOptions(context.Background(), worker,
 		acp.SessionNewResult{SessionID: "sess_nomodel", ConfigOptions: noModelOption},
-		"gemini-4-hydrogen-xhigh", "medium", "accept-edits", time.Second, nil)
+		"gemini-4-hydrogen-xhigh", "medium", time.Second, nil)
 	if err != nil {
 		t.Fatalf("applySessionConfigOptions: %v", err)
 	}
@@ -396,17 +350,17 @@ func TestApplySessionConfigOptions_NoModelOptionStillAppliesLaterOptions(t *test
 		if id == acp.ConfigIDThoughtLevel {
 			levelSent = true
 		}
-		if id == acp.ConfigIDMode {
+		if id == "mode" {
 			modeSent = true
 		}
 	}
 	if !levelSent {
 		t.Fatalf("thought_level must still be applied when the agent advertises no model option (calls: %v)", sentIDs)
 	}
-	if !modeSent {
-		t.Fatalf("mode must still be applied when the agent advertises no model option (calls: %v)", sentIDs)
+	if modeSent {
+		t.Fatalf("session mode must never be sent (calls: %v)", sentIDs)
 	}
-	if appliedMode != "accept-edits" {
-		t.Fatalf("appliedMode = %q, want accept-edits", appliedMode)
+	if appliedModel != "gemini-4-hydrogen-xhigh" {
+		t.Fatalf("appliedModel = %q, want gemini-4-hydrogen-xhigh", appliedModel)
 	}
 }

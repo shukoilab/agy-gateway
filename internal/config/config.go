@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/exec"
@@ -38,6 +39,13 @@ type Config struct {
 	QueryRegex *regexp.Regexp `yaml:"-"`
 	AliasRegex *regexp.Regexp `yaml:"-"`
 	binMu      sync.RWMutex   `yaml:"-"`
+
+	// RemovedKeys carries the YAML keys and environment variables that were deleted by the YOLO
+	// refactor but are still present in the loaded configuration. Load does not log them itself:
+	// it runs before the configured log handler is installed, so an emission here would bypass
+	// observability.log_format/level. Callers pass the value to WarnRemovedKeys once their logger is
+	// built; every entrypoint that builds a logger does so, and the daemon uses setupLogging.
+	RemovedKeys []string `yaml:"-"`
 }
 
 type ServerConfig struct {
@@ -66,24 +74,29 @@ type SecurityConfig struct {
 	AllowedCORSOrigins []string       `yaml:"allowed_cors_origins"`
 }
 
+// BinariesConfig locates the agent and constrains which build the gateway will run against.
+//
+// @purpose Supplies paths plus the minimum version gate.
+// @rationale agy_acp_args was removed with the YOLO refactor: the argv is a product invariant owned by
+// acp.SpawnArgs(), so exposing it would let a deployment silently drop the flag that makes the gateway
+// a provider endpoint rather than a blocking harness.
 type BinariesConfig struct {
-	AgyPath       string   `yaml:"agy_path"`
-	AgyMinVersion string   `yaml:"agy_min_version"`
-	AgyAuthPath   string   `yaml:"agy_auth_path"`
-	AgyAcpArgs    []string `yaml:"agy_acp_args"`
+	AgyPath       string `yaml:"agy_path"`
+	AgyMinVersion string `yaml:"agy_min_version"`
+	AgyAuthPath   string `yaml:"agy_auth_path"`
 }
 
 // ExecutionConfig controls per-turn agent behaviour.
 //
 // @purpose Groups the policies that shape how one inference turn is executed.
-// @rationale YoloMode was removed: it was a dead duplicate of AutoApprovePermissions plus the
-// --dangerously-skip-permissions CLI flag, so its presence implied a switch that did nothing.
+// @rationale The YOLO refactor removed three knobs that only existed to compensate for a mode or
+// channel choice the gateway no longer makes: acp_session_mode (plan/build is the consumer's system
+// prompt), auto_approve_permissions (--dangerously-skip-permissions is now unconditional), and
+// system_prompt_channel (append is the only carrier agy honours). What remains is genuine per-turn
+// policy that no product invariant fixes.
 type ExecutionConfig struct {
-	AcpSessionMode                string        `yaml:"acp_session_mode"`
-	AutoApprovePermissions        bool          `yaml:"auto_approve_permissions"`
 	CleanWorkspaceBetweenRequests bool          `yaml:"clean_workspace_between_requests"`
 	StrictClientToolDelegation    bool          `yaml:"strict_client_tool_delegation"`
-	SystemPromptChannel           string        `yaml:"system_prompt_channel"`
 	VisionMode                    string        `yaml:"vision_mode"`
 	MaxRetries                    int           `yaml:"max_retries"`
 	RetryInitialBackoff           time.Duration `yaml:"retry_initial_backoff"`
@@ -320,14 +333,10 @@ func DefaultConfig() *Config {
 			AgyPath:       "/usr/local/bin/agy",
 			AgyMinVersion: "1.5.16",
 			AgyAuthPath:   "/usr/local/bin/agy-auth",
-			AgyAcpArgs:    []string{"acp"},
 		},
 		Execution: ExecutionConfig{
-			AcpSessionMode:                "accept-edits",
-			AutoApprovePermissions:        true,
 			CleanWorkspaceBetweenRequests: true,
 			StrictClientToolDelegation:    true,
-			SystemPromptChannel:           "auto",
 			VisionMode:                    "reject",
 			MaxRetries:                    3,
 			RetryInitialBackoff:           500 * time.Millisecond,
@@ -455,10 +464,12 @@ func Load(path string) (*Config, error) {
 			if err := yaml.Unmarshal(data, cfg); err != nil {
 				return nil, fmt.Errorf("failed to parse YAML config: %w", err)
 			}
+			cfg.RemovedKeys = collectRemovedKeys(data)
 		}
 	}
 
 	applyEnvOverrides(cfg)
+	cfg.RemovedKeys = append(cfg.RemovedKeys, collectRemovedEnvKeys(os.Getenv)...)
 
 	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("configuration validation failed: %w", err)
@@ -467,8 +478,135 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func applyEnvOverrides(cfg *Config) {
-	// 1. Server Overrides
+// removedConfigKeys lists YAML keys deleted by the YOLO refactor.
+//
+// @purpose Lets a stale config file keep working while telling the operator what no longer applies.
+// @rationale Load uses plain yaml.Unmarshal, so an unknown key is silently ignored. That is desirable
+// for boot safety but unacceptable for auto_approve_permissions=false, which used to disable
+// auto-approval: an operator relying on it would otherwise believe a policy still holds.
+var removedConfigKeys = []struct{ section, key string }{
+	{"execution", "acp_session_mode"},
+	{"execution", "auto_approve_permissions"},
+	{"execution", "system_prompt_channel"},
+	{"binaries", "agy_acp_args"},
+}
+
+// removedEnvKeys lists environment variables deleted by the YOLO refactor.
+//
+// @purpose Discloses a stale environment configuration, which is how most deployments actually
+// configure the gateway (docker-compose, systemd, .env).
+// @rationale A YAML-only check is insufficient: an operator who set
+// AGY_GW_AUTO_APPROVE_PERMISSIONS=false in .env would never learn that approval can no longer be
+// denied.
+var removedEnvKeys = []string{
+	"AGY_GW_ACP_SESSION_MODE",
+	"ACP_SESSION_MODE",
+	"AGY_GW_AUTO_APPROVE_PERMISSIONS",
+	"AGY_GW_SYSTEM_PROMPT_CHANNEL",
+	"AGY_GW_AGY_ACP_ARGS",
+}
+
+// removedKeyNotes maps each removed key to the action an operator should take.
+//
+// @purpose Gives the startup warning something actionable to say.
+// @rationale A bare "ignored" leaves the operator guessing whether their intent is still honoured.
+// This map is the single source of truth for both the YAML and env key sets; keys absent here emit no
+// note, which Validate-free lookups in tests assert against.
+var removedKeyNotes = map[string]string{
+	"execution.acp_session_mode":         "plan vs build is now decided by the consumer system prompt",
+	"execution.auto_approve_permissions": "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"execution.system_prompt_channel":    "the system prompt is always sent via _meta.antigravity.systemPrompt.append",
+	"binaries.agy_acp_args":              "the ACP argv is fixed by the gateway",
+	"AGY_GW_ACP_SESSION_MODE":            "plan vs build is now decided by the consumer system prompt",
+	"ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
+	"AGY_GW_AUTO_APPROVE_PERMISSIONS":    "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"AGY_GW_SYSTEM_PROMPT_CHANNEL":       "the system prompt is always sent via _meta.antigravity.systemPrompt.append",
+	"AGY_GW_AGY_ACP_ARGS":                "the ACP argv is fixed by the gateway",
+}
+
+// collectRemovedEnvKeys returns the removed environment variables that are still exported.
+//
+// @purpose Identifies a stale environment configuration without emitting any log itself.
+// @rationale Load runs before the configured slog handler is installed, so logging here would bypass
+// observability.log_format/level and could not be indexed by the operator's pipeline.
+// @preconditions None.
+// @param getenv Lookup function, injected so tests do not mutate the process environment.
+// @returns The removed variable names that are set and non-blank, in declaration order.
+// @throws None.
+// @invariants O(len(removedEnvKeys)); reads each variable exactly once.
+func collectRemovedEnvKeys(getenv func(string) string) []string {
+	if getenv == nil {
+		return nil
+	}
+	var stale []string
+	for _, name := range removedEnvKeys {
+		if strings.TrimSpace(getenv(name)) != "" {
+			stale = append(stale, name)
+		}
+	}
+	return stale
+}
+
+// collectRemovedKeys returns the removed YAML keys still present in the loaded document.
+//
+// @purpose Identifies a stale YAML configuration without emitting any log itself.
+// @rationale Silently ignoring a security-relevant toggle is the defect this avoids; failing the boot
+// would punish an operator for an otherwise harmless leftover line. Emission is deferred to the
+// entrypoint, after the real handler exists.
+// @preconditions data is the YAML document already applied to cfg.
+// @param data Raw YAML bytes.
+// @returns Dotted key paths present in the document, in declaration order.
+// @throws None; parse failures yield nil because Load has already validated the document shape.
+// @invariants O(len(removedConfigKeys)).
+func collectRemovedKeys(data []byte) []string {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil || raw == nil {
+		return nil
+	}
+	var stale []string
+	for _, removed := range removedConfigKeys {
+		section, ok := raw[removed.section].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, present := section[removed.key]; present {
+			stale = append(stale, removed.section+"."+removed.key)
+		}
+	}
+	return stale
+}
+
+// RemovedKeyNote returns the operator-facing note for a removed configuration key.
+//
+// @purpose Lets every entrypoint print the same actionable warning for a stale key.
+// @param key A value returned by Load in Config.RemovedKeys.
+// @returns The explanatory note, or an empty string for an unrecognised key.
+// @invariants Pure; O(1).
+func RemovedKeyNote(key string) string { return removedKeyNotes[key] }
+
+// WarnRemovedKeys emits one actionable warning per removed configuration key.
+//
+// @purpose Gives every entrypoint (daemon and CLI subcommands) a single way to disclose a stale
+// configuration, so no operator loses the notice depending on which binary they run.
+// @rationale Load cannot log: it runs before the configured handler exists, and the CLI subcommands
+// each build their own logger. Emitting from here keeps the message identical everywhere and honours
+// whatever handler the caller installed.
+// @preconditions cfg may be nil; logger may be nil.
+// @param logger The caller's configured logger.
+// @param cfg Loaded configuration whose RemovedKeys were populated by Load.
+// @returns None.
+// @throws None.
+// @invariants O(len(cfg.RemovedKeys)); one line per key; emits only static key names and notes.
+func WarnRemovedKeys(logger *slog.Logger, cfg *Config) {
+	if logger == nil || cfg == nil {
+		return
+	}
+	for _, key := range cfg.RemovedKeys {
+		logger.Warn("removed configuration key ignored", "key", key, "reason", RemovedKeyNote(key))
+	}
+}
+
+func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	if v := getFirstEnv("AGY_GW_HOST", "HOST"); v != "" {
 		cfg.Server.Host = v
 	}
@@ -608,9 +746,6 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("AGY_GW_RETRY_MAX_BACKOFF"); v != "" {
 		cfg.Execution.RetryMaxBackoff = parseDurationEnv(v, cfg.Execution.RetryMaxBackoff)
 	}
-	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
-		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
-	}
 	if v := os.Getenv("AGY_GW_STRICT_CLIENT_TOOL_DELEGATION"); v != "" {
 		cfg.Execution.StrictClientToolDelegation = parseBoolEnv(v, cfg.Execution.StrictClientToolDelegation)
 	}
@@ -671,17 +806,10 @@ func applyEnvOverrides(cfg *Config) {
 	}
 
 	// 5d. Execution Policy Overrides
-	if v := getFirstEnv("AGY_GW_ACP_SESSION_MODE", "ACP_SESSION_MODE"); v != "" {
-		cfg.Execution.AcpSessionMode = strings.TrimSpace(v)
-	}
-	if v := os.Getenv("AGY_GW_AUTO_APPROVE_PERMISSIONS"); v != "" {
-		cfg.Execution.AutoApprovePermissions = parseBoolEnv(v, cfg.Execution.AutoApprovePermissions)
-	}
+	// acp_session_mode, auto_approve_permissions, system_prompt_channel and agy_acp_args are no
+	// longer read: they are product invariants now (see acp.SpawnArgs and composeSystemPrompt).
 	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
 		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
-	}
-	if v := os.Getenv("AGY_GW_SYSTEM_PROMPT_CHANNEL"); v != "" {
-		cfg.Execution.SystemPromptChannel = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("AGY_GW_VISION_MODE"); v != "" {
 		cfg.Execution.VisionMode = strings.TrimSpace(v)
@@ -699,18 +827,6 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("AGY_GW_AGY_MIN_VERSION"); v != "" {
 		cfg.Binaries.AgyMinVersion = strings.TrimSpace(v)
-	}
-	if v := os.Getenv("AGY_GW_AGY_ACP_ARGS"); v != "" {
-		parts := strings.Split(v, ",")
-		args := make([]string, 0, len(parts))
-		for _, p := range parts {
-			if t := strings.TrimSpace(p); t != "" {
-				args = append(args, t)
-			}
-		}
-		if len(args) > 0 {
-			cfg.Binaries.AgyAcpArgs = args
-		}
 	}
 
 	// 5c. Outbound Proxy Overrides (Docker Layer & Host)
@@ -952,15 +1068,6 @@ func validate(cfg *Config) error {
 	if !validUnsupportedParamPolicy(cfg.Anthropic.UnsupportedParamPolicy) {
 		return fmt.Errorf("anthropic.unsupported_param_policy must be 'strip_and_warn' or 'reject', got %q",
 			cfg.Anthropic.UnsupportedParamPolicy)
-	}
-	// "auto" is advertised by agy acp 1.5.16 and must be selectable.
-	if !validSessionMode(cfg.Execution.AcpSessionMode) {
-		return fmt.Errorf("execution.acp_session_mode must be one of %v, got %q",
-			sessionModes, cfg.Execution.AcpSessionMode)
-	}
-	if !validSystemPromptChannel(cfg.Execution.SystemPromptChannel) {
-		return fmt.Errorf("execution.system_prompt_channel must be one of %v, got %q",
-			systemPromptChannels, cfg.Execution.SystemPromptChannel)
 	}
 	if !validVisionMode(cfg.Execution.VisionMode) {
 		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",

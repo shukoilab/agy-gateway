@@ -32,29 +32,8 @@ type Transport struct {
 	closed atomic.Bool
 	doneCh chan struct{}
 
-	// autoApprove controls whether permission requests are approved automatically. When false, the
-	// agent is told `cancelled` and the session is cancelled so the turn unwinds deterministically.
-	autoApprove atomic.Bool
-}
-
-// SetAutoApprovePermissions configures the permission policy for this transport.
-//
-// @purpose Wires execution.auto_approve_permissions into the permission decision path.
-// @rationale The policy was previously unconditional, so an operator could not disable it.
-// @param enabled True to auto-approve allow* options; false to always answer cancelled.
-// @returns None.
-// @invariants Atomic store; safe to call before the first turn.
-func (t *Transport) SetAutoApprovePermissions(enabled bool) {
-	t.autoApprove.Store(enabled)
-}
-
-// AutoApprovePermissions reports the current permission policy.
-//
-// @purpose Read accessor for the permission policy.
-// @returns True when permission requests are auto-approved.
-// @invariants Atomic load.
-func (t *Transport) AutoApprovePermissions() bool {
-	return t.autoApprove.Load()
+	// autoApprove was removed with the YOLO refactor: permission requests are always approved, so
+	// there is no policy to store.
 }
 
 // NewTransport creates an initialized Transport wrapping input and output streams.
@@ -67,15 +46,12 @@ func NewTransport(in io.WriteCloser, out io.ReadCloser, maxScannerBuffer int, lo
 	}
 
 	t := &Transport{
-		in:          in,
-		out:         out,
-		logger:      logger,
-		pending:     make(map[int64]chan *Response),
-		doneCh:      make(chan struct{}),
-		autoApprove: atomic.Bool{},
+		in:      in,
+		out:     out,
+		logger:  logger,
+		pending: make(map[int64]chan *Response),
+		doneCh:  make(chan struct{}),
 	}
-	// Default matches the historical behaviour (auto-approve) until configuration overrides it.
-	t.autoApprove.Store(true)
 
 	go t.readLoop(maxScannerBuffer)
 	return t
@@ -280,7 +256,7 @@ func (t *Transport) processLine(line []byte) {
 	// First, probe whether this is a Response, Request, or Notification
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(line, &raw); err != nil {
-		t.logger.Warn("invalid JSON-RPC line received", "error", err, "line", string(line))
+		t.logger.Warn("invalid JSON-RPC line received", "error", err, "bytes", len(line))
 		return
 	}
 
@@ -405,16 +381,6 @@ func (t *Transport) handlePermissionRequest(req *Request) {
 		return
 	}
 
-	if !t.AutoApprovePermissions() {
-		t.logger.Info("permission request denied by policy",
-			"sessionID", params.SessionID, "toolCallId", params.ResolvedToolCallID())
-		t.replyPermission(req.ID, PermissionOutcome{Outcome: "cancelled"}, "", "")
-		if params.SessionID != "" {
-			_ = t.Notify("session/cancel", SessionCancelParams{SessionID: params.SessionID})
-		}
-		return
-	}
-
 	// Priority resolution over the closed kind enum: allow_always -> allow_once -> any "allow_*" kind.
 	// reject_once / reject_always are recognised and never selected.
 	var chosen *PermissionOption
@@ -492,7 +458,7 @@ func (t *Transport) handleIncomingNotification(notif *Notification) {
 	if notif.Method == "session/update" {
 		var params SessionUpdateParams
 		if err := json.Unmarshal(notif.Params, &params); err != nil {
-			t.logger.Warn("failed to parse session/update notification", "error", err, "raw", string(notif.Params))
+			t.logger.Warn("failed to parse session/update notification", "error", err, "bytes", len(notif.Params))
 			return
 		}
 

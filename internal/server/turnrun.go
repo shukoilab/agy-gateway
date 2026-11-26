@@ -481,10 +481,16 @@ func executeTurnAttempt(
 // @param cfg Gateway configuration.
 // @param logger Structured logger.
 // @param in Turn input.
-// @returns The negotiated session id, the prompt blocks to use (with the system prompt folded in when
-// no capability channel exists), and an error when the session cannot be created or closed cleanly.
-// @throws Returns the agent error when session/new fails after one auth retry.
-// @invariants Registers a session/close defer that always runs, gated on the advertised capability.
+// @returns The negotiated session id, the caller's prompt blocks unchanged (the system prompt travels
+// only in the session/new `_meta` carrier), a session-close closure, and an error when the session
+// cannot be created or the model cannot be applied.
+// @throws The agent error when session/new fails after one auth retry, an error when session/new
+// returned an empty session id, or the model-application error from applySessionConfigOptions (an
+// unavailable model is surfaced as 400 by the caller; an upstream set_config_option failure is a
+// 500-class fault).
+// @invariants Returns a closeSession closure instead of registering a defer: a defer inside this
+// function would fire before the prompt turn and close the session early ("Session not found"), so the
+// caller owns the lifetime and defers the returned closure after the turn completes.
 func setupACPSession(
 	ctx context.Context,
 	worker *pool.Worker,
@@ -495,7 +501,7 @@ func setupACPSession(
 	sessCtx, cancelSess := context.WithTimeout(ctx, cfg.Pool.HandshakeTimeout)
 	defer cancelSess()
 
-	newParams, foldPrompt := buildACPSessionNewParams(SessionSetupInput{
+	newParams := buildACPSessionNewParams(SessionSetupInput{
 		Worker:               worker,
 		Config:               cfg,
 		ConsumerSystemPrompt: in.SystemPrompt,
@@ -536,28 +542,16 @@ func setupACPSession(
 		}
 	}
 
-	mode := cfg.Execution.AcpSessionMode
-	if _, _, err := applySessionConfigOptions(
+	if _, err := applySessionConfigOptions(
 		sessCtx, worker, newResult,
-		in.ModelEntry.UpstreamModel, in.ThoughtLevel, mode,
+		in.ModelEntry.UpstreamModel, in.ThoughtLevel,
 		cfg.Pool.ConfigSwitchTimeout, logger,
 	); err != nil {
 		closer()
 		return "", nil, nil, err
 	}
 
-	blocks := in.PromptBlocks
-	if foldPrompt != "" {
-		// No capability channel: prepend instead of dropping the prompt.
-		logger.Warn("agent advertises no system prompt channel; folding system prompt into the first block",
-			"workerID", worker.ID)
-		folded := make([]acp.PromptBlock, 0, len(blocks)+1)
-		folded = append(folded, acp.PromptBlock{Type: "text", Text: foldPrompt + "\n\n"})
-		folded = append(folded, blocks...)
-		blocks = folded
-	}
-
-	return newResult.SessionID, blocks, closer, nil
+	return newResult.SessionID, in.PromptBlocks, closer, nil
 }
 
 // sleepCtx waits for d or until the context is done.

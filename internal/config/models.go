@@ -97,20 +97,6 @@ func IsThoughtLevel(value string) bool {
 	return false
 }
 
-// sessionModes enumerates agy acp session modes.
-//
-// @purpose Validation set for execution.acp_session_mode.
-// @rationale Verified from a live session/new response: agy 1.5.16 advertises default, accept-edits,
-// auto and plan. Excluding `auto` made an advertised mode unreachable.
-var sessionModes = []string{"default", "accept-edits", "auto", "plan"}
-
-// systemPromptChannels enumerates delivery channels for the system prompt.
-//
-// @purpose Validation set for execution.system_prompt_channel.
-// @rationale "auto" sends every channel the agent advertises (the only safe default); "standard" and
-// "vendor" pin one channel; "both" forces both regardless of advertisement.
-var systemPromptChannels = []string{"auto", "standard", "vendor", "both"}
-
 // visionModes enumerates image/embedded-content handling.
 //
 // @purpose Validation set for execution.vision_mode.
@@ -187,8 +173,6 @@ func validAllocationStrategy(v string) bool {
 	return contains(allocationStrategies, NormalizeAllocationStrategy(v))
 }
 
-func validSessionMode(v string) bool            { return contains(sessionModes, v) }
-func validSystemPromptChannel(v string) bool    { return contains(systemPromptChannels, v) }
 func validVisionMode(v string) bool             { return contains(visionModes, v) }
 func validUnsupportedParamPolicy(v string) bool { return contains(unsupportedParamPolicies, v) }
 

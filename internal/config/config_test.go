@@ -24,11 +24,9 @@ binaries:
   agy_path: "/usr/local/bin/agy"
   agy_min_version: "1.5.5"
   agy_auth_path: "/usr/local/bin/agy-auth"
-  agy_acp_args: ["acp", "--dangerously-skip-permissions"]
 
 execution:
-  yolo_mode: true
-  acp_session_mode: "accept-edits"
+  vision_mode: "reject"
 
 pool:
   worker_count: 2

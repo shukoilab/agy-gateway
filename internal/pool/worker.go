@@ -100,10 +100,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		return w.StartFn(ctx)
 	}
 
-	args := w.cfg.Binaries.AgyAcpArgs
-	if len(args) == 0 {
-		args = []string{"acp"}
-	}
+	args := acp.SpawnArgs()
 
 	env := append(os.Environ(),
 		fmt.Sprintf("HOME=%s", w.HomeDir),
@@ -165,17 +162,21 @@ func (w *Worker) Start(ctx context.Context) error {
 		w.Close()
 		return fmt.Errorf("unsupported acp protocol version %d (gateway speaks %d)", v, acp.SupportedProtocolVersion)
 	}
-	w.Transport.SetAutoApprovePermissions(w.cfg.Execution.AutoApprovePermissions)
-
 	w.logger.Info("warm worker process started successfully",
 		"pid", proc.PID(),
 		"protocolVersion", w.Capabilities.ProtocolVersion,
-		"capAppend", w.Capabilities.SupportsSystemPromptAppend,
-		"capOverride", w.Capabilities.SupportsSystemPromptOveride,
 		"capVendorPrompt", w.Capabilities.SupportsVendorSystemPrompt,
 		"capAddDirs", w.Capabilities.SupportsAdditionalDirs,
 		"capClose", w.Capabilities.SupportsSessionClose,
 	)
+	// Append is the only system-prompt carrier the gateway uses. An agent that does not advertise it
+	// will silently drop every consumer prompt, so make that visible once per worker instead of
+	// letting requests appear to succeed with the prompt ignored.
+	if !w.Capabilities.SupportsVendorSystemPrompt {
+		w.logger.Warn("agent does not advertise _meta.antigravity.systemPrompt.append; "+
+			"consumer system prompts will be ignored by the agent",
+			"minVersion", w.cfg.Binaries.AgyMinVersion)
+	}
 	return nil
 }
 

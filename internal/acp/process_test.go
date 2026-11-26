@@ -3,7 +3,6 @@ package acp
 import (
 	"context"
 	"os/exec"
-	"strings"
 	"testing"
 	"time"
 )
@@ -27,25 +26,15 @@ func TestSpawnProcess_StderrBurstDoesNotBlock(t *testing.T) {
 	}
 	defer func() { _ = proc.Terminate(2 * time.Second) }()
 
-	// Reading stdout must complete; if stderr were unread the child would never reach the echo.
-	buf := make([]byte, 64)
+	// The child must reach its own exit within the budget. An undrained stderr pipe would block it on
+	// write forever. Poll the process state rather than matching stdout bytes: exec.Cmd closes the
+	// stdout read end in Wait, so a starved reader can lose the final buffered bytes and flake.
 	deadline := time.Now().Add(15 * time.Second)
-	var got string
-	for time.Now().Before(deadline) {
-		n, readErr := proc.Stdout().Read(buf)
-		if n > 0 {
-			got += string(buf[:n])
-			if strings.Contains(got, "SENTINEL") {
-				break
-			}
-		}
-		if readErr != nil {
-			break
-		}
+	for time.Now().Before(deadline) && proc.IsRunning() {
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	if !strings.Contains(got, "SENTINEL") {
-		t.Fatalf("child never reached its final write; stderr pipe was not drained (got %q)", got)
+	if proc.IsRunning() {
+		t.Fatalf("child never exited; stderr pipe was not drained")
 	}
 
 	// The retained tail must be bounded and non-empty.
@@ -94,7 +83,16 @@ func TestSpawnProcess_TerminateReapsGroup(t *testing.T) {
 	}
 
 	// The whole process group must be gone: signalling -pgid must fail with ESRCH.
-	if err := killGroupProbe(proc.PGID()); err == nil {
+	// SIGTERM is delivered asynchronously, so a backgrounded child can still be observable for a
+	// few milliseconds after the group leader reaps. Poll briefly instead of racing the kernel.
+	var probeErr error
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		if probeErr = killGroupProbe(proc.PGID()); probeErr != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if probeErr == nil {
 		t.Fatalf("process group %d still alive after Terminate", proc.PGID())
 	}
 

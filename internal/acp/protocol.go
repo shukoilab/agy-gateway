@@ -27,7 +27,6 @@ const (
 	ErrCodeResourceNotFound = -32002
 
 	// ACP Session Config IDs
-	ConfigIDMode         = "mode"
 	ConfigIDModel        = "model"
 	ConfigIDThoughtLevel = "thought_level"
 
@@ -39,7 +38,6 @@ const (
 	UpdateToolCallUpdate    = "tool_call_update"
 	UpdateUsage             = "usage_update"
 	UpdateAvailableCommands = "available_commands_update"
-	UpdateCurrentMode       = "current_mode_update"
 	UpdateConfigOption      = "config_option_update"
 	UpdateNotice            = "notice"
 	UpdateCompaction        = "compaction_update"
@@ -110,66 +108,48 @@ type MCPServerInfo struct {
 	Headers []HTTPHeader  `json:"headers,omitempty"`
 }
 
-// DefaultExecutionProtocol is the ultra-smart system prompt applied when the API consumer
-// does not specify a custom system prompt. It enforces strict language mirroring,
-// first-principles analysis, high-signal directness, and Chain-of-Verification (CoVe).
-const DefaultExecutionProtocol = `Apply the following execution protocol to every user request:
-
-1. **Strict Language Mirroring**: Detect the user's input language and write the entire response in that exact language naturally, accurately, and professionally.
-2. **First-Principles & Assumption Analysis**: Before concluding, decompose the core objective, underlying first principles, critical variables, key assumptions, and edge cases or counter-arguments. Calibrate depth to task complexity.
-3. **High-Signal Directness**: Deliver concrete, actionable, and well-structured outputs (using Markdown headings, lists, or tables where helpful) immediately—omit introductory filler and closing summaries.
-4. **Chain-of-Verification (CoVe) Checklist**: Audit every draft claim against these gates before finalizing output:
-   - [ ] **Premise & Fact Verification**: Independently verify every claim, calculation, and logical step; state uncertainty or missing data explicitly rather than extrapolating.
-   - [ ] **Falsifiability & Edge Cases**: Address boundary conditions, failure modes, and strongest alternative interpretations.
-   - [ ] **Logical Coherence**: Ensure conclusions follow strictly from verified premises without internal contradiction.
-   - [ ] **Language & Signal Compliance**: Confirm 100% adherence to the user's input language and maximum information density.`
-
-// SystemPrompt defines system-level instructions passed during session setup per ACP v1.
-type SystemPrompt struct {
-	Mode    string        `json:"mode"` // "append" or "override"
-	Content []PromptBlock `json:"content"`
+// SpawnArgs returns the argv used to launch the ACP agent.
+//
+// @purpose Single source of truth for the gateway's YOLO posture.
+// @rationale The gateway is a provider endpoint, not an agent harness. Probes proved that
+// `--dangerously-skip-permissions` alone yields zero permission requests and unblocked file CRUD,
+// so auto-approval is a product invariant rather than an operator setting. A fresh slice is
+// returned per call so no caller can mutate the posture for others.
+// @preconditions None.
+// @returns A two-element argv whose first element is the `acp` subcommand.
+// @throws None.
+// @invariants Pure; O(1); the returned slice is caller-owned.
+func SpawnArgs() []string {
+	return []string{"acp", "--dangerously-skip-permissions"}
 }
 
 // SessionNewParams represents parameters sent in the session/new request per ACP v1 NewSessionRequest.
+//
+// @purpose Carries the workspace, loopback MCP servers and the append-only system prompt.
+// @rationale The spec-level `systemPrompt` field was removed: agy 1.5.16+ accepts it and silently
+// discards it, honouring only `_meta.antigravity.systemPrompt.append`. Keeping a field that is
+// never populated would suggest a delivery path that does not exist.
+// @invariants Meta is nil when the composed prompt (consumer prompt plus any client-tool delegation
+// directive) is empty, so a declared tool list alone is enough to populate it.
 type SessionNewParams struct {
 	CWD                   string          `json:"cwd"`
 	AdditionalDirectories []string        `json:"additionalDirectories,omitempty"`
 	MCPServers            []MCPServerInfo `json:"mcpServers,omitempty"`
-	SystemPrompt          *SystemPrompt   `json:"systemPrompt,omitempty"`
 	Meta                  map[string]any  `json:"_meta,omitempty"`
 }
 
 // SessionNewResult represents the result returned by session/new per ACP v1 NewSessionResponse.
 //
-// @purpose Carries the session handle plus the agent-advertised modes, config options and models.
+// @purpose Carries the session handle plus the agent-advertised config options and models.
 // @rationale `configOptions` is strongly typed so callers can reject values the agent will refuse
 // (verified: agy answers -32602 for unlisted thought levels) instead of discarding the error.
 //
 // @invariants ConfigOptions entries are keyed by ID and are safe to iterate without nil checks.
 type SessionNewResult struct {
 	SessionID     string                `json:"sessionId"`
-	Modes         *SessionModeState     `json:"modes,omitempty"`
 	ConfigOptions []SessionConfigOption `json:"configOptions,omitempty"`
 	Models        *SessionModelsState   `json:"models,omitempty"` // vendor extension
 	Meta          json.RawMessage       `json:"_meta,omitempty"`
-}
-
-// SessionModeState describes the agent's mode set as returned by session/new.
-//
-// @purpose Exposes the current and available modes for runtime validation.
-// @rationale agy advertises four modes (default, accept-edits, auto, plan); a configured mode must be
-// checked against this set rather than against a hardcoded list.
-// @invariants AvailableModes may be empty; CurrentModeID may be empty.
-type SessionModeState struct {
-	CurrentModeID  string        `json:"currentModeId"`
-	AvailableModes []SessionMode `json:"availableModes"`
-}
-
-// SessionMode is one selectable agent mode.
-type SessionMode struct {
-	ID          string `json:"id"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
 }
 
 // SessionModelsState mirrors the Antigravity vendor `models` extension on session/new.
@@ -582,36 +562,33 @@ type RequestPermissionResult struct {
 // AgentCapabilities describes negotiated server capabilities parsed from the ACP initialize response.
 //
 // @purpose Drives deterministic ACP feature negotiation without assuming unadvertised protocol extensions.
-// @rationale ACP v1 prohibits sending unadvertised modes (such as systemPrompt override when only append is supported).
-//
-//	The official schema expresses `sessionCapabilities.systemPrompt.mode.override` as an object (`{}`), and
-//	`append` as an implicit capability carrying NO entry at all. The Antigravity vendor dialect instead emits
-//	booleans under `_meta.antigravity.systemPrompt`. Both dialects are parsed separately so that a vendor-only
-//	key is never mistaken for evidence about the standard key.
+// @rationale Only the vendor system-prompt dialect is retained, because that is the sole carrier the
+// gateway uses: agy accepts the spec-level `systemPrompt` parameter and silently discards it, so
+// parsing standard system-prompt modes would advertise a delivery path that does not exist.
+// SupportsVendorSystemPrompt survives purely as a startup warning signal — append is mandatory, so an
+// agent that does not advertise it will silently drop every consumer prompt.
 //
 // @invariants All boolean flags default cleanly to false when omitted or malformed; never panics on wrong JSON types.
 type AgentCapabilities struct {
-	ProtocolVersion             int
-	LoadSession                 bool
-	SupportsSessionClose        bool
-	SupportsAdditionalDirs      bool
-	SupportsSystemPrompt        bool
-	SupportsSystemPromptAppend  bool
-	SupportsSystemPromptOveride bool
-	SupportsVendorSystemPrompt  bool
-	SupportsVendorPromptOveride bool
-	SupportsMCPHTTP             bool
-	SupportsMCPSSE              bool
-	PromptImage                 bool
-	PromptEmbeddedContext       bool
+	ProtocolVersion            int
+	LoadSession                bool
+	SupportsSessionClose       bool
+	SupportsAdditionalDirs     bool
+	SupportsVendorSystemPrompt bool
+	SupportsMCPHTTP            bool
+	SupportsMCPSSE             bool
+	PromptImage                bool
+	PromptEmbeddedContext      bool
 }
 
-// ParseAgentCapabilities safely extracts canonical and vendor-extension capabilities from an ACP initialize result.
+// ParseAgentCapabilities safely extracts the negotiated capabilities from an ACP initialize result.
 //
 // @purpose Parses initialize result payloads into strongly typed capability flags.
-// @rationale Prevents nil-map panics and guarantees strict compliance with ACP v1 capability gating, while
-// supporting both the official schema dialect (implicit `append`, object `override`) and the Antigravity
-// vendor dialect (booleans under `_meta.antigravity.systemPrompt`).
+// @rationale Prevents nil-map panics and never mistakes a malformed value for an advertisement. Only
+// the Antigravity vendor dialect is parsed for the system prompt: `_meta.antigravity.systemPrompt.append`.
+// The spec-level `sessionCapabilities.systemPrompt` block is deliberately not read, because agy accepts
+// that carrier and discards it, so treating it as support would imply a delivery path the gateway does
+// not use.
 //
 // @preconditions initResult may be nil or partially populated; keys may hold unexpected JSON types.
 // @param initResult Raw decoded initialize JSON-RPC result map.
@@ -661,7 +638,7 @@ func ParseAgentCapabilities(initResult map[string]any) AgentCapabilities {
 	}
 	if sessCaps != nil {
 		// Schema keys are advertised as empty objects, never as booleans/numbers. Accepting a falsy
-		// value as "advertised" would send a standard systemPrompt to an agent that said no.
+		// value as "advertised" would report a capability the agent never offered.
 		if v, exists := sessCaps["additionalDirectories"]; exists {
 			if _, ok := v.(map[string]any); ok {
 				caps.SupportsAdditionalDirs = true
@@ -670,31 +647,6 @@ func ParseAgentCapabilities(initResult map[string]any) AgentCapabilities {
 		if v, exists := sessCaps["close"]; exists {
 			if _, ok := v.(map[string]any); ok {
 				caps.SupportsSessionClose = true
-			}
-		}
-		// Must be an object (present, possibly `{}`). A falsy scalar is not an advertisement, and
-		// presence of the object means append is supported: it carries no entry in the schema.
-		if spMap, ok := sessCaps["systemPrompt"].(map[string]any); ok && spMap != nil {
-			caps.SupportsSystemPrompt = true
-			caps.SupportsSystemPromptAppend = true
-			if modeMap, ok := spMap["mode"].(map[string]any); ok {
-				// Schema dialect: override is an object. Vendor dialect: a boolean.
-				if ovRaw, exists := modeMap["override"]; exists {
-					switch ov := ovRaw.(type) {
-					case map[string]any:
-						caps.SupportsSystemPromptOveride = true
-					case bool:
-						caps.SupportsSystemPromptOveride = ov
-					}
-				}
-				if apRaw, exists := modeMap["append"]; exists {
-					switch ap := apRaw.(type) {
-					case map[string]any:
-						caps.SupportsSystemPromptAppend = true
-					case bool:
-						caps.SupportsSystemPromptAppend = ap
-					}
-				}
 			}
 		}
 	}
@@ -708,19 +660,13 @@ func ParseAgentCapabilities(initResult map[string]any) AgentCapabilities {
 		}
 	}
 
-	// Vendor dialect: _meta.antigravity.systemPrompt.{append,override} booleans.
-	// A vendor key must not be read as evidence about the standard key (FR-01): it only sets the
-	// vendor flag. Delivery-channel selection consults SupportsSystemPrompt, which stays false here,
-	// so resolveSystemPromptChannel picks the vendor channel and nothing else.
+	// Vendor dialect: _meta.antigravity.systemPrompt.append. This is the only system-prompt carrier
+	// the gateway uses, so it is the only one parsed.
 	if meta, ok := agentCaps["_meta"].(map[string]any); ok {
 		if agy, ok := meta["antigravity"].(map[string]any); ok {
 			if sp, ok := agy["systemPrompt"].(map[string]any); ok {
 				if v, ok := sp["append"].(bool); ok && v {
 					caps.SupportsVendorSystemPrompt = true
-				}
-				if v, ok := sp["override"].(bool); ok && v {
-					caps.SupportsVendorSystemPrompt = true
-					caps.SupportsVendorPromptOveride = true
 				}
 			}
 		}

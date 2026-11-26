@@ -136,48 +136,6 @@ func TestTransport_PermissionSelectionMatrix(t *testing.T) {
 	}
 }
 
-// TestTransport_PermissionDeniedByPolicy proves that auto_approve_permissions=false yields a
-// deterministic cancellation instead of hanging the turn.
-func TestTransport_PermissionDeniedByPolicy(t *testing.T) {
-	outReader, outWriter := io.Pipe()
-	inReader, inWriter := io.Pipe()
-	transport := NewTransport(outWriter, inReader, 1024*1024, nil)
-	defer transport.Close()
-	transport.SetAutoApprovePermissions(false)
-
-	req := Request{JSONRPC: JSONRPCVersion, ID: int64(9), Method: "session/request_permission"}
-	req.Params, _ = json.Marshal(RequestPermissionParams{
-		SessionID: "sess_x",
-		Options:   []PermissionOption{{OptionID: "allow", Kind: "allow_once"}},
-	})
-	reqBytes, _ := json.Marshal(req)
-	go func() { _, _ = inWriter.Write(append(reqBytes, '\n')) }()
-
-	dec := json.NewDecoder(outReader)
-	var resp Response
-	if err := dec.Decode(&resp); err != nil {
-		t.Fatalf("failed to decode permission response: %v", err)
-	}
-	var result RequestPermissionResult
-	if err := json.Unmarshal(resp.Result, &result); err != nil {
-		t.Fatalf("failed to unmarshal result: %v", err)
-	}
-	if result.Outcome.Outcome != "cancelled" {
-		t.Fatalf("policy disabled must produce cancelled, got %+v", result.Outcome)
-	}
-
-	// The agent is also told to cancel the in-flight turn so it cannot remain blocked.
-	var notif Notification
-	if err := dec.Decode(&notif); err != nil {
-		t.Fatalf("expected session/cancel notification after denial: %v", err)
-	}
-	if notif.Method != "session/cancel" {
-		t.Fatalf("expected session/cancel notification, got %q", notif.Method)
-	}
-}
-
-// TestTransport_DispatchResponseNeverRacesClose reproduces the reachable "send on closed channel"
-// panic: a response is being dispatched at the same moment the transport is closed.
 func TestTransport_DispatchResponseNeverRacesClose(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		outReader, outWriter := io.Pipe()
@@ -300,15 +258,6 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 				},
 			},
 		},
-		SystemPrompt: &SystemPrompt{
-			Mode: "append",
-			Content: []PromptBlock{
-				{
-					Type: "text",
-					Text: "You are an expert systems programmer.",
-				},
-			},
-		},
 		Meta: map[string]any{
 			"antigravity": map[string]any{
 				"systemPrompt": map[string]any{
@@ -328,20 +277,33 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 		t.Fatalf("failed to unmarshal JSON: %v", err)
 	}
 
-	// 1. Verify root systemPrompt
-	sysPrompt, ok := parsed["systemPrompt"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected root systemPrompt object, got %T", parsed["systemPrompt"])
-	}
-	if sysPrompt["mode"] != "append" {
-		t.Fatalf("expected mode 'append', got %v", sysPrompt["mode"])
-	}
-	contentArr, ok := sysPrompt["content"].([]any)
-	if !ok || len(contentArr) == 0 {
-		t.Fatalf("expected non-empty content array, got %v", sysPrompt["content"])
+	// 1. The top-level systemPrompt field no longer exists: agy accepts and discards it, so emitting
+	//    it would advertise a delivery path that does not work.
+	if _, present := parsed["systemPrompt"]; present {
+		t.Fatalf("top-level systemPrompt must never be emitted, got %+v", parsed["systemPrompt"])
 	}
 
-	// 2. Verify mcpServers env is an array of objects
+	// 2. The vendor append channel round-trips verbatim.
+	meta, ok := parsed["_meta"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected _meta object, got %T", parsed["_meta"])
+	}
+	agyMeta, ok := meta["antigravity"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected antigravity map, got %T", meta["antigravity"])
+	}
+	sysMap, ok := agyMeta["systemPrompt"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected systemPrompt map, got %T", agyMeta["systemPrompt"])
+	}
+	if sysMap["append"] != "You are an expert systems programmer." {
+		t.Fatalf("append payload must round-trip verbatim, got %v", sysMap["append"])
+	}
+	if _, present := sysMap["override"]; present {
+		t.Fatalf("override must never be emitted; it hangs the agent turn")
+	}
+
+	// 3. Verify mcpServers env is an array of objects
 	servers, ok := parsed["mcpServers"].([]any)
 	if !ok || len(servers) == 0 {
 		t.Fatalf("expected non-empty mcpServers array")
@@ -354,6 +316,22 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 	env0 := envArr[0].(map[string]any)
 	if env0["name"] != "NODE_ENV" || env0["value"] != "production" {
 		t.Fatalf("unexpected EnvVariable payload: %+v", env0)
+	}
+}
+
+// TestSessionNewParams_OmitsMetaWithoutPrompt proves the field is absent, not empty, when there is
+// nothing to send: an empty _meta would still be a gateway-authored payload.
+func TestSessionNewParams_OmitsMetaWithoutPrompt(t *testing.T) {
+	raw, err := json.Marshal(SessionNewParams{CWD: "/w"})
+	if err != nil {
+		t.Fatalf("failed to marshal: %v", err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if _, present := parsed["_meta"]; present {
+		t.Fatalf("_meta must be omitted when no prompt is configured, got %v", parsed["_meta"])
 	}
 }
 
@@ -393,11 +371,11 @@ func TestSessionUpdate_UsageUpdate(t *testing.T) {
 func TestParseAgentCapabilities(t *testing.T) {
 	// 1. Nil input safety — never panics, everything defaults false.
 	emptyCaps := ParseAgentCapabilities(nil)
-	if emptyCaps.SupportsSystemPromptAppend || emptyCaps.SupportsSystemPromptOveride || emptyCaps.SupportsSystemPrompt {
+	if emptyCaps.SupportsVendorSystemPrompt || emptyCaps.SupportsSessionClose {
 		t.Fatalf("expected all false for nil initResult, got %+v", emptyCaps)
 	}
 
-	// 2. Real agy acp v1.5.16 shape: NO sessionCapabilities.systemPrompt, vendor _meta boolean only.
+	// 2. Real agy acp v1.5.16 shape: vendor _meta boolean is the only system-prompt signal.
 	agyPayload := map[string]any{
 		"protocolVersion": float64(1),
 		"agentCapabilities": map[string]any{
@@ -426,46 +404,11 @@ func TestParseAgentCapabilities(t *testing.T) {
 		!caps.SupportsSessionClose || !caps.SupportsVendorSystemPrompt {
 		t.Fatalf("agy 1.5.16 capability parse wrong: %+v", caps)
 	}
-	// FR-01: a vendor key must not be read as evidence about the standard dialect.
-	if caps.SupportsSystemPrompt || caps.SupportsSystemPromptAppend ||
-		caps.SupportsSystemPromptOveride || caps.SupportsVendorPromptOveride {
-		t.Fatalf("agy advertises no standard systemPrompt and no override; got %+v", caps)
-	}
 	if !caps.PromptImage || caps.PromptEmbeddedContext != true {
 		t.Fatalf("expected promptCapabilities image/embeddedContext parsed; got %+v", caps)
 	}
 
-	// 3. Official schema dialect: {"systemPrompt":{}} means append is IMPLICIT (no entry at all).
-	specAppend := ParseAgentCapabilities(map[string]any{
-		"agentCapabilities": map[string]any{
-			"sessionCapabilities": map[string]any{"systemPrompt": map[string]any{}},
-		},
-	})
-	if !specAppend.SupportsSystemPrompt || !specAppend.SupportsSystemPromptAppend {
-		t.Fatalf("schema dialect {systemPrompt:{}} must imply append support; got %+v", specAppend)
-	}
-	if specAppend.SupportsSystemPromptOveride {
-		t.Fatalf("schema dialect {systemPrompt:{}} must not imply override; got %+v", specAppend)
-	}
-
-	// 4. Official schema dialect: override is an OBJECT {}, not a boolean.
-	specOverride := ParseAgentCapabilities(map[string]any{
-		"agentCapabilities": map[string]any{
-			"sessionCapabilities": map[string]any{
-				"systemPrompt": map[string]any{
-					"mode": map[string]any{"override": map[string]any{}},
-				},
-			},
-		},
-	})
-	if !specOverride.SupportsSystemPromptOveride {
-		t.Fatalf("schema dialect override object must be recognised as supported; got %+v", specOverride)
-	}
-	if !specOverride.SupportsSystemPromptAppend {
-		t.Fatalf("older schema dialect {mode:{override:{}}} must still imply append; got %+v", specOverride)
-	}
-
-	// 5. Vendor snake_case duplicates are accepted as aliases.
+	// 3. Vendor snake_case duplicates are accepted as aliases.
 	aliased := ParseAgentCapabilities(map[string]any{
 		"agentCapabilities": map[string]any{
 			"load_session": true,
@@ -478,12 +421,12 @@ func TestParseAgentCapabilities(t *testing.T) {
 		t.Fatalf("snake_case capability aliases must be honoured; got %+v", aliased)
 	}
 
-	// 6. Malformed / hostile JSON types never panic and never produce false positives.
+	// 4. Malformed / hostile JSON types never panic and never produce false positives.
 	hostile := ParseAgentCapabilities(map[string]any{
 		"protocolVersion":   "one",
 		"agentCapabilities": "nope",
 	})
-	if hostile.ProtocolVersion != 0 || hostile.SupportsSystemPrompt {
+	if hostile.ProtocolVersion != 0 || hostile.SupportsVendorSystemPrompt {
 		t.Fatalf("malformed payload must degrade silently; got %+v", hostile)
 	}
 	hostile2 := ParseAgentCapabilities(map[string]any{
@@ -497,6 +440,19 @@ func TestParseAgentCapabilities(t *testing.T) {
 	})
 	if hostile2.SupportsMCPHTTP || hostile2.SupportsVendorSystemPrompt {
 		t.Fatalf("non-boolean capability values must not be treated as true; got %+v", hostile2)
+	}
+	// A falsy vendor append must not count as support: the warning it drives depends on this.
+	falsyAppend := ParseAgentCapabilities(map[string]any{
+		"agentCapabilities": map[string]any{
+			"_meta": map[string]any{
+				"antigravity": map[string]any{
+					"systemPrompt": map[string]any{"append": false},
+				},
+			},
+		},
+	})
+	if falsyAppend.SupportsVendorSystemPrompt {
+		t.Fatalf("append:false must not be treated as support; got %+v", falsyAppend)
 	}
 }
 
@@ -613,7 +569,6 @@ func TestRequestPermissionParams_ResolvedToolCallID(t *testing.T) {
 func TestSessionNewResult_ConfigOptionByID(t *testing.T) {
 	var raw = `{
       "sessionId":"abc",
-      "modes":{"currentModeId":"default","availableModes":[{"id":"default"},{"id":"accept-edits"},{"id":"auto"},{"id":"plan"}]},
       "configOptions":[
         {"id":"thought_level","category":"thought_level","type":"select","currentValue":"high",
          "options":[{"value":"low"},{"value":"medium"},{"value":"high"},{"value":"xhigh","name":"Extra"}]}
@@ -630,9 +585,6 @@ func TestSessionNewResult_ConfigOptionByID(t *testing.T) {
 	}
 	if opt.Options[3].Value != "xhigh" || opt.Options[3].Name != "Extra" {
 		t.Fatalf("wire value must be xhigh with label Extra, got %+v", opt.Options[3])
-	}
-	if res.Modes == nil || len(res.Modes.AvailableModes) != 4 {
-		t.Fatalf("expected 4 available modes, got %+v", res.Modes)
 	}
 	if res.ConfigOptionByID("nope") != nil {
 		t.Fatalf("unknown option must return nil")

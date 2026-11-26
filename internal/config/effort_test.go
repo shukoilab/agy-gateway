@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // TestMapReasoningEffort_OnlyEmitsAcceptedWireValues is the regression test for the silent effort
 // downgrade: the mapper used to return "off" and "extra", both of which agy rejects with -32602.
@@ -87,28 +90,12 @@ func TestIsThoughtLevel(t *testing.T) {
 	}
 }
 
-// TestValidate_AcceptsAutoSessionMode proves the mode agy actually advertises is selectable.
-func TestValidate_AcceptsAutoSessionMode(t *testing.T) {
-	for _, mode := range []string{"default", "accept-edits", "auto", "plan"} {
-		cfg := DefaultConfig()
-		cfg.Execution.AcpSessionMode = mode
-		if err := validate(cfg); err != nil {
-			t.Errorf("mode %q must be valid: %v", mode, err)
-		}
-	}
-	cfg := DefaultConfig()
-	cfg.Execution.AcpSessionMode = "yolo-mode-not-real"
-	if err := validate(cfg); err == nil {
-		t.Fatal("expected invalid session mode to be rejected")
-	}
-}
-
+// TestValidate_RejectsInvalidEnums ensures the enums that remain are still enforced.
 func TestValidate_RejectsInvalidEnums(t *testing.T) {
 	mutations := []struct {
 		name   string
 		mutate func(*Config)
 	}{
-		{"bad system prompt channel", func(c *Config) { c.Execution.SystemPromptChannel = "carrier-pigeon" }},
 		{"bad vision mode", func(c *Config) { c.Execution.VisionMode = "hallucinate" }},
 		{"bad unsupported param policy", func(c *Config) { c.OpenAI.UnsupportedParamPolicy = "ignore" }},
 		{"zero max client tools", func(c *Config) { c.MCP.ClientToolCalling.MaxClientTools = 0 }},
@@ -134,12 +121,6 @@ func TestDefaults_MatchVerifiedAgentBehaviour(t *testing.T) {
 	if cfg.Execution.VisionMode != "reject" {
 		t.Errorf("vision_mode must default to reject (agy advertises image support but fails every image turn); got %q", cfg.Execution.VisionMode)
 	}
-	if cfg.Execution.SystemPromptChannel != "auto" {
-		t.Errorf("system_prompt_channel must default to auto; got %q", cfg.Execution.SystemPromptChannel)
-	}
-	if cfg.Execution.SystemPromptChannel == "" || !validSystemPromptChannel(cfg.Execution.SystemPromptChannel) {
-		t.Errorf("default system prompt channel must validate")
-	}
 	if cfg.OpenAI.UnsupportedParamPolicy != "strip_and_warn" {
 		t.Errorf("unsupported param policy default changed: %q", cfg.OpenAI.UnsupportedParamPolicy)
 	}
@@ -152,23 +133,160 @@ func TestDefaults_MatchVerifiedAgentBehaviour(t *testing.T) {
 	if cfg.MCP.ClientToolCalling.ToolCallCollectWindow <= 0 {
 		t.Error("tool_call_collect_window must default to a positive duration")
 	}
-	// The dangerous flag must no longer be baked into the defaults.
-	for _, a := range cfg.Binaries.AgyAcpArgs {
-		if a == "--dangerously-skip-permissions" {
-			t.Error("--dangerously-skip-permissions must not be a built-in default")
-		}
+	// The YOLO posture lives in acp.SpawnArgs, not in configuration. There is no argv field left to
+	// carry it, so a stale config cannot reintroduce a blocking posture.
+}
+
+// TestLoad_RemovedKeysWarnButStillBoot proves backward compatibility: a stale configuration file
+// containing the four removed keys must load successfully. This matters most for
+// auto_approve_permissions, which used to disable auto-approval.
+func TestLoad_RemovedKeysWarnButStillBoot(t *testing.T) {
+	tmpDir := t.TempDir()
+	configFile := tmpDir + "/legacy.yaml"
+
+	content := `
+server:
+  port: 9090
+
+binaries:
+  agy_path: "/usr/local/bin/agy"
+  agy_min_version: "1.5.16"
+  agy_acp_args: ["acp", "--dangerously-skip-permissions"]
+
+execution:
+  acp_session_mode: "accept-edits"
+  auto_approve_permissions: false
+  system_prompt_channel: "vendor"
+  vision_mode: "reject"
+`
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
 	}
-	if len(cfg.Binaries.AgyAcpArgs) == 0 || cfg.Binaries.AgyAcpArgs[0] != "acp" {
-		t.Errorf("agy_acp_args must start with 'acp', got %v", cfg.Binaries.AgyAcpArgs)
+
+	cfg, err := Load(configFile)
+	if err != nil {
+		t.Fatalf("a stale config must still boot, got: %v", err)
+	}
+	if cfg.Server.Port != 9090 {
+		t.Errorf("surviving keys must still apply, got port %d", cfg.Server.Port)
+	}
+	if cfg.Execution.VisionMode != "reject" {
+		t.Errorf("surviving execution keys must still apply, got %q", cfg.Execution.VisionMode)
 	}
 }
 
-// TestDeadKnobsRemoved guards against re-introducing the knobs that were validated but never read.
-func TestDeadKnobsRemoved(t *testing.T) {
-	// Compile-time style assertion: these fields no longer exist, so referencing them would not build.
-	// The behavioural check here is that YAML containing them still loads (unknown keys are ignored).
-	cfg := DefaultConfig()
-	if err := validate(cfg); err != nil {
-		t.Fatalf("default config must validate: %v", err)
+// TestCollectRemovedEnvKeys_DisclosesStaleEnvironment proves the env path is covered too: most
+// deployments configure the gateway through .env or docker-compose, so a YAML-only check would never
+// reach an operator who set auto_approve_permissions=false.
+func TestCollectRemovedEnvKeys_DisclosesStaleEnvironment(t *testing.T) {
+	env := map[string]string{
+		"AGY_GW_AUTO_APPROVE_PERMISSIONS": "false",
+		"AGY_GW_SYSTEM_PROMPT_CHANNEL":    "vendor",
+		"UNRELATED_VAR":                   "keep-me",
+	}
+	got := collectRemovedEnvKeys(func(k string) string { return env[k] })
+	if len(got) != 2 {
+		t.Fatalf("expected 2 stale env vars, got %v", got)
+	}
+	for _, key := range got {
+		if RemovedKeyNote(key) == "" {
+			t.Errorf("removed key %q has no operator-facing note", key)
+		}
+	}
+
+	// An empty environment is a no-op; a nil lookup must not panic.
+	if stale := collectRemovedEnvKeys(func(string) string { return "" }); len(stale) != 0 {
+		t.Errorf("empty environment must yield no stale keys, got %v", stale)
+	}
+	if stale := collectRemovedEnvKeys(nil); len(stale) != 0 {
+		t.Errorf("nil lookup must yield no stale keys, got %v", stale)
+	}
+}
+
+// TestCollectRemovedKeys_OnlyFiresOnRealKeys ensures a clean or unparseable document yields nothing,
+// so a normal config produces no misleading startup warning.
+func TestCollectRemovedKeys_OnlyFiresOnRealKeys(t *testing.T) {
+	if got := collectRemovedKeys([]byte("server:\n  port: 8080\nexecution:\n  vision_mode: reject\n")); len(got) != 0 {
+		t.Errorf("clean config must yield no stale keys, got %v", got)
+	}
+	if got := collectRemovedKeys(nil); len(got) != 0 {
+		t.Errorf("nil document must yield no stale keys, got %v", got)
+	}
+	if got := collectRemovedKeys([]byte("::not yaml::")); len(got) != 0 {
+		t.Errorf("unparseable document must yield no stale keys, got %v", got)
+	}
+
+	legacy := []byte("execution:\n  acp_session_mode: auto\n  auto_approve_permissions: false\nbinaries:\n  agy_acp_args: [acp]\n")
+	got := collectRemovedKeys(legacy)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 stale YAML keys, got %v", got)
+	}
+	for _, key := range got {
+		if RemovedKeyNote(key) == "" {
+			t.Errorf("removed key %q has no operator-facing note", key)
+		}
+	}
+}
+
+// TestLoad_PopulatesRemovedKeysFromYAMLAndEnv proves the Load-side half of the disclosure pipeline:
+// a stale file and a stale environment both surface in Config.RemovedKeys, which is the only input
+// config.WarnRemovedKeys reads. Without this, deleting the collector wiring leaves every gate green
+// while operators silently lose the warning.
+func TestLoad_PopulatesRemovedKeysFromYAMLAndEnv(t *testing.T) {
+	// Pin the removed env names so the assertion does not depend on the developer's shell.
+	for _, name := range removedEnvKeys {
+		t.Setenv(name, "")
+	}
+	t.Setenv("AGY_GW_AUTO_APPROVE_PERMISSIONS", "false")
+	t.Setenv("AGY_GW_SYSTEM_PROMPT_CHANNEL", "vendor")
+
+	configFile := t.TempDir() + "/legacy.yaml"
+	content := "execution:\n  acp_session_mode: auto\n  auto_approve_permissions: false\n"
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	cfg, err := Load(configFile)
+	if err != nil {
+		t.Fatalf("a stale config must still boot, got: %v", err)
+	}
+
+	want := []string{
+		"execution.acp_session_mode",
+		"execution.auto_approve_permissions",
+		"AGY_GW_AUTO_APPROVE_PERMISSIONS",
+		"AGY_GW_SYSTEM_PROMPT_CHANNEL",
+	}
+	if len(cfg.RemovedKeys) != len(want) {
+		t.Fatalf("expected %d removed keys, got %v", len(want), cfg.RemovedKeys)
+	}
+	for i, key := range want {
+		if cfg.RemovedKeys[i] != key {
+			t.Errorf("RemovedKeys[%d] = %q, want %q", i, cfg.RemovedKeys[i], key)
+		}
+		if RemovedKeyNote(key) == "" {
+			t.Errorf("removed key %q has no operator-facing note", key)
+		}
+	}
+}
+
+// TestLoad_CleanConfigReportsNoRemovedKeys guards the other direction: a current config must not
+// produce a misleading startup warning.
+func TestLoad_CleanConfigReportsNoRemovedKeys(t *testing.T) {
+	for _, name := range removedEnvKeys {
+		t.Setenv(name, "")
+	}
+
+	configFile := t.TempDir() + "/clean.yaml"
+	if err := os.WriteFile(configFile, []byte("execution:\n  vision_mode: reject\n"), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	cfg, err := Load(configFile)
+	if err != nil {
+		t.Fatalf("clean config must load, got: %v", err)
+	}
+	if len(cfg.RemovedKeys) != 0 {
+		t.Errorf("clean config must report no removed keys, got %v", cfg.RemovedKeys)
 	}
 }

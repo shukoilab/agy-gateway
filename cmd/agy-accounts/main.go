@@ -52,6 +52,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
 	}))
+	config.WarnRemovedKeys(logger, cfg)
 
 	// 4. Initialize account manager & sync accounts from vault
 	mgr := auth.NewManager(cfg, logger)

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.13.0] - 2026-11-26
+
+### Changed
+- **YOLO Mode Is Now a Product Invariant (`internal/acp`, `internal/pool`)**:
+  - The agent is always launched as `agy acp --dangerously-skip-permissions`, sourced from a single
+    `acp.SpawnArgs()` function. No environment variable, YAML key, or request field can alter it.
+  - Verified against a live agent: the flag alone yields zero permission requests and unblocked file
+    CRUD, so auto-approval no longer needs a policy switch.
+  - Removed `transport.autoApprove`, `SetAutoApprovePermissions`, `AutoApprovePermissions`, and the
+    deny branch that answered `cancelled` + `session/cancel`. A permission request is now always
+    answered with the highest-priority `allow*` option, so no configuration can stall a turn.
+
+### Removed
+- **Configuration knobs** (stale files still boot; each present key logs one warning):
+  `execution.acp_session_mode` / `AGY_GW_ACP_SESSION_MODE`, `execution.auto_approve_permissions` /
+  `AGY_GW_AUTO_APPROVE_PERMISSIONS`, `execution.system_prompt_channel` /
+  `AGY_GW_SYSTEM_PROMPT_CHANNEL`, and `binaries.agy_acp_args` / `AGY_GW_AGY_ACP_ARGS`.
+- **Hardcoded prompt injection**: `DefaultExecutionProtocol` and the literal
+  `"AUTHORITATIVE SYSTEM INSTRUCTIONS ..."` banner. An absent consumer prompt now means an absent
+  `_meta`, not a gateway-authored persona.
+- **Dead delivery and mode surface**: the spec-level `systemPrompt` field (agy accepts and silently
+  discards it), the `standard`/`vendor`/`both` channel resolution, the plan/build prompt-fold
+  fallback, the session-mode config push, `SessionModeState`/`SessionMode`, and four capability
+  flags that no longer have a consumer.
+- A duplicate `AGY_GW_CLEAN_WORKSPACE` read that shadowed the effective handler.
+
+### Fixed
+- `TestSpawnProcess_TerminateReapsGroup` raced the kernel: `SIGTERM` is delivered asynchronously, so
+  the process-group liveness probe could observe a backgrounded child milliseconds after reaping.
+  The assertion now polls briefly instead of racing, which removes a pre-existing full-suite flake.
+
+### Added
+- `tests/e2e_yolo_mode_test.py`: an end-to-end suite on both `/v1/chat/completions` and
+  `/v1/messages` using `gemini-3.8-flash` at low effort. Turn 1 declares a read-only plan directive
+  and must emit no write tool call and leave no file; turn 2 declares a build directive and must
+  create the file, with a per-turn stall detector; turns 3-4 read the file back through the client
+  tool and assert the model echoes the exact contents from a follow-up request that carries the tool
+  result.
+
+---
+
 ## [3.12.0] - 2026-11-25
 
 ### Added

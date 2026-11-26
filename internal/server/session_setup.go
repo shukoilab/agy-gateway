@@ -28,77 +28,30 @@ type SessionSetupInput struct {
 	ClientToolNames      []string
 }
 
-// SystemPromptChannel is the resolved delivery strategy for the effective system prompt.
-type SystemPromptChannel struct {
-	// Standard reports whether the spec-compliant `systemPrompt` parameter should be sent.
-	Standard bool
-	// Vendor reports whether `_meta.antigravity.systemPrompt` should be sent.
-	Vendor bool
-}
-
-// resolveSystemPromptChannel decides which delivery channels to use for the system prompt.
+// buildACPSessionNewParams builds the ACP session/new payload for one turn.
 //
-// @purpose Encodes the verified fact that agy 1.5.16 silently discards the standard parameter and
-// honors only its vendor `_meta` extension, without hardcoding that vendor quirk into the request path.
-// @rationale Sending both channels is proven harmless, so `auto` prefers every channel the agent
-// advertises; an operator who pins a channel gets exactly that, which keeps the gateway usable against
-// agents that would reject an unknown `_meta` payload.
-// @preconditions caps is the negotiated capability set for the leased worker.
-// @param caps Negotiated agent capabilities.
-// @param configured One of auto|standard|vendor|both from execution.system_prompt_channel.
-// @returns The channel set to use, and false when neither channel is available.
-// @throws None.
-// @invariants Pure; O(1).
-func resolveSystemPromptChannel(caps acp.AgentCapabilities, configured string) (SystemPromptChannel, bool) {
-	standardAvail := caps.SupportsSystemPrompt
-	vendorAvail := caps.SupportsVendorSystemPrompt
-
-	switch strings.ToLower(strings.TrimSpace(configured)) {
-	case "standard":
-		if standardAvail {
-			return SystemPromptChannel{Standard: true}, true
-		}
-		return SystemPromptChannel{}, false
-	case "vendor":
-		if vendorAvail {
-			return SystemPromptChannel{Vendor: true}, true
-		}
-		return SystemPromptChannel{}, false
-	case "both":
-		if standardAvail && vendorAvail {
-			return SystemPromptChannel{Standard: true, Vendor: true}, true
-		}
-		return SystemPromptChannel{}, false
-	default: // "auto" and any unexpected value behave like auto.
-		ch := SystemPromptChannel{Standard: standardAvail, Vendor: vendorAvail}
-		return ch, ch.Standard || ch.Vendor
-	}
-}
-
-// buildACPSessionNewParams constructs a strictly capability-negotiated ACP session/new request payload.
-//
-// @purpose Enforces ACP v1 capability compliance, pure host client-tool delegation, and zero silent prompt loss.
-// @rationale Probing proved agy acp v1.5.16 accepts the standard `systemPrompt` parameter and discards it
-// without error, honoring only `_meta.antigravity.systemPrompt.append`; and that `override` hangs the turn.
-// The prompt is therefore delivered through every channel the agent advertises, with `override` used only
-// when the spec-compliant channel explicitly supports it.
+// @purpose Supplies the workspace, the loopback MCP server and the single append-only system-prompt
+// carrier.
+// @rationale Probing proved agy 1.5.16+ accepts the standard `systemPrompt` parameter and discards it
+// without error, honouring only `_meta.antigravity.systemPrompt.append`; and that `override` hangs the
+// turn. The gateway therefore has exactly one carrier. When the consumer supplies no prompt the `_meta`
+// object is omitted entirely rather than sent empty, so the gateway injects nothing of its own.
 // @preconditions in.Worker must be non-nil.
 // @param in SessionSetupInput encapsulating worker, config, system prompt, and client tool names.
-// @returns Populated acp.SessionNewParams and the effective prompt text the caller must fold into the
-// first prompt block when no delivery channel exists.
-// @invariants Pure construction; thread-safe, zero shared state mutation.
-func buildACPSessionNewParams(in SessionSetupInput) (acp.SessionNewParams, string) {
+// @returns Populated acp.SessionNewParams; Meta is nil when there is no prompt to deliver.
+// @invariants The payload never depends on advertised capabilities: an agent that cannot honour
+// `append` is reported once per worker by the startup warning, not silently downgraded per request.
+// Pure construction; thread-safe, zero shared state mutation.
+func buildACPSessionNewParams(in SessionSetupInput) acp.SessionNewParams {
 	newParams := acp.SessionNewParams{
 		CWD: in.Worker.Cwd,
 	}
 
 	port := 8080
 	strictDelegation := true
-	promptChannel := "auto"
 	if in.Config != nil {
 		port = in.Config.Server.Port
 		strictDelegation = in.Config.Execution.StrictClientToolDelegation
-		promptChannel = in.Config.Execution.SystemPromptChannel
 	}
 
 	if in.LoopbackSessionID != "" {
@@ -122,104 +75,85 @@ func buildACPSessionNewParams(in SessionSetupInput) (acp.SessionNewParams, strin
 		}
 	}
 
-	effectiveSystemPrompt := composeSystemPrompt(in.ConsumerSystemPrompt, in.ClientToolNames, strictDelegation)
-
-	caps := in.Worker.Capabilities
-	channel, available := resolveSystemPromptChannel(caps, promptChannel)
-
-	if channel.Standard {
-		mode := "append"
-		// `override` is only sent when the spec-compliant capability explicitly advertises it. agy does
-		// not, and sending the vendor override key makes its turn hang with no response.
-		if caps.SupportsSystemPromptOveride {
-			mode = "override"
-		}
-		newParams.SystemPrompt = &acp.SystemPrompt{
-			Mode:    mode,
-			Content: []acp.PromptBlock{{Type: "text", Text: effectiveSystemPrompt}},
-		}
-	}
-
-	if channel.Vendor {
+	if effective := composeSystemPrompt(in.ConsumerSystemPrompt, in.ClientToolNames, strictDelegation); effective != "" {
 		newParams.Meta = map[string]any{
 			"antigravity": map[string]any{
 				"systemPrompt": map[string]any{
-					"append": effectiveSystemPrompt,
+					"append": effective,
 				},
 			},
 		}
 	}
 
-	if !available {
-		// No capability channel exists. Returning the text lets the caller prepend it to the first
-		// prompt block instead of losing it silently.
-		return newParams, effectiveSystemPrompt
-	}
-	return newParams, ""
+	return newParams
 }
 
-// composeSystemPrompt builds the effective prompt from the consumer prompt, the default protocol,
-// and the client-tool delegation directive.
+// composeSystemPrompt builds the effective prompt from the consumer prompt and the client-tool
+// delegation directive.
 //
 // @purpose Single source of truth for prompt precedence across both protocol adapters.
-// @rationale Prompt assembly was duplicated per adapter, which let the precedence banner drift.
+// @rationale The gateway is a provider endpoint: it must not invent a persona or a preamble. An
+// earlier version injected a hardcoded default protocol when the consumer prompt was empty and a
+// literal "AUTHORITATIVE SYSTEM INSTRUCTIONS" banner otherwise, which altered consumer intent on
+// every request. Only the delegation directive remains, because it targets tools rather than voice
+// and is emitted solely when the consumer declared tools.
 // @preconditions None.
 // @param consumerSystemPrompt Caller-supplied system prompt; may be empty.
 // @param clientToolNames Declared client tool names used by the delegation directive.
 // @param strictDelegation Whether the delegation directive should be appended.
-// @returns The effective system prompt, never empty.
+// @returns The effective system prompt; empty when the consumer supplied none and declared no tools.
 // @throws None.
 // @invariants Pure; O(n) in prompt length.
 func composeSystemPrompt(consumerSystemPrompt string, clientToolNames []string, strictDelegation bool) string {
 	effective := strings.TrimSpace(consumerSystemPrompt)
-	if effective == "" {
-		effective = acp.DefaultExecutionProtocol
-	} else {
-		effective = "AUTHORITATIVE SYSTEM INSTRUCTIONS (PRIORITIZE OVER ANY DEFAULT AGENT INSTRUCTIONS):\n" + effective
-	}
 	if strictDelegation && len(clientToolNames) > 0 {
 		if directive := acp.ClientToolDelegationDirective(clientToolNames); directive != "" {
+			if effective == "" {
+				return directive
+			}
 			effective = effective + "\n\n" + directive
 		}
 	}
 	return effective
 }
 
-// applySessionConfigOptions aligns the requested model, thought level, and mode with the options the
-// agent actually advertised, and pushes only values it can accept.
+// applySessionConfigOptions aligns the requested model and thought level with the options the agent
+// actually advertised, and pushes only values it can accept.
 //
 // @purpose Removes every silent `set_config_option` failure: a value the agent rejects is a value the
 // gateway must not send.
 // @rationale Probing showed agy rejects `extra` (the display label) and `off` with -32602 while
 // accepting only low|medium|high|xhigh; and rejects models absent from its catalogue. Discarding those
-// errors previously let turns run on an unintended model.
+// errors previously let turns run on an unintended model. Session mode is deliberately absent: it is
+// the consumer's system prompt that decides plan vs build, not a gateway knob (probe E3/E5).
 // @preconditions newResult came from a successful session/new on worker.
+// @param ctx Parent context governing the turn.
 // @param worker Leased worker whose transport performs the calls.
 // @param newResult Negotiated session, carrying live configOptions.
 // @param requestedModel Upstream model id requested by the caller.
 // @param thoughtLevel Desired thought level already mapped to a wire value.
-// @param mode Desired session mode.
 // @param switchTimeout Per-option timeout budget; zero falls back to the handshake default.
-// @returns The model actually applied, the mode actually applied, and a typed error when the requested
-// model cannot be honored at all.
-// @throws Returns a non-nil error only for an unavailable model, which the caller must surface as 400.
+// @param logger Destination for non-fatal fallback warnings; nil falls back to slog.Default.
+// @returns The model actually applied (the requested one when no model option is advertised).
+// @throws An error when session/new returned an empty session id, when the requested model is absent
+// from the agent catalogue or rejected by it (the caller maps this to 400), or when set_config_option
+// failed for a model the agent does advertise (an upstream fault).
 // @invariants Sequential calls; each bounded by switchTimeout so a wedged agent cannot stall the turn.
 func applySessionConfigOptions(
 	ctx context.Context,
 	worker *pool.Worker,
 	newResult acp.SessionNewResult,
-	requestedModel, thoughtLevel, mode string,
+	requestedModel, thoughtLevel string,
 	switchTimeout time.Duration,
 	logger *slog.Logger,
-) (appliedModel, appliedMode string, err error) {
+) (appliedModel string, err error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	appliedModel = requestedModel
-	appliedMode = mode
 
 	if newResult.SessionID == "" {
-		return appliedModel, appliedMode, fmt.Errorf("session/new returned an empty session id")
+		return appliedModel, fmt.Errorf("session/new returned an empty session id")
 	}
 
 	// The agent rewrites its option set when the model changes: switching to claude-sonnet-4-6
@@ -240,9 +174,9 @@ func applySessionConfigOptions(
 		refreshed, callErr := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDModel, requestedModel, switchTimeout)
 		if callErr != nil {
 			if !cfg.HoldsValue(requestedModel) {
-				return "", appliedMode, fmt.Errorf("model %q is not available on the upstream agent: %w", requestedModel, callErr)
+				return "", fmt.Errorf("model %q is not available on the upstream agent: %w", requestedModel, callErr)
 			}
-			return "", appliedMode, fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
+			return "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
 		}
 		if len(refreshed) > 0 {
 			options = refreshed
@@ -250,7 +184,7 @@ func applySessionConfigOptions(
 	} else if requestedModel != "" {
 		refreshed, callErr := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDModel, requestedModel, switchTimeout)
 		if callErr != nil {
-			return "", appliedMode, fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
+			return "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
 		}
 		if len(refreshed) > 0 {
 			options = refreshed
@@ -280,24 +214,7 @@ func applySessionConfigOptions(
 		}
 	}
 
-	if mode != "" {
-		value := mode
-		if cfg := byID(acp.ConfigIDMode); cfg != nil && !cfg.HoldsValue(value) {
-			logger.Warn("configured session mode is not offered by the agent; falling back",
-				"requested", value, "fallback", cfg.CurrentValue, "sessionId", newResult.SessionID)
-			value = cfg.CurrentValue
-		}
-		if value != "" {
-			if _, err := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDMode, value, switchTimeout); err != nil {
-				logger.Warn("session mode rejected by agent; turn continues at agent default",
-					"requested", value, "err", err, "sessionId", newResult.SessionID)
-			} else {
-				appliedMode = value
-			}
-		}
-	}
-
-	return appliedModel, appliedMode, nil
+	return appliedModel, nil
 }
 
 // callSetConfigOption performs one bounded session/set_config_option request.

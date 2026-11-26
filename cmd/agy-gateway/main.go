@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -112,17 +113,7 @@ func main() {
 	}
 
 	// 3. Initialize structured logger
-	var logHandler slog.Handler
-	logOpts := &slog.HandlerOptions{
-		Level: parseLogLevel(cfg.Observability.LogLevel),
-	}
-	if stringsEqual(cfg.Observability.LogFormat, "json") {
-		logHandler = slog.NewJSONHandler(os.Stdout, logOpts)
-	} else {
-		logHandler = slog.NewTextHandler(os.Stdout, logOpts)
-	}
-	logger := slog.New(logHandler).With("version", version.Version)
-	slog.SetDefault(logger)
+	logger := setupLogging(cfg, os.Stdout)
 
 	logger.Info("starting agy-gateway", "config", *configPath)
 
@@ -304,6 +295,7 @@ func runAccountsSubcommand(args []string) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
 	}))
+	config.WarnRemovedKeys(logger, cfg)
 	mgr := auth.NewManager(cfg, logger)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -341,6 +333,7 @@ func runModelsSubcommand(args []string) {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelWarn,
 	}))
+	config.WarnRemovedKeys(logger, cfg)
 	mgr := auth.NewManager(cfg, logger)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -464,11 +457,43 @@ func runUpdaterSubcommand(args []string) {
 		fmt.Fprintf(os.Stderr, "FATAL: Config load failed: %v\n", err)
 		os.Exit(1)
 	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelWarn,
+	}))
+	config.WarnRemovedKeys(logger, cfg)
 	updaterCLI := cli.NewUpdaterCLI(cfg, nil, os.Stdin, os.Stdout)
 	if err := updaterCLI.Run(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// setupLogging builds the configured slog handler, installs it as the process default, and emits the
+// YOLO-refactor disclosure for any removed configuration key.
+//
+// @purpose Single entrypoint seam for logging setup, so the ordering invariant (handler installed
+// before any warning is emitted) is testable without running main().
+// @rationale Emitting the removed-key warnings through slog.Default() from config.Load bypassed
+// observability.log_format/log_level and was unindexable; the disclosure must therefore happen here,
+// after SetDefault, and nowhere else in the daemon path.
+// @preconditions cfg is validated and non-nil.
+// @param cfg Loaded configuration.
+// @param w Destination for log output.
+// @returns The configured logger, already installed via slog.SetDefault.
+// @throws None.
+// @invariants O(len(cfg.RemovedKeys)) warnings; no goroutines spawned.
+func setupLogging(cfg *config.Config, w io.Writer) *slog.Logger {
+	logOpts := &slog.HandlerOptions{Level: parseLogLevel(cfg.Observability.LogLevel)}
+	var logHandler slog.Handler
+	if stringsEqual(cfg.Observability.LogFormat, "json") {
+		logHandler = slog.NewJSONHandler(w, logOpts)
+	} else {
+		logHandler = slog.NewTextHandler(w, logOpts)
+	}
+	logger := slog.New(logHandler).With("version", version.Version)
+	slog.SetDefault(logger)
+	config.WarnRemovedKeys(logger, cfg)
+	return logger
 }
 
 // @purpose: Maps a string representation of log level into slog.Level.
