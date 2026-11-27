@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.8] - 2026-11-27
+
+### Bug Fixes
+
+* **prompt:** stop long agentic sessions from looping on repeated tool calls ([e5293e7](https://github.com/shukoilab/agy-gateway/commit/e5293e7e1fdfe6480836dbdfeb1fad4048f476f4))
+
 ## [3.16.7] - 2026-11-27
 
 ### Bug Fixes
