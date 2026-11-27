@@ -60,20 +60,33 @@ func (t *Translator) Translate(req *MessageRequest, _ string) (string, []acp.Pro
 	// Identify the newest tool results: they are what the agent needs to continue, so they are
 	// never compacted even when older, oversized results exhaust the budget.
 	intactToolIDs := newestToolResultIDs(req.Messages)
-	toolCap := acp.ToolResultCharsCap(t.maxHistoryTokens)
 
-	var historyBuilder strings.Builder
-	for _, msg := range req.Messages {
-		role := strings.ToLower(msg.Role)
-		switch role {
-		case "user":
-			t.formatUserMessage(&historyBuilder, msg, intactToolIDs, toolCap)
-		case "assistant":
-			t.formatAssistantMessage(&historyBuilder, msg)
+	// render produces the whole history with a given per-result cap, so the sizing pass and the real
+	// pass share one code path.
+	render := func(toolCap int) string {
+		var historyBuilder strings.Builder
+		for _, msg := range req.Messages {
+			switch strings.ToLower(msg.Role) {
+			case "user":
+				t.formatUserMessage(&historyBuilder, msg, intactToolIDs, toolCap)
+			case "assistant":
+				t.formatAssistantMessage(&historyBuilder, msg)
+			}
 		}
+		return strings.TrimSpace(historyBuilder.String())
 	}
 
-	finalPrompt := strings.TrimSpace(historyBuilder.String())
+	// Size the per-result cap so the whole conversation fits the budget WITHOUT dropping turns, using
+	// the same rule as the OpenAI translator: dropping turns is what made long agentic sessions forget
+	// their own analysis and re-read the same files forever.
+	toolCap := 0
+	if t.maxHistoryTokens > 0 {
+		uncompacted := render(0)
+		bodies, count := compactableBodyChars(req.Messages, intactToolIDs)
+		toolCap = acp.FitToolResultChars(len(uncompacted)-bodies, count, t.maxHistoryTokens)
+	}
+
+	finalPrompt := render(toolCap)
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}
@@ -85,6 +98,53 @@ func (t *Translator) Translate(req *MessageRequest, _ string) (string, []acp.Pro
 			Text: finalPrompt,
 		},
 	}
+}
+
+// compactableBodyChars measures the tool-result text the cap has to share.
+//
+// @purpose Supplies FitToolResultChars with the volume and count it needs.
+// @rationale Rendering the history once with no cap and subtracting these body lengths is the exact
+// overhead that remains, without duplicating the renderer's wrapper accounting.
+// @param msgs the conversation messages in request order.
+// @param intact tool_use ids whose results stay verbatim.
+// @returns total characters of compactable results, and how many there are.
+// @invariants O(len(msgs)); pure.
+func compactableBodyChars(msgs []Message, intact map[string]struct{}) (int, int) {
+	chars, count := 0, 0
+	for _, msg := range msgs {
+		if strings.ToLower(msg.Role) != "user" {
+			continue
+		}
+		if len(msg.Content.Blocks) == 0 {
+			// Text-only tool results carry no id, so they cannot be matched against `intact`;
+			// treat them as compactable, exactly as the renderer does.
+			trimmed := strings.TrimSpace(msg.Content.Text)
+			if strings.HasPrefix(trimmed, "User: [Tool Execution Results]") || strings.HasPrefix(trimmed, "[Tool Execution Results]") {
+				chars += len(cleanAnthropicToolContent(trimmed, ""))
+				count++
+			}
+			continue
+		}
+		for _, block := range msg.Content.Blocks {
+			if block.Type != "tool_result" {
+				continue
+			}
+			if _, keep := intact[block.ToolUseID]; keep {
+				continue
+			}
+			resStr := ""
+			switch c := block.Content.(type) {
+			case string:
+				resStr = c
+			default:
+				raw, _ := json.Marshal(c)
+				resStr = string(raw)
+			}
+			chars += len(cleanAnthropicToolContent(resStr, block.ToolUseID))
+			count++
+		}
+	}
+	return chars, count
 }
 
 // newestToolResultIDs returns the ids of the newest tool_result blocks across the conversation.

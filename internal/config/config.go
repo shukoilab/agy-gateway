@@ -102,9 +102,11 @@ type ExecutionConfig struct {
 	RetryInitialBackoff           time.Duration `yaml:"retry_initial_backoff"`
 	RetryMaxBackoff               time.Duration `yaml:"retry_max_backoff"`
 	// MaxHistoryTokens bounds the conversational history forwarded to the agent per turn. Above
-	// ~100K estimated tokens the agent stops converging and re-issues the same tool calls, so once
-	// the rendered prompt exceeds this budget the middle turns are dropped while the opening turn
-	// and the newest turns are kept. 0 disables the bound.
+	// ~100K estimated tokens the agent stops converging and re-issues the same tool calls, so the
+	// budget is enforced by compacting the oldest tool results first (head and tail kept), which
+	// preserves every assistant turn — dropping turns is what made a long session forget its own
+	// analysis. Whole turns are dropped only when the prose alone exceeds the budget, and then the
+	// opening turn and the newest turns are kept. 0 disables the bound.
 	MaxHistoryTokens int `yaml:"max_history_tokens"`
 }
 
@@ -286,12 +288,20 @@ func (c *Config) SetAgyAuthPath(p string) {
 // @rationale DefaultParallel was removed: OpenAI's `parallel_tool_calls` is the real control surface, and
 // multi-call collection is now always enabled, so the knob implied a switch that did nothing.
 type MCPClientToolCallingConfig struct {
-	Enabled                 bool          `yaml:"enabled"`
-	StrictSchemaValidation  bool          `yaml:"strict_schema_validation"`
-	MaxToolArgumentBytes    int64         `yaml:"max_tool_argument_bytes"`
-	MaxClientTools          int           `yaml:"max_client_tools"`
-	MaxInterceptedToolCalls int           `yaml:"max_intercepted_tool_calls"`
-	ToolCallCollectWindow   time.Duration `yaml:"tool_call_collect_window"`
+	Enabled                 bool  `yaml:"enabled"`
+	StrictSchemaValidation  bool  `yaml:"strict_schema_validation"`
+	MaxToolArgumentBytes    int64 `yaml:"max_tool_argument_bytes"`
+	MaxClientTools          int   `yaml:"max_client_tools"`
+	MaxInterceptedToolCalls int   `yaml:"max_intercepted_tool_calls"`
+	// ToolCallCollectWindow is the idle watchdog window, not a post-call deadline.
+	//
+	// @purpose Ends a turn only after the agent stops producing output while calls are pending.
+	// @rationale It was applied as a one-shot deadline from the moment a tool call arrived, so a
+	// reasoning model that kept thinking for more than a window (TTFT reached 63 s in a real session)
+	// had its turn cancelled mid-generation; the client saw a truncated turn and retried it, which is
+	// the loop this restart prevents. It is now re-armed by every streamed chunk and, when it does
+	// fire, sends session/cancel followed by one more window of grace before cancelling the prompt.
+	ToolCallCollectWindow time.Duration `yaml:"tool_call_collect_window"`
 	// DelimiterTag is retained for configuration backwards-compatibility.
 	// All tools are natively handled via ACP and the in-memory MCP loopback server.
 	DelimiterTag string `yaml:"delimiter_tag"`

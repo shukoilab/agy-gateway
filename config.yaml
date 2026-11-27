@@ -31,9 +31,10 @@ execution:
   retry_initial_backoff: "500ms"
   retry_max_backoff: "10s"
   # Bound on the conversation history forwarded to agy per turn (estimated tokens, ~4 chars each).
-  # Above ~100K tokens the agent stops converging and repeats the same tool calls, so once the
-  # rendered prompt exceeds this budget the middle turns are dropped: the opening turn and the most
-  # recent turns are always kept. 0 disables the bound.
+  # Above ~100K tokens the agent stops converging and repeats the same tool calls, so the budget is
+  # enforced by compacting oldest tool results first — keeping the head and tail of each — which
+  # preserves every assistant turn. Whole turns are only dropped when prose alone exceeds the budget,
+  # and then the opening turn and the newest turns are kept. 0 disables the bound.
   max_history_tokens: 60000
 
 storage:
@@ -118,6 +119,9 @@ mcp:
     max_tool_argument_bytes: 16777216 # 16 MiB (supports large context tool returns)
     max_client_tools: 128
     max_intercepted_tool_calls: 16
+    # Idle watchdog: a turn is only ended after the agent goes this long WITHOUT emitting any
+    # text/thought chunk while the gateway already holds collected tool calls. Re-armed by every
+    # streamed chunk, and followed by one more window of grace before the prompt is cancelled.
     tool_call_collect_window: "1s"
     delimiter_tag: "tool_call"
 

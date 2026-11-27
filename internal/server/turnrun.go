@@ -188,8 +188,18 @@ func executeTurnAttempt(
 		}
 	}()
 
+	// The cancel timer is an IDLE watchdog, not a deadline after a tool call: it fires only when the
+	// agent has gone completely silent while the gateway already holds something to return. Re-arming
+	// it on every streaming chunk is what makes that true. Without the reset a model that keeps
+	// thinking for more than one second after emitting a tool call — routine for a reasoning model —
+	// had its turn cancelled mid-generation, so the reasoning text and any later calls were lost and
+	// the client saw a truncated turn it would simply retry.
 	var cancelTimer *time.Timer
 	var cancelTimerMu sync.Mutex
+	// cancelSent records that the agent was already asked to wind this turn down. Re-arming after
+	// that point would send a second `session/cancel` for a turn that is already ending, so the
+	// watchdog fires exactly once per attempt.
+	var cancelSent bool
 	stopCancelTimer := func() {
 		cancelTimerMu.Lock()
 		if cancelTimer != nil {
@@ -199,13 +209,41 @@ func executeTurnAttempt(
 		cancelTimerMu.Unlock()
 	}
 	armCancel := func() {
-		stopCancelTimer()
 		cancelTimerMu.Lock()
+		if cancelSent {
+			cancelTimerMu.Unlock()
+			return
+		}
+		if cancelTimer != nil {
+			cancelTimer.Stop()
+		}
 		cancelTimer = NewTurnTimer(cfg.MCP.ClientToolCalling.ToolCallCollectWindow, func() {
+			// Ask the agent to wind the turn down, then keep reading for one more window so updates it
+			// already queued still reach the client. Cancelling promptCtx at this instant aborted the
+			// read path and discarded them, which is how a reasoning model lost the calls it emitted
+			// right after a silent think gap. If the agent does not end the turn itself within that
+			// grace window the prompt is cancelled anyway, so a wedged agent cannot hold the lease;
+			// InferenceTimeout remains the outer bound.
+			cancelTimerMu.Lock()
+			cancelSent = true
+			cancelTimerMu.Unlock()
 			_ = worker.Transport.Notify("session/cancel", acp.SessionCancelParams{SessionID: sessionID})
-			cancelPrompt()
+			cancelTimerMu.Lock()
+			cancelTimer = NewTurnTimer(cfg.MCP.ClientToolCalling.ToolCallCollectWindow, cancelPrompt)
+			cancelTimerMu.Unlock()
 		})
 		cancelTimerMu.Unlock()
+	}
+	// touchCancel restarts the idle window only once a tool call is already collected, i.e. only while
+	// the gateway is holding something the client must receive. Called for every streamed chunk so a
+	// model that keeps producing output is never cancelled for taking longer than the window.
+	touchCancel := func() {
+		cancelTimerMu.Lock()
+		armed := cancelTimer != nil && !cancelSent
+		cancelTimerMu.Unlock()
+		if armed {
+			armCancel()
+		}
 	}
 	defer stopCancelTimer()
 
@@ -233,6 +271,7 @@ func executeTurnAttempt(
 				return
 			}
 			notifyFirstToken()
+			touchCancel()
 			if !ttftTimer.Stop() {
 				select {
 				case <-ttftTimer.C:
@@ -274,6 +313,7 @@ func executeTurnAttempt(
 				return
 			}
 			notifyFirstToken()
+			touchCancel()
 			if !ttftTimer.Stop() {
 				select {
 				case <-ttftTimer.C:
