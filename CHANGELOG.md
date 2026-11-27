@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.5] - 2026-11-27
+
+### Bug Fixes
+
+* **openai:** give every streamed tool call its own index ([9ca3eb2](https://github.com/shukoilab/agy-gateway/commit/9ca3eb236bb8c113e484088ac0c29245aa248bae))
+
 ## [3.16.4] - 2026-11-27
 
 ### Bug Fixes
