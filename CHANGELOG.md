@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.3] - 2026-11-27
+
+### Bug Fixes
+
+* **acp:** deliver system prompt as prompt block, drop append carrier ([b52091c](https://github.com/shukoilab/agy-gateway/commit/b52091c466e1c527952d3671cb761b0f602a3d9d))
+
 ## [Unreleased]
 
 ### Bug Fixes
