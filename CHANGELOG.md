@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.6] - 2026-11-27
+
+### Bug Fixes
+
+* **pool:** boot with an empty vault and onboard without a restart ([dc7ff3d](https://github.com/shukoilab/agy-gateway/commit/dc7ff3d74a50c36fa3f8f41f2dec40337e5393d0))
+
 ## [3.16.5] - 2026-11-27
 
 ### Bug Fixes
