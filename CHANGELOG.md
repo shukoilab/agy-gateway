@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.7] - 2026-11-27
+
+### Bug Fixes
+
+* **auth:** purge deleted accounts and stop rotation from selecting them ([3453a76](https://github.com/shukoilab/agy-gateway/commit/3453a760a1ee8ec2284e81e7f3af371f88f834a5))
+
 ## [3.16.6] - 2026-11-27
 
 ### Bug Fixes
