@@ -313,6 +313,32 @@ func SchemaFor(state *mcp.SessionState, name string) json.RawMessage {
 	return nil
 }
 
+// ToolCallIndexer hands out the distinct per-turn indexes OpenAI streaming requires.
+//
+// @purpose Guarantees every emitted tool-call delta carries a unique index within its turn.
+// @rationale OpenAI clients fold streamed deltas that share an index into one call and concatenate
+// the argument fragments, so reusing an index (the previous code sent 0 for every call) merges
+// parallel calls into one unparseable arguments blob and the consumer fails to parse the call.
+// @preconditions The zero value is ready to use.
+// @invariants Safe for concurrent use; Next returns 0, 1, 2, … without gaps or repeats.
+type ToolCallIndexer struct {
+	mu   sync.Mutex
+	next int
+}
+
+// Next returns the next index for this turn.
+//
+// @purpose Single allocation point for tool call indexes.
+// @returns A monotonically increasing index starting at 0.
+// @invariants O(1); safe for concurrent callers.
+func (t *ToolCallIndexer) Next() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	idx := t.next
+	t.next++
+	return idx
+}
+
 // NewTurnTimer creates the single collection-window timer for a turn.
 //
 // @purpose Replaces eight unstoppable time.AfterFunc timers with one stoppable timer.

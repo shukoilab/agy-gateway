@@ -341,8 +341,14 @@ func (h *OpenAIHandlers) handleStreaming(
 		}
 		emitDelta(openai.ChatCompletionChunkDelta{ReasoningContent: &chunk}, nil)
 	}
+	// Tool call indexes must be distinct per turn. OpenAI clients merge streamed deltas that share an
+	// index into ONE call, concatenating their argument strings, so a constant 0 corrupts any turn
+	// that emits more than one call: the client then receives a single unparseable arguments blob and
+	// every subsequent tool invocation fails. Anthropic already assigned increasing block indexes;
+	// this is the OpenAI equivalent.
+	var toolCallIndex ToolCallIndexer
 	in.OnTool = func(entry toolCollectorEntry) {
-		idx := 0
+		idx := toolCallIndex.Next()
 		emitDelta(openai.ChatCompletionChunkDelta{ToolCalls: []openai.ToolCall{{
 			Index: &idx,
 			ID:    entry.ID,
