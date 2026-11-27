@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.16.4] - 2026-11-27
+
+### Bug Fixes
+
+* **translate:** restore tool-call ids and bound conversation history ([43c9c64](https://github.com/shukoilab/agy-gateway/commit/43c9c64f8f1a2ca36d6a4d083bdcdad08880533f))
+
 ## [3.16.3] - 2026-11-27
 
 ### Bug Fixes
