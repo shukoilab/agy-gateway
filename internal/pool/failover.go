@@ -15,6 +15,47 @@ import (
 // making transparent failover prohibited to prevent duplicated or conflicting tokens.
 var ErrNonRetryableStream = errors.New("stream already started; failover prohibited")
 
+// zeroTokenError marks a turn that failed without producing any output.
+//
+// @purpose Lets the failover path tell "the agent refused before doing any work" apart from "the turn
+// ran and then hit a quota wall", which need different account penalties.
+// @rationale The signal is produced by the executor, which knows the output counts, and consumed by
+// the coordinator, which knows the account state. A wrapper keeps that knowledge flowing through a
+// generic interface without widening ExecuteWithFailover's signature.
+// @invariants Unwraps to the original error, so classification and `errors.Is` are unaffected.
+type zeroTokenError struct{ err error }
+
+func (e *zeroTokenError) Error() string { return e.err.Error() }
+func (e *zeroTokenError) Unwrap() error { return e.err }
+
+// MarkZeroTokens wraps err to record that the turn produced no text, thoughts or tool calls.
+//
+// @purpose Records an output-count fact alongside the failure.
+// @rationale See zeroTokenError.
+// @preconditions err is non-nil.
+// @param err The attempt failure.
+// @returns err wrapped, or err unchanged when it is nil.
+// @throws None.
+// @invariants Idempotent; preserves errors.Is/errors.As through Unwrap.
+func MarkZeroTokens(err error) error {
+	if err == nil || IsZeroTokens(err) {
+		return err
+	}
+	return &zeroTokenError{err: err}
+}
+
+// IsZeroTokens reports whether err was marked as producing no output.
+//
+// @purpose Failover guard predicate.
+// @param err Candidate error.
+// @returns true when err wraps a zero-token marker.
+// @throws None.
+// @invariants O(1).
+func IsZeroTokens(err error) bool {
+	var target *zeroTokenError
+	return errors.As(err, &target)
+}
+
 // FailoverCoordinator handles transparent pre-first-byte retries, multi-account failover,
 // and exponential backoff with full jitter across worker lease attempts.
 type FailoverCoordinator struct {
@@ -194,6 +235,19 @@ func (fc *FailoverCoordinator) ExecuteWithFailover(
 			}
 
 		case retry.FailureClassQuotaExhausted:
+			// A 429 that arrives while the account still has measured capacity is a refusal, not
+			// exhaustion. Cooling the credential and recycling the worker only shrinks the pool.
+			if currentAccID != "" && fc.authMgr != nil && IsZeroTokens(err) {
+				if pct, known := fc.authMgr.KnownQuotaPct(currentAccID); known &&
+					fc.pool != nil && fc.pool.cfg != nil &&
+					pct >= fc.pool.cfg.Accounts.MinRemainingQuotaPct {
+					fc.logger.Warn("upstream 429 with healthy quota; not cooling the account",
+						"workerID", w.ID, "accountID", currentAccID, "quotaPct", pct)
+					fc.pool.Release(w)
+					return fmt.Errorf("upstream refused the turn with healthy measured quota (%.1f%% remaining); account not cooled", pct)
+				}
+			}
+
 			// Duration comes from configuration; a literal here silently drifted from the operator's
 			// setting and could keep an account out of service far longer than its real reset.
 			cooldownDuration := 30 * time.Minute

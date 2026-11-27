@@ -125,17 +125,18 @@ func SpawnArgs() []string {
 
 // SessionNewParams represents parameters sent in the session/new request per ACP v1 NewSessionRequest.
 //
-// @purpose Carries the workspace, loopback MCP servers and the append-only system prompt.
-// @rationale The spec-level `systemPrompt` field was removed: agy 1.5.16+ accepts it and silently
-// discards it, honouring only `_meta.antigravity.systemPrompt.append`. Keeping a field that is
-// never populated would suggest a delivery path that does not exist.
-// @invariants Meta is nil when the composed prompt (consumer prompt plus any client-tool delegation
-// directive) is empty, so a declared tool list alone is enough to populate it.
+// @purpose Carries the workspace and the loopback MCP server list.
+// @rationale Neither the spec-level `systemPrompt` field nor the vendor `_meta.antigravity.systemPrompt`
+// dialect is emitted: agy accepts and discards the former, and answers the latter with a synthetic
+// HTTP 429 ResourceExhausted for certain instruction text while emitting zero updates. The consumer
+// system prompt therefore travels as the first prompt block of session/prompt, which has no
+// dedicated field here.
+// @invariants The payload carries no prompt text, so it is identical regardless of what the consumer
+// declared.
 type SessionNewParams struct {
 	CWD                   string          `json:"cwd"`
 	AdditionalDirectories []string        `json:"additionalDirectories,omitempty"`
 	MCPServers            []MCPServerInfo `json:"mcpServers,omitempty"`
-	Meta                  map[string]any  `json:"_meta,omitempty"`
 }
 
 // SessionNewResult represents the result returned by session/new per ACP v1 NewSessionResponse.
@@ -562,33 +563,30 @@ type RequestPermissionResult struct {
 // AgentCapabilities describes negotiated server capabilities parsed from the ACP initialize response.
 //
 // @purpose Drives deterministic ACP feature negotiation without assuming unadvertised protocol extensions.
-// @rationale Only the vendor system-prompt dialect is retained, because that is the sole carrier the
-// gateway uses: agy accepts the spec-level `systemPrompt` parameter and silently discards it, so
-// parsing standard system-prompt modes would advertise a delivery path that does not exist.
-// SupportsVendorSystemPrompt survives purely as a startup warning signal — append is mandatory, so an
-// agent that does not advertise it will silently drop every consumer prompt.
+// @rationale Only flags the gateway actually acts on are retained. The vendor system-prompt flag was
+// removed together with the append carrier it described: the gateway no longer sends a system prompt
+// through session/new at all, so a flag about that dialect would drive a warning about a path that
+// does not exist.
 //
 // @invariants All boolean flags default cleanly to false when omitted or malformed; never panics on wrong JSON types.
 type AgentCapabilities struct {
-	ProtocolVersion            int
-	LoadSession                bool
-	SupportsSessionClose       bool
-	SupportsAdditionalDirs     bool
-	SupportsVendorSystemPrompt bool
-	SupportsMCPHTTP            bool
-	SupportsMCPSSE             bool
-	PromptImage                bool
-	PromptEmbeddedContext      bool
+	ProtocolVersion        int
+	LoadSession            bool
+	SupportsSessionClose   bool
+	SupportsAdditionalDirs bool
+	SupportsMCPHTTP        bool
+	SupportsMCPSSE         bool
+	PromptImage            bool
+	PromptEmbeddedContext  bool
 }
 
 // ParseAgentCapabilities safely extracts the negotiated capabilities from an ACP initialize result.
 //
 // @purpose Parses initialize result payloads into strongly typed capability flags.
-// @rationale Prevents nil-map panics and never mistakes a malformed value for an advertisement. Only
-// the Antigravity vendor dialect is parsed for the system prompt: `_meta.antigravity.systemPrompt.append`.
-// The spec-level `sessionCapabilities.systemPrompt` block is deliberately not read, because agy accepts
-// that carrier and discards it, so treating it as support would imply a delivery path the gateway does
-// not use.
+// @rationale Prevents nil-map panics and never mistakes a malformed value for an advertisement. No
+// system-prompt dialect is parsed at all: agy accepts the spec-level `sessionCapabilities.systemPrompt`
+// carrier and discards it, and its vendor `_meta.antigravity.systemPrompt.append` dialect is
+// policy-guarded, so neither describes a path the gateway uses.
 //
 // @preconditions initResult may be nil or partially populated; keys may hold unexpected JSON types.
 // @param initResult Raw decoded initialize JSON-RPC result map.
@@ -660,17 +658,6 @@ func ParseAgentCapabilities(initResult map[string]any) AgentCapabilities {
 		}
 	}
 
-	// Vendor dialect: _meta.antigravity.systemPrompt.append. This is the only system-prompt carrier
-	// the gateway uses, so it is the only one parsed.
-	if meta, ok := agentCaps["_meta"].(map[string]any); ok {
-		if agy, ok := meta["antigravity"].(map[string]any); ok {
-			if sp, ok := agy["systemPrompt"].(map[string]any); ok {
-				if v, ok := sp["append"].(bool); ok && v {
-					caps.SupportsVendorSystemPrompt = true
-				}
-			}
-		}
-	}
 	return caps
 }
 
@@ -717,7 +704,8 @@ func IsBuiltInContainerTool(name string) bool {
 // precedence guidance listing the mcp_client-tools_* surface, models invoke internal container tools and miss host project files.
 // @preconditions toolNames must contain normalized tool names provided by the API consumer.
 // @param toolNames List of OpenAI/Anthropic client tool names registered on the LoopbackServer.
-// @returns Directive text suitable for systemPrompt append injection, or empty string if toolNames is empty.
+// @returns Directive text suitable for prepending as the system prompt block, or empty string if
+// toolNames is empty.
 // @invariants Zero XML tag injection; pure semantic role/tool boundary instructions.
 func ClientToolDelegationDirective(toolNames []string) string {
 	if len(toolNames) == 0 {

@@ -111,15 +111,6 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// FR-14: report or reject fields the agent cannot honour instead of dropping them silently.
-	if _, err := applyUnsupportedParamPolicy(suppliedOpenAIUnsupportedParams(&req), h.cfg.OpenAI.UnsupportedParamPolicy, w); err != nil {
-		field, _ := IsUnsupportedParam(err)
-		h.writeOpenAIError(w, http.StatusBadRequest,
-			fmt.Sprintf("The parameter %q is not supported by the upstream agent", field),
-			"invalid_request_error", "unsupported_parameter", field)
-		return
-	}
-
 	// 1. Translate prompt and deduplicate JIT tools into ACP prompt blocks
 	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
 	if delimiter == "" {
@@ -395,11 +386,7 @@ func (h *OpenAIHandlers) handleStreaming(
 	})
 
 	if err != nil {
-		if _, ok := IsUnsupportedParam(err); ok {
-			h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
-			return
-		}
-		if !firstChunkSentPtr() {
+		if !sseWriter.Committed() {
 			h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
 			return
 		}
@@ -586,10 +573,6 @@ func estimatePromptTokens(blocks []acp.PromptBlock) int {
 // @param ttft configured first-token timeout for the message.
 // @invariants Writes exactly one response.
 func (h *OpenAIHandlers) writeTurnError(w http.ResponseWriter, err error, ttft time.Duration) {
-	if field, ok := IsUnsupportedParam(err); ok {
-		h.writeOpenAIError(w, http.StatusBadRequest, "parameter "+field+" is not supported upstream", "invalid_request_error", "unsupported_parameter", field)
-		return
-	}
 	if errors.Is(err, ErrFirstTokenTimeout) {
 		h.writeOpenAIError(w, http.StatusGatewayTimeout,
 			fmt.Sprintf("Time to first token exceeded %s (model cold-cache or prompt prefill timed out)", ttft),

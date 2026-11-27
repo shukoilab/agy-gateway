@@ -114,9 +114,13 @@ func runMCPBridgeSubcommand(args []string) {
 					continue
 				}
 				if resp.StatusCode != http.StatusOK {
-					// A transport-level failure must reach the agent as a JSON-RPC error frame,
-					// otherwise the agent waits forever for a response that will never come.
 					fmt.Fprintf(os.Stderr, "gateway returned HTTP %d: %s\n", resp.StatusCode, string(respBody))
+					if bridgeShouldExit(resp.StatusCode) {
+						fmt.Fprintln(os.Stderr, "bridge session ended by the gateway; exiting")
+						return
+					}
+					// A transport-level failure must still reach the agent as a JSON-RPC error frame,
+					// otherwise the agent waits forever for a response that will never come.
 					writeBridgeError(trimmed, -32603, fmt.Sprintf("gateway HTTP %d: %s", resp.StatusCode, string(respBody)))
 					continue
 				}
@@ -133,6 +137,22 @@ func runMCPBridgeSubcommand(args []string) {
 			break // EOF or stdin pipe closed
 		}
 	}
+}
+
+// bridgeShouldExit reports whether a non-200 gateway response is unrecoverable.
+//
+// @purpose Centralises the one status that must terminate the bridge instead of retrying.
+// @rationale The loopback token is minted per gateway session and the gateway deletes it on
+// unregister. Once the gateway answers 401 `mcp session token invalid`, every later frame gets the
+// same answer, so staying alive only leaks a process for the lifetime of the agent. Any other status
+// (502, 503, 500) may be a transient gateway restart and must remain retryable.
+// @preconditions None.
+// @param statusCode The status the gateway returned.
+// @returns true only for http.StatusUnauthorized.
+// @throws None.
+// @invariants Pure; O(1).
+func bridgeShouldExit(statusCode int) bool {
+	return statusCode == http.StatusUnauthorized
 }
 
 // writeBridgeError emits a JSON-RPC 2.0 error frame on stdout for the given request line.

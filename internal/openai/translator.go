@@ -53,9 +53,9 @@ func cleanToolOutputContent(content, toolCallID string) string {
 }
 
 // Translate extracts pure system instructions and formats conversational history into standard ACP prompt blocks.
-// System instructions are returned separately and forwarded by the server layer on the append-only
-// carrier (`_meta.antigravity.systemPrompt.append`); the spec-level `systemPrompt` field is
-// deliberately not used because the agent accepts and discards it.
+// System instructions are returned separately and forwarded by the server layer as the first prompt
+// block; neither the spec-level `systemPrompt` field (accepted and discarded by the agent) nor the
+// vendor `_meta` dialect (policy-guarded, can answer a synthetic 429) is used.
 // Tool declarations are NOT injected into prompt text; they are provided natively via LoopbackServer mcpServers.
 func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []acp.PromptBlock) {
 	var sysMessages []string

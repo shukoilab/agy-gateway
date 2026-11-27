@@ -26,9 +26,9 @@ func NewTranslator() *Translator {
 }
 
 // Translate converts the Anthropic conversation into an ACP prompt payload.
-// System instructions are returned separately and forwarded by the server layer on the append-only
-// carrier (`_meta.antigravity.systemPrompt.append`); the spec-level `systemPrompt` field is
-// deliberately not used because the agent accepts and discards it.
+// System instructions are returned separately and forwarded by the server layer as the first prompt
+// block; neither the spec-level `systemPrompt` field (accepted and discarded by the agent) nor the
+// vendor `_meta` dialect (policy-guarded, can answer a synthetic 429) is used.
 func (t *Translator) Translate(req *MessageRequest, _ string) (string, []acp.PromptBlock) {
 	systemPrompt := strings.TrimSpace(req.System.String())
 

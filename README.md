@@ -52,9 +52,9 @@ A common challenge when bridging developer IDEs and autonomous coding agents (su
 ### The Architectural Solution
 This project explores a sustainable, standards-compliant alternative:
 1. **Standard ACP Emulation**: The gateway emulates a native code editor client (such as Zed) communicating directly with the official Google Antigravity CLI (`agy acp`) using standard JSON-RPC 2.0. The underlying CLI runtime operates in its natural state without file injection or binary tampering.
-2. **Native ACP System Prompt Integration**: Rather than altering core system files or injecting artificial wrapper tags into conversation turns, developer instructions and tool schemas are forwarded directly upstream via official ACP `_meta.antigravity.systemPrompt.append` parameters during session creation (`session/new`). This prevents prompt-injection false positives in safety filters (such as Claude Sonnet) while maintaining pure conversational turn symmetry.
+2. **Native ACP System Prompt Delivery**: Rather than altering core system files or scraping undocumented endpoints, developer instructions travel upstream as a standard ACP prompt block in `session/prompt`, prepended as the first block of the turn. The gateway deliberately does not use any vendor-specific side channel: `agy` inspects those with a policy guard that answers certain instruction text with a synthetic `429 ResourceExhausted` while emitting zero updates, which hangs the turn for any harness whose persona trips it (observed with Hermes). The block carrier has no such guard, so one code path behaves identically for every client.
 
-The gateway is a **provider endpoint, not an agent harness**: the agent always runs as `agy acp --dangerously-skip-permissions`, so no turn is ever blocked behind an approval prompt, and this posture is not configurable. The consumer system prompt is forwarded verbatim and append-only — the gateway injects no persona, no default protocol, and no precedence banner, and omits `_meta` entirely when the consumer supplies no prompt. Whether a turn is read-only (plan) or write-enabled (build) is therefore decided purely by the consumer system prompt, exactly as with any other model provider.
+The gateway is a **provider endpoint, not an agent harness**: the agent always runs as `agy acp --dangerously-skip-permissions`, so no turn is ever blocked behind an approval prompt, and this posture is not configurable. The consumer system prompt is forwarded verbatim and prepended as the first prompt block — the gateway injects no persona, no default protocol, and no precedence banner, and prepends nothing when the consumer supplies no prompt. Whether a turn is read-only (plan) or write-enabled (build) is therefore decided purely by the consumer system prompt, exactly as with any other model provider.
 3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy-auth usage --all`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
 4. **Drop-in Compatibility**: Exposes standards-compliant REST endpoints for both `/v1/chat/completions` and `/v1/messages`, enabling developers to benchmark models like Gemini 3.8 Flash (supporting up to 1M+ token context windows) using existing tooling.
 
@@ -64,17 +64,17 @@ The gateway is a **provider endpoint, not an agent harness**: the agent always r
 
 - **Dual Wire Protocol Parity**:
   - **OpenAI 2026 Compatible**: Standard `/v1/chat/completions`, `/v1/models`, and `/v1/models/{model}` endpoints with streaming support.
-  - **Anthropic Messages Compatible**: Complete `/v1/messages` endpoint supporting dual authentication headers (`x-api-key` and `Authorization: Bearer`), polymorphic message payloads (plain strings and typed content blocks), and 7-stage Server-Sent Events (SSE) streaming.
+  - **Anthropic Messages Compatible**: Complete `/v1/messages` endpoint supporting dual authentication headers (`x-api-key` and `Authorization: Bearer`), polymorphic message payloads (plain strings and typed content blocks), and full Server-Sent Events (SSE) streaming (`message_start`, `content_block_start`/`delta`/`stop`, `message_delta`, `message_stop`, plus `ping` and `error`).
 - **Reasoning & Extended Thinking Streams**:
-  - Captures internal reasoning tokens from upstream thinking models and formats them cleanly as `reasoning_content` (OpenAI format) or `thinking` blocks with cryptographic signatures (Anthropic format).
+  - Captures internal reasoning tokens from upstream thinking models and formats them cleanly as `reasoning_content` (OpenAI format) or `thinking` blocks with content-derived cryptographic signatures (Anthropic format), so no two distinct reasoning blocks share a signature.
 - **Dynamic Model Discovery & Live Capability Ranking**:
   - Queries available models dynamically across authenticated accounts.
   - Integrates with [models.dev](https://models.dev) to score and rank models by capability, automatically electing "Family Champions" (Sonnet, Haiku, Opus, and Flash) with resilient offline disk caching.
   - Supports administrative runtime model aliasing and manual overrides through dedicated REST endpoints (`/admin/v1/models/anthropic/*`).
 - **Client-Side Tool Calling (Function Calling) & Autonomous Anti-Stall**:
-  - Native ACP system prompt appending for tool schemas and execution directives, eliminating safety filter conflicts.
-  - Active execution loop priming (`BuildActiveContinuationCue`) and structured turn symmetry, keeping autonomous agents (OpenCode, Claude Code, Cursor, Cline, Roo Code, Continue.dev) executing continuously without premature stalls.
-  - Streaming parser with closing tag prefix buffering and resilient flush recovery, guaranteeing zero unclosed or fragmented tool calls across network chunk boundaries.
+  - Tool schemas and execution directives travel in the same prepended prompt block as the rest of the consumer system prompt, so no vendor side channel is involved and no safety filter conflicts arise.
+  - Every client parameter is accepted: fields `agy` understands are mapped, and fields with no ACP equivalent are ignored without failing the request.
+  - Delimiter-tagged tool calls are parsed incrementally as the turn streams (`StreamTextToolCalls`), with closing-tag prefix buffering and resilient flush recovery, guaranteeing zero unclosed or fragmented tool calls across network chunk boundaries.
 - **Live Quota Tracking & Zero-Downtime Failover**:
   - Real-time per-account quota polling via `agy-auth usage --all --json`, tracking remaining percentages across rolling 5-hour and weekly bucket limits for **every** stored account independently.
   - Model-aware eligibility: quota families are tracked separately, so an account with a nearly spent *Claude and GPT models* bucket is still selected for pure Gemini traffic (and vice versa).
@@ -92,6 +92,8 @@ The gateway is a **provider endpoint, not an agent harness**: the agent always r
   - Complete control plane integration via REST endpoints (`/admin/v1/updater/*`), CLI subcommands (`agy-gateway update`), and interactive dashboard.
 - **Resource-Safe Architecture & Zero-Garbage Janitor**:
   - Built with Go 1.25, supervised process group lifecycles preventing zombie processes, zero data races, and JIT ACP session teardown (`session/close`) with automatic purging of SQLite databases, WAL journals (`.db-wal`), shared memory (`.db-shm`), and brain artifacts between requests.
+  - The per-turn MCP bridge is bound to its loopback session token; once the gateway ends that session the bridge receives `401` and exits immediately instead of retrying forever.
+  - Streaming responses commit their HTTP status exactly once, on the first byte actually written, so a pre-content failure still reports a truthful status instead of a `200` followed by a malformed body.
 
 ---
 
@@ -177,7 +179,7 @@ For local development or bare-metal execution:
 
 #### Prerequisites
 - **Go**: Version 1.25 or higher
-- **Google Antigravity CLI**: `agy` (v1.5.5+) installed and accessible in `$PATH`
+- **Google Antigravity CLI**: `agy` (v1.5.16+ required; the gateway refuses to start below this) installed and accessible in `$PATH`
 - **Node.js & Auth Helper**: `@fikrilal/agy-auth` installed globally (`npm install -g @fikrilal/agy-auth`)
 
 #### Step 1: Build the Binaries
@@ -214,6 +216,8 @@ Key sections include:
 - `pool`: Worker concurrency limits, TTFT timeouts, and buffer ceilings.
 - `accounts`: Quota polling frequency, cooldown intervals, and failover retries.
 - `proxy`: Outbound HTTP/HTTPS proxy rules and exclusions.
+
+Settings that were removed from the gateway are never fatal: a stale key in `config.yaml` or a stale `AGY_GW_*` variable logs a single `WARN` naming the key and the reason, then boot continues. Request parameters follow the same philosophy — every field a client sends is accepted, the ones `agy` can honour are mapped, and the rest are ignored.
 
 ### Environment Variables (`.env`)
 The gateway follows standard 12-factor configuration principles. Key variables:
@@ -352,6 +356,7 @@ The gateway treats each stored account as an independent quota source and binds 
 | Lease-time reconciliation | On every lease the worker's account is re-judged against live quota. An ineligible account is replaced from the vault and the new credential is installed before the turn runs. |
 | Polling | `quota_poll_interval` refreshes every account's buckets. A bucket below `min_remaining_quota_pct` moves that account into cooldown until the bucket's **own** reset time. |
 | Recovery | A cooldown that has elapsed returns the account to `HEALTHY` on the next poll, with no external trigger. |
+| Refusal guard | A `429` from upstream on a turn that produced zero tokens does **not** cool an account whose measured quota is still above `min_remaining_quota_pct`. The refusal is content-level, not quota-level, so cooling would bench a healthy account for nothing. The account stays in service and the turn fails with a server error (`inference_error`) instead of a misleading `all_accounts_cooling`. |
 
 **Quota families are independent.** Google meters *Gemini Models* and *Claude and GPT models* as separate buckets, so eligibility is evaluated only against the family the requested model uses. An account at 1% on the third-party bucket still serves Gemini models at full capacity.
 
@@ -365,7 +370,6 @@ The gateway treats each stored account as an independent quota source and binds 
 | `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Floor below which a bucket counts as depleted. An account whose quota could not be read ranks **below** a known-good one but stays usable (rank 1), so one failed quota call never takes the pool offline. |
 | `auto_rotate_enabled` | `AGY_GW_AUTO_ROTATE_ENABLED` | `true` | Derive cooldowns from live quota. When `false`, quota data is still refreshed but statuses never change. |
 | `quota_poll_interval` | `AGY_GW_QUOTA_POLL_INTERVAL` | `30s` | Background poll cadence (minimum `10s`). |
-| `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Bucket floor before an account is demoted. |
 | `default_cooldown_5h` | `AGY_GW_DEFAULT_COOLDOWN_5H` | `30m` | Fallback cooldown when a 5-hour bucket reports no reset time. |
 | `default_cooldown_weekly` | `AGY_GW_DEFAULT_COOLDOWN_WEEKLY` | `24h` | Fallback cooldown when a weekly bucket reports no reset time. |
 | `credential_op_timeout` | `AGY_GW_CREDENTIAL_OP_TIMEOUT` | `20s` | Deadline for one credential export/install, including process-group kill on expiry. |

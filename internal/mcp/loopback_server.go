@@ -247,12 +247,22 @@ func (s *LoopbackServer) GetSession(sessionID string) (*SessionState, error) {
 }
 
 // UnregisterSession removes a session and closes its interception channel.
+//
+// @purpose Releases per-session state so a stale bridge cannot keep writing into it.
+// @rationale The bridge child is not terminated here — the gateway does not own that process and the
+// agent may still hold its stdio. The bridge itself exits when its token is rejected, which is
+// observable through the debug log below.
+// @preconditions None; safe for an unknown session.
+// @param sessionID Session to forget.
+// @throws None.
+// @invariants O(1) map delete under the server lock.
 func (s *LoopbackServer) UnregisterSession(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state, ok := s.sessions[sessionID]; ok {
 		state.Close()
 		delete(s.sessions, sessionID)
+		slog.Debug("loopback session unregistered", "sessionID", sessionID)
 	}
 }
 

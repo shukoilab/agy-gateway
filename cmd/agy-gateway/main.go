@@ -392,8 +392,8 @@ func compareVersions(a, b string) int {
 
 // @purpose: Blocks startup when the installed agent binary predates the version whose
 // behaviour this gateway is written against.
-// @rationale: Every compatibility compensation in this codebase (vendor systemPrompt
-// channel, wire effort values, configOptions gating) was verified against agy 1.5.16.
+// @rationale: Every compatibility compensation in this codebase (wire effort values,
+// configOptions gating, prompt-block system delivery) was verified against agy 1.5.16.
 // Running on an older build reproduces the original silent-drop defects while all gates
 // still pass, so the mismatch must be fatal and explicit rather than inferred at runtime.
 // @preconditions: cfg non-nil and validated; cfg.Binaries.AgyPath points at an executable.

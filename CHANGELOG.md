@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Bug Fixes
+
+- **Universal harness compatibility: the consumer system prompt no longer travels through `_meta.antigravity.systemPrompt.append`.** agy inspects that field with a policy guard which answers certain instruction text with a synthetic `429 ResourceExhausted` while emitting zero ACP updates, so the turn hung until the client disconnected. Any harness whose persona tripped the guard appeared to receive no output at all — not merely no reasoning (reproduced with Hermes v0.23.4: 0 data frames in 300s; the same text as a prompt block produces 6-8 chunks plus tool calls in under 14s). The prompt is now always prepended as the first `session/prompt` block, so one code path behaves identically for every client and every model.
+- **`execution.system_prompt_channel` removed along with the append carrier.** The knob existed only to choose between a working path and a broken one. A stale `system_prompt_channel` key or `AGY_GW_SYSTEM_PROMPT_CHANNEL` env var now produces a startup warning with no behavioural effect, rather than silently restoring the hang.
+- **Vendor system-prompt capability parsing removed.** `AgentCapabilities.SupportsVendorSystemPrompt` and the per-worker warning it drove are gone with the carrier they described.
+- **SSE status is written once.** `internal/anthropic/sse.go` no longer calls `WriteHeader` in its constructor, and both writers expose `Committed()`, so a failure before the first byte returns a truthful HTTP status instead of a JSON body after a committed 200 (the `superfluous response.WriteHeader` warnings in the log).
+- **Unsupported OpenAI/Anthropic parameters are accepted instead of policed.** The `unsupported_param_policy` setting is gone: every parameter a harness sends is accepted, values agy supports are mapped, and the rest are ignored. Harnesses that send extra fields work unmodified.
+- **`mcp-bridge` exits when its session is gone.** A 401 from the loopback server used to log and loop forever; it now terminates, so session teardown no longer leaks a blocked child process.
+- **Anthropic thinking signatures are content-derived.** Every thinking block previously carried the same signature (an HMAC over the empty string). They now hash the block's own text.
+- **A synthetic 429 no longer cools a healthy account.** When the agent produces zero tokens and the account's measured quota is still above `accounts.min_remaining_quota_pct`, the failover coordinator refuses the turn without marking the account exhausted for five hours.
+
 ## [3.16.2] - 2026-11-26
 
 ### Bug Fixes

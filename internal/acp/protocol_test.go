@@ -258,13 +258,6 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 				},
 			},
 		},
-		Meta: map[string]any{
-			"antigravity": map[string]any{
-				"systemPrompt": map[string]any{
-					"append": "You are an expert systems programmer.",
-				},
-			},
-		},
 	}
 
 	raw, err := json.Marshal(params)
@@ -277,33 +270,15 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 		t.Fatalf("failed to unmarshal JSON: %v", err)
 	}
 
-	// 1. The top-level systemPrompt field no longer exists: agy accepts and discards it, so emitting
-	//    it would advertise a delivery path that does not work.
-	if _, present := parsed["systemPrompt"]; present {
-		t.Fatalf("top-level systemPrompt must never be emitted, got %+v", parsed["systemPrompt"])
+	// 1. No prompt carrier exists at all: neither the spec-level systemPrompt nor the vendor _meta
+	//    dialect may appear, because agy accepts the former and can refuse the latter.
+	for _, key := range []string{"systemPrompt", "_meta"} {
+		if _, present := parsed[key]; present {
+			t.Fatalf("%s must never be emitted, got %+v", key, parsed[key])
+		}
 	}
 
-	// 2. The vendor append channel round-trips verbatim.
-	meta, ok := parsed["_meta"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected _meta object, got %T", parsed["_meta"])
-	}
-	agyMeta, ok := meta["antigravity"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected antigravity map, got %T", meta["antigravity"])
-	}
-	sysMap, ok := agyMeta["systemPrompt"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected systemPrompt map, got %T", agyMeta["systemPrompt"])
-	}
-	if sysMap["append"] != "You are an expert systems programmer." {
-		t.Fatalf("append payload must round-trip verbatim, got %v", sysMap["append"])
-	}
-	if _, present := sysMap["override"]; present {
-		t.Fatalf("override must never be emitted; it hangs the agent turn")
-	}
-
-	// 3. Verify mcpServers env is an array of objects
+	// 2. Verify mcpServers env is an array of objects
 	servers, ok := parsed["mcpServers"].([]any)
 	if !ok || len(servers) == 0 {
 		t.Fatalf("expected non-empty mcpServers array")
@@ -319,9 +294,9 @@ func TestSessionNewParams_CanonicalACPv1(t *testing.T) {
 	}
 }
 
-// TestSessionNewParams_OmitsMetaWithoutPrompt proves the field is absent, not empty, when there is
-// nothing to send: an empty _meta would still be a gateway-authored payload.
-func TestSessionNewParams_OmitsMetaWithoutPrompt(t *testing.T) {
+// TestSessionNewParams_NoPromptCarrier proves the payload never grows a prompt field: the struct has
+// no _meta at all, so no future refactor can quietly reintroduce the policy-guarded carrier.
+func TestSessionNewParams_NoPromptCarrier(t *testing.T) {
 	raw, err := json.Marshal(SessionNewParams{CWD: "/w"})
 	if err != nil {
 		t.Fatalf("failed to marshal: %v", err)
@@ -330,8 +305,10 @@ func TestSessionNewParams_OmitsMetaWithoutPrompt(t *testing.T) {
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		t.Fatalf("failed to unmarshal: %v", err)
 	}
-	if _, present := parsed["_meta"]; present {
-		t.Fatalf("_meta must be omitted when no prompt is configured, got %v", parsed["_meta"])
+	for _, key := range []string{"_meta", "systemPrompt"} {
+		if _, present := parsed[key]; present {
+			t.Fatalf("%s must be absent from session/new, got %v", key, parsed[key])
+		}
 	}
 }
 
@@ -371,11 +348,12 @@ func TestSessionUpdate_UsageUpdate(t *testing.T) {
 func TestParseAgentCapabilities(t *testing.T) {
 	// 1. Nil input safety — never panics, everything defaults false.
 	emptyCaps := ParseAgentCapabilities(nil)
-	if emptyCaps.SupportsVendorSystemPrompt || emptyCaps.SupportsSessionClose {
+	if emptyCaps.SupportsSessionClose || emptyCaps.LoadSession {
 		t.Fatalf("expected all false for nil initResult, got %+v", emptyCaps)
 	}
 
-	// 2. Real agy acp v1.5.16 shape: vendor _meta boolean is the only system-prompt signal.
+	// 2. Real agy acp v1.5.16 shape. The vendor _meta block is present in the real response but must
+	//    contribute nothing: the gateway never sends a system prompt through session/new.
 	agyPayload := map[string]any{
 		"protocolVersion": float64(1),
 		"agentCapabilities": map[string]any{
@@ -392,16 +370,11 @@ func TestParseAgentCapabilities(t *testing.T) {
 				"list":                  map[string]any{},
 				"additionalDirectories": map[string]any{},
 			},
-			"_meta": map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{"append": true},
-				},
-			},
 		},
 	}
 	caps := ParseAgentCapabilities(agyPayload)
 	if caps.ProtocolVersion != 1 || !caps.LoadSession || !caps.SupportsAdditionalDirs ||
-		!caps.SupportsSessionClose || !caps.SupportsVendorSystemPrompt {
+		!caps.SupportsSessionClose {
 		t.Fatalf("agy 1.5.16 capability parse wrong: %+v", caps)
 	}
 	if !caps.PromptImage || caps.PromptEmbeddedContext != true {
@@ -426,7 +399,7 @@ func TestParseAgentCapabilities(t *testing.T) {
 		"protocolVersion":   "one",
 		"agentCapabilities": "nope",
 	})
-	if hostile.ProtocolVersion != 0 || hostile.SupportsVendorSystemPrompt {
+	if hostile.ProtocolVersion != 0 || hostile.LoadSession || hostile.SupportsSessionClose {
 		t.Fatalf("malformed payload must degrade silently; got %+v", hostile)
 	}
 	hostile2 := ParseAgentCapabilities(map[string]any{
@@ -438,21 +411,8 @@ func TestParseAgentCapabilities(t *testing.T) {
 			"_meta":           map[string]any{"antigravity": 42},
 		},
 	})
-	if hostile2.SupportsMCPHTTP || hostile2.SupportsVendorSystemPrompt {
+	if hostile2.SupportsMCPHTTP || hostile2.SupportsSessionClose {
 		t.Fatalf("non-boolean capability values must not be treated as true; got %+v", hostile2)
-	}
-	// A falsy vendor append must not count as support: the warning it drives depends on this.
-	falsyAppend := ParseAgentCapabilities(map[string]any{
-		"agentCapabilities": map[string]any{
-			"_meta": map[string]any{
-				"antigravity": map[string]any{
-					"systemPrompt": map[string]any{"append": false},
-				},
-			},
-		},
-	})
-	if falsyAppend.SupportsVendorSystemPrompt {
-		t.Fatalf("append:false must not be treated as support; got %+v", falsyAppend)
 	}
 }
 

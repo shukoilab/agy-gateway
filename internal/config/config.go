@@ -89,11 +89,11 @@ type BinariesConfig struct {
 // ExecutionConfig controls per-turn agent behaviour.
 //
 // @purpose Groups the policies that shape how one inference turn is executed.
-// @rationale The YOLO refactor removed three knobs that only existed to compensate for a mode or
-// channel choice the gateway no longer makes: acp_session_mode (plan/build is the consumer's system
-// prompt), auto_approve_permissions (--dangerously-skip-permissions is now unconditional), and
-// system_prompt_channel (append is the only carrier agy honours). What remains is genuine per-turn
-// policy that no product invariant fixes.
+// @rationale The YOLO refactor removed two knobs that only existed to compensate for a mode or
+// auto-approval choice the gateway no longer makes: acp_session_mode (plan/build is the consumer's
+// system prompt) and auto_approve_permissions (--dangerously-skip-permissions is now unconditional).
+// system_prompt_channel is gone for the same reason: only one delivery path works, so a knob to pick
+// another would only exist to be misconfigured.
 type ExecutionConfig struct {
 	CleanWorkspaceBetweenRequests bool          `yaml:"clean_workspace_between_requests"`
 	StrictClientToolDelegation    bool          `yaml:"strict_client_tool_delegation"`
@@ -158,7 +158,6 @@ type AdminConfig struct {
 }
 
 type OpenAIConfig struct {
-	UnsupportedParamPolicy string `yaml:"unsupported_param_policy"`
 	DefaultModel           string `yaml:"default_model"`
 	DefaultReasoningEffort string `yaml:"default_reasoning_effort"`
 	ExposeReasoningContent bool   `yaml:"expose_reasoning_content"`
@@ -168,7 +167,6 @@ type AnthropicConfig struct {
 	DefaultModel           string `yaml:"default_model"`
 	DefaultMaxTokens       int    `yaml:"default_max_tokens"`
 	ExposeReasoningContent bool   `yaml:"expose_reasoning_content"`
-	UnsupportedParamPolicy string `yaml:"unsupported_param_policy"`
 }
 
 // ProxyConfig specifies optional outbound HTTP/HTTPS proxy settings for Docker and host environments.
@@ -388,14 +386,12 @@ func DefaultConfig() *Config {
 			},
 		},
 		OpenAI: OpenAIConfig{
-			UnsupportedParamPolicy: "strip_and_warn",
 			DefaultModel:           "gemini-3.8-flash",
 			DefaultReasoningEffort: "medium",
 			ExposeReasoningContent: true,
 		},
 		Anthropic: AnthropicConfig{
 			DefaultModel:           "claude-3-5-sonnet",
-			UnsupportedParamPolicy: "strip_and_warn",
 			DefaultMaxTokens:       4096,
 			ExposeReasoningContent: true,
 		},
@@ -489,6 +485,8 @@ var removedConfigKeys = []struct{ section, key string }{
 	{"execution", "auto_approve_permissions"},
 	{"execution", "system_prompt_channel"},
 	{"binaries", "agy_acp_args"},
+	{"openai", "unsupported_param_policy"},
+	{"anthropic", "unsupported_param_policy"},
 }
 
 // removedEnvKeys lists environment variables deleted by the YOLO refactor.
@@ -504,6 +502,8 @@ var removedEnvKeys = []string{
 	"AGY_GW_AUTO_APPROVE_PERMISSIONS",
 	"AGY_GW_SYSTEM_PROMPT_CHANNEL",
 	"AGY_GW_AGY_ACP_ARGS",
+	"AGY_GW_UNSUPPORTED_PARAM_POLICY",
+	"AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY",
 }
 
 // removedKeyNotes maps each removed key to the action an operator should take.
@@ -513,15 +513,19 @@ var removedEnvKeys = []string{
 // This map is the single source of truth for both the YAML and env key sets; keys absent here emit no
 // note, which Validate-free lookups in tests assert against.
 var removedKeyNotes = map[string]string{
-	"execution.acp_session_mode":         "plan vs build is now decided by the consumer system prompt",
-	"execution.auto_approve_permissions": "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"execution.system_prompt_channel":    "the system prompt is always sent via _meta.antigravity.systemPrompt.append",
-	"binaries.agy_acp_args":              "the ACP argv is fixed by the gateway",
-	"AGY_GW_ACP_SESSION_MODE":            "plan vs build is now decided by the consumer system prompt",
-	"ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
-	"AGY_GW_AUTO_APPROVE_PERMISSIONS":    "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"AGY_GW_SYSTEM_PROMPT_CHANNEL":       "the system prompt is always sent via _meta.antigravity.systemPrompt.append",
-	"AGY_GW_AGY_ACP_ARGS":                "the ACP argv is fixed by the gateway",
+	"execution.acp_session_mode":                "plan vs build is now decided by the consumer system prompt",
+	"execution.auto_approve_permissions":        "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"execution.system_prompt_channel":           "the consumer system prompt is always sent as the first prompt block",
+	"binaries.agy_acp_args":                     "the ACP argv is fixed by the gateway",
+	"AGY_GW_ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
+	"ACP_SESSION_MODE":                          "plan vs build is now decided by the consumer system prompt",
+	"AGY_GW_AUTO_APPROVE_PERMISSIONS":           "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"AGY_GW_SYSTEM_PROMPT_CHANNEL":              "the consumer system prompt is always sent as the first prompt block",
+	"AGY_GW_AGY_ACP_ARGS":                       "the ACP argv is fixed by the gateway",
+	"openai.unsupported_param_policy":           "every parameter is accepted; fields with no ACP surface are ignored",
+	"anthropic.unsupported_param_policy":        "every parameter is accepted; fields with no ACP surface are ignored",
+	"AGY_GW_UNSUPPORTED_PARAM_POLICY":           "every parameter is accepted; fields with no ACP surface are ignored",
+	"AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY": "every parameter is accepted; fields with no ACP surface are ignored",
 }
 
 // collectRemovedEnvKeys returns the removed environment variables that are still exported.
@@ -760,9 +764,6 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	if v := os.Getenv("AGY_GW_EXPOSE_REASONING_CONTENT"); v != "" {
 		cfg.OpenAI.ExposeReasoningContent = parseBoolEnv(v, cfg.OpenAI.ExposeReasoningContent)
 	}
-	if v := os.Getenv("AGY_GW_UNSUPPORTED_PARAM_POLICY"); v != "" {
-		cfg.OpenAI.UnsupportedParamPolicy = v
-	}
 
 	// 5b. Anthropic Overrides
 	if v := getFirstEnv("AGY_GW_ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_DEFAULT_MODEL"); v != "" {
@@ -773,9 +774,6 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
 			cfg.Anthropic.DefaultMaxTokens = n
 		}
-	}
-	if v := os.Getenv("AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY"); v != "" {
-		cfg.Anthropic.UnsupportedParamPolicy = strings.TrimSpace(v)
 	}
 	if v := os.Getenv("AGY_GW_ANTHROPIC_EXPOSE_REASONING_CONTENT"); v != "" {
 		cfg.Anthropic.ExposeReasoningContent = parseBoolEnv(v, cfg.Anthropic.ExposeReasoningContent)
@@ -806,8 +804,8 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	}
 
 	// 5d. Execution Policy Overrides
-	// acp_session_mode, auto_approve_permissions, system_prompt_channel and agy_acp_args are no
-	// longer read: they are product invariants now (see acp.SpawnArgs and composeSystemPrompt).
+	// acp_session_mode, auto_approve_permissions and agy_acp_args are no longer read: they are
+	// product invariants now (see acp.SpawnArgs).
 	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
 		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
 	}
@@ -1065,17 +1063,9 @@ func validate(cfg *Config) error {
 	if cfg.Binaries.AgyAuthPath == "" {
 		return fmt.Errorf("binaries.agy_auth_path cannot be empty")
 	}
-	if !validUnsupportedParamPolicy(cfg.Anthropic.UnsupportedParamPolicy) {
-		return fmt.Errorf("anthropic.unsupported_param_policy must be 'strip_and_warn' or 'reject', got %q",
-			cfg.Anthropic.UnsupportedParamPolicy)
-	}
 	if !validVisionMode(cfg.Execution.VisionMode) {
 		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",
 			visionModes, cfg.Execution.VisionMode)
-	}
-	if !validUnsupportedParamPolicy(cfg.OpenAI.UnsupportedParamPolicy) {
-		return fmt.Errorf("openai.unsupported_param_policy must be one of %v, got %q",
-			unsupportedParamPolicies, cfg.OpenAI.UnsupportedParamPolicy)
 	}
 	if cfg.MCP.ClientToolCalling.MaxClientTools <= 0 || cfg.MCP.ClientToolCalling.MaxClientTools > 1024 {
 		return fmt.Errorf("mcp.client_tool_calling.max_client_tools must be between 1 and 1024, got %d",

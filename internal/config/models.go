@@ -103,12 +103,6 @@ func IsThoughtLevel(value string) bool {
 // @rationale agy advertises image support but fails every such turn with a 400 surfaced as assistant text.
 var visionModes = []string{"reject", "flatten"}
 
-// unsupportedParamPolicies enumerates handling of parameters the agent cannot honour.
-//
-// @purpose Validation set for openai.unsupported_param_policy.
-// @rationale Silent stripping is the bug this knob exists to eliminate.
-var unsupportedParamPolicies = []string{"strip_and_warn", "reject"}
-
 // allocationStrategies enumerates how the pool assigns accounts to workers.
 //
 // @purpose Validation set for accounts.allocation_strategy.
@@ -173,8 +167,7 @@ func validAllocationStrategy(v string) bool {
 	return contains(allocationStrategies, NormalizeAllocationStrategy(v))
 }
 
-func validVisionMode(v string) bool             { return contains(visionModes, v) }
-func validUnsupportedParamPolicy(v string) bool { return contains(unsupportedParamPolicies, v) }
+func validVisionMode(v string) bool { return contains(visionModes, v) }
 
 // contains reports membership in a small string set.
 //

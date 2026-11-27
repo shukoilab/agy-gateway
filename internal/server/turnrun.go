@@ -465,6 +465,11 @@ func executeTurnAttempt(
 			(result.Text != "" || len(result.Tools) > 0 || streamParser.IsTerminated() || result.StopMatched) {
 			return result, nil
 		}
+		// Record whether the turn produced anything, so failover can tell a refusal from a real
+		// exhaustion without re-deriving it from the error text.
+		if result.Text == "" && result.Thoughts == "" && len(result.Tools) == 0 {
+			return result, pool.MarkZeroTokens(callErr)
+		}
 		return result, callErr
 	}
 
@@ -481,9 +486,9 @@ func executeTurnAttempt(
 // @param cfg Gateway configuration.
 // @param logger Structured logger.
 // @param in Turn input.
-// @returns The negotiated session id, the caller's prompt blocks unchanged (the system prompt travels
-// only in the session/new `_meta` carrier), a session-close closure, and an error when the session
-// cannot be created or the model cannot be applied.
+// @returns The negotiated session id, the caller's prompt blocks with the consumer system prompt
+// prepended as a leading text block, a session-close closure, and an error when the session cannot be
+// created or the model cannot be applied.
 // @throws The agent error when session/new fails after one auth retry, an error when session/new
 // returned an empty session id, or the model-application error from applySessionConfigOptions (an
 // unavailable model is surfaced as 400 by the caller; an upstream set_config_option failure is a
@@ -551,7 +556,16 @@ func setupACPSession(
 		return "", nil, nil, err
 	}
 
-	return newResult.SessionID, in.PromptBlocks, closer, nil
+	// The consumer system prompt is delivered as the first prompt block. It must never travel in
+	// session/new: the vendor carrier is policy-guarded and can answer a synthetic 429 with zero
+	// updates, leaving the turn to hang.
+	blocks := prependPromptBlocks(in.PromptBlocks, effectiveSystemPrompt(SessionSetupInput{
+		Config:               cfg,
+		ConsumerSystemPrompt: in.SystemPrompt,
+		ClientToolNames:      in.ClientToolNames,
+	}))
+
+	return newResult.SessionID, blocks, closer, nil
 }
 
 // sleepCtx waits for d or until the context is done.

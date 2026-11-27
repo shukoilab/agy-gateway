@@ -97,7 +97,6 @@ func TestValidate_RejectsInvalidEnums(t *testing.T) {
 		mutate func(*Config)
 	}{
 		{"bad vision mode", func(c *Config) { c.Execution.VisionMode = "hallucinate" }},
-		{"bad unsupported param policy", func(c *Config) { c.OpenAI.UnsupportedParamPolicy = "ignore" }},
 		{"zero max client tools", func(c *Config) { c.MCP.ClientToolCalling.MaxClientTools = 0 }},
 		{"oversized max client tools", func(c *Config) { c.MCP.ClientToolCalling.MaxClientTools = 5000 }},
 		{"zero intercepted cap", func(c *Config) { c.MCP.ClientToolCalling.MaxInterceptedToolCalls = 0 }},
@@ -120,9 +119,6 @@ func TestDefaults_MatchVerifiedAgentBehaviour(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Execution.VisionMode != "reject" {
 		t.Errorf("vision_mode must default to reject (agy advertises image support but fails every image turn); got %q", cfg.Execution.VisionMode)
-	}
-	if cfg.OpenAI.UnsupportedParamPolicy != "strip_and_warn" {
-		t.Errorf("unsupported param policy default changed: %q", cfg.OpenAI.UnsupportedParamPolicy)
 	}
 	if cfg.Binaries.AgyMinVersion == "" {
 		t.Error("agy_min_version must not be empty")
@@ -156,7 +152,6 @@ binaries:
 execution:
   acp_session_mode: "accept-edits"
   auto_approve_permissions: false
-  system_prompt_channel: "vendor"
   vision_mode: "reject"
 `
 	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
@@ -181,12 +176,13 @@ execution:
 func TestCollectRemovedEnvKeys_DisclosesStaleEnvironment(t *testing.T) {
 	env := map[string]string{
 		"AGY_GW_AUTO_APPROVE_PERMISSIONS": "false",
-		"AGY_GW_SYSTEM_PROMPT_CHANNEL":    "vendor",
+		"AGY_GW_UNSUPPORTED_PARAM_POLICY": "reject",
+		"AGY_GW_SYSTEM_PROMPT_CHANNEL":    "append",
 		"UNRELATED_VAR":                   "keep-me",
 	}
 	got := collectRemovedEnvKeys(func(k string) string { return env[k] })
-	if len(got) != 2 {
-		t.Fatalf("expected 2 stale env vars, got %v", got)
+	if len(got) != 3 {
+		t.Fatalf("expected 3 stale env vars, got %v", got)
 	}
 	for _, key := range got {
 		if RemovedKeyNote(key) == "" {
@@ -238,10 +234,10 @@ func TestLoad_PopulatesRemovedKeysFromYAMLAndEnv(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	t.Setenv("AGY_GW_AUTO_APPROVE_PERMISSIONS", "false")
-	t.Setenv("AGY_GW_SYSTEM_PROMPT_CHANNEL", "vendor")
+	t.Setenv("AGY_GW_UNSUPPORTED_PARAM_POLICY", "reject")
 
 	configFile := t.TempDir() + "/legacy.yaml"
-	content := "execution:\n  acp_session_mode: auto\n  auto_approve_permissions: false\n"
+	content := "execution:\n  acp_session_mode: auto\n  auto_approve_permissions: false\n  system_prompt_channel: append\n"
 	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write test config: %v", err)
 	}
@@ -254,8 +250,9 @@ func TestLoad_PopulatesRemovedKeysFromYAMLAndEnv(t *testing.T) {
 	want := []string{
 		"execution.acp_session_mode",
 		"execution.auto_approve_permissions",
+		"execution.system_prompt_channel",
 		"AGY_GW_AUTO_APPROVE_PERMISSIONS",
-		"AGY_GW_SYSTEM_PROMPT_CHANNEL",
+		"AGY_GW_UNSUPPORTED_PARAM_POLICY",
 	}
 	if len(cfg.RemovedKeys) != len(want) {
 		t.Fatalf("expected %d removed keys, got %v", len(want), cfg.RemovedKeys)

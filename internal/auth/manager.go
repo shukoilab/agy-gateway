@@ -718,6 +718,48 @@ func (m *Manager) FetchAgyUsage(ctx context.Context, homeDir string) (*AgyUsageE
 	return &env, nil
 }
 
+// KnownQuotaPct reports the lowest remaining percentage across an account's known quota buckets.
+//
+// @purpose Lets the failover path distinguish a real quota exhaustion from a refusal that arrived
+// while the account still has ample capacity.
+// @rationale An upstream 429 is not always exhaustion: the agent returns one for policy refusals
+// too. Cooling an account on that signal removes a working credential for the full cooldown window
+// and recycles its worker for nothing. The snapshot this reads is the same one `GetAccounts` serves,
+// so no subprocess runs on the failover hot path.
+// @preconditions None; safe on an unknown id.
+// @param accountID Account to inspect.
+// @returns The minimum remaining percentage and true when at least one bucket is known, otherwise
+// (0, false) so the caller falls back to the pre-existing penalty behaviour.
+// @throws None.
+// @invariants O(buckets); takes a read lock; never spawns a process.
+func (m *Manager) KnownQuotaPct(accountID string) (float64, bool) {
+	if m == nil || accountID == "" {
+		return 0, false
+	}
+	for _, acc := range m.GetAccounts() {
+		if acc.ID != accountID {
+			continue
+		}
+		if !acc.QuotasKnown || len(acc.Quotas) == 0 {
+			return 0, false
+		}
+		worst := -1.0
+		for _, q := range acc.Quotas {
+			if q.IsExhausted {
+				return 0, true
+			}
+			if worst < 0 || q.RemainingPct < worst {
+				worst = q.RemainingPct
+			}
+		}
+		if worst < 0 {
+			return 0, false
+		}
+		return worst, true
+	}
+	return 0, false
+}
+
 // GetQuota returns live per-account quota, optionally narrowed to one account.
 //
 // @purpose Gives operators and the pool the true quota of each account.

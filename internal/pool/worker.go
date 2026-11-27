@@ -165,18 +165,9 @@ func (w *Worker) Start(ctx context.Context) error {
 	w.logger.Info("warm worker process started successfully",
 		"pid", proc.PID(),
 		"protocolVersion", w.Capabilities.ProtocolVersion,
-		"capVendorPrompt", w.Capabilities.SupportsVendorSystemPrompt,
 		"capAddDirs", w.Capabilities.SupportsAdditionalDirs,
 		"capClose", w.Capabilities.SupportsSessionClose,
 	)
-	// Append is the only system-prompt carrier the gateway uses. An agent that does not advertise it
-	// will silently drop every consumer prompt, so make that visible once per worker instead of
-	// letting requests appear to succeed with the prompt ignored.
-	if !w.Capabilities.SupportsVendorSystemPrompt {
-		w.logger.Warn("agent does not advertise _meta.antigravity.systemPrompt.append; "+
-			"consumer system prompts will be ignored by the agent",
-			"minVersion", w.cfg.Binaries.AgyMinVersion)
-	}
 	return nil
 }
 

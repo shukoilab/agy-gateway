@@ -7,8 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,99 +18,6 @@ import (
 	"agy-gateway/internal/mcp"
 	"agy-gateway/internal/openai"
 )
-
-// IgnoredParamsHeader names the response header that reports request fields the gateway accepted
-// but could not honor upstream.
-const IgnoredParamsHeader = "X-Agy-Gateway-Ignored-Params"
-
-// unsupportedFields lists request fields that have no ACP surface and therefore can never reach agy.
-//
-// @purpose Single authoritative list behind the unsupported-parameter policy.
-// @rationale Accepting and silently dropping a field is the defect this closes; every name here is
-// either reported in IgnoredParamsHeader or rejected outright.
-// @invariants Read-only; sorted for deterministic header output.
-var unsupportedFields = []string{
-	"frequency_penalty",
-	"logit_bias",
-	"logprobs",
-	"max_completion_tokens",
-	"max_tokens",
-	"metadata",
-	"parallel_tool_calls",
-	"presence_penalty",
-	"response_format",
-	"seed",
-	"temperature",
-	"tool_choice",
-	"top_k",
-	"top_logprobs",
-	"top_p",
-	"user",
-}
-
-// UnsupportedParamError reports the first request field the configured policy refuses.
-type UnsupportedParamError struct {
-	Field string
-}
-
-// Error implements the error interface.
-//
-// @purpose Makes UnsupportedParamError usable with errors.As and error wrapping.
-// @returns A message naming the offending field.
-// @invariants Pure.
-func (e *UnsupportedParamError) Error() string {
-	return "parameter " + e.Field + " is not supported by the upstream agent"
-}
-
-// IsUnsupportedParam reports whether err is an UnsupportedParamError.
-//
-// @purpose Lets handlers branch to 400 without string matching.
-// @param err Candidate error.
-// @returns true when err wraps an UnsupportedParamError.
-// @invariants Pure.
-func IsUnsupportedParam(err error) (string, bool) {
-	var target *UnsupportedParamError
-	if err != nil && errors.As(err, &target) {
-		return target.Field, true
-	}
-	return "", false
-}
-
-// applyUnsupportedParamPolicy enforces execution-time handling of fields agy cannot honor.
-//
-// @purpose Converts a silent drop into either an explicit report or an explicit rejection.
-// @rationale FR-14: no request field may be accepted and then discarded without appearing in the
-// IgnoredParamsHeader or an error.
-// @preconditions requested is the set of fields the caller actually supplied with a non-zero value.
-// @param requested Field names supplied by the caller.
-// @param policy strip_and_warn or reject.
-// @param w Response writer used to stamp the informational header in warn mode.
-// @returns The reported field list and, in reject mode, a typed error naming the first offending field.
-// @invariants Deterministic ordering; O(n log n).
-func applyUnsupportedParamPolicy(requested []string, policy string, w http.ResponseWriter) ([]string, error) {
-	set := make(map[string]struct{}, len(requested))
-	for _, name := range requested {
-		set[name] = struct{}{}
-	}
-	reported := make([]string, 0, len(unsupportedFields))
-	for _, name := range unsupportedFields {
-		if _, ok := set[name]; ok {
-			reported = append(reported, name)
-		}
-	}
-	if len(reported) == 0 {
-		return nil, nil
-	}
-	sort.Strings(reported)
-
-	if strings.EqualFold(strings.TrimSpace(policy), "reject") {
-		return reported, &UnsupportedParamError{Field: reported[0]}
-	}
-	if w != nil {
-		w.Header().Set(IgnoredParamsHeader, strings.Join(reported, ","))
-	}
-	return reported, nil
-}
 
 // MapStopReason converts an ACP stop reason into the OpenAI finish_reason and Anthropic stop_reason.
 //
@@ -850,9 +755,6 @@ func ClientErrorKind(err error) string {
 	if errors.Is(err, ErrFirstTokenTimeout) {
 		return "first_token_timeout"
 	}
-	if _, ok := IsUnsupportedParam(err); ok {
-		return "unsupported_parameter"
-	}
 	var respErr *acp.ResponseError
 	if errors.As(err, &respErr) {
 		switch respErr.Code {
@@ -892,73 +794,6 @@ func ClientErrorMessage(kind string) string {
 	default:
 		return "The upstream agent failed to complete the request."
 	}
-}
-
-// suppliedOpenAIUnsupportedParams returns the names of request fields the upstream agent cannot honour
-// that the caller actually supplied.
-//
-// @purpose Implements FR-14: no accepted-then-dropped field may be invisible to the caller.
-// @rationale agy exposes no sampling surface, so honouring these silently would be a lie.
-// @preconditions req must be non-nil.
-// @param req Decoded OpenAI request.
-// @returns Field names in ascending order, empty when the caller supplied none.
-// @throws None.
-// @invariants O(1); no allocation when nothing is supplied.
-func suppliedOpenAIUnsupportedParams(req *openai.ChatCompletionRequest) []string {
-	if req == nil {
-		return nil
-	}
-	var out []string
-	add := func(name string, supplied bool) {
-		if supplied {
-			out = append(out, name)
-		}
-	}
-	add("temperature", req.Temperature != nil)
-	add("top_p", req.TopP != nil)
-	add("max_tokens", req.MaxTokens != nil)
-	add("max_completion_tokens", req.MaxCompletionTokens != nil)
-	add("presence_penalty", req.PresencePenalty != nil)
-	add("frequency_penalty", req.FrequencyPenalty != nil)
-	add("stop", req.Stop != nil)
-	add("response_format", req.ResponseFormat != nil)
-	add("parallel_tool_calls", req.ParallelToolCalls != nil)
-	add("tool_choice", req.ToolChoice != nil)
-	add("user", req.User != "")
-	add("seed", req.Seed != nil)
-	add("logprobs", req.Logprobs != nil)
-	add("top_logprobs", req.TopLogprobs != nil)
-	add("logit_bias", len(req.LogitBias) > 0)
-	sort.Strings(out)
-	return out
-}
-
-// suppliedAnthropicUnsupportedParams returns the names of request fields the upstream agent cannot honour.
-//
-// @purpose Implements FR-14 for the Anthropic surface.
-// @rationale Same reasoning as the OpenAI variant; the caller must be able to see what was ignored.
-// @preconditions req must be non-nil.
-// @param req Decoded Anthropic request.
-// @returns Field names in ascending order.
-// @throws None.
-// @invariants O(1).
-func suppliedAnthropicUnsupportedParams(req *anthropic.MessageRequest) []string {
-	if req == nil {
-		return nil
-	}
-	var out []string
-	add := func(name string, supplied bool) {
-		if supplied {
-			out = append(out, name)
-		}
-	}
-	add("temperature", req.Temperature != nil)
-	add("top_p", req.TopP != nil)
-	add("top_k", req.TopK != nil)
-	add("metadata", req.Metadata != nil)
-	add("tool_choice", req.ToolChoice != nil)
-	sort.Strings(out)
-	return out
 }
 
 // openAIVisionRequest returns the first image-bearing content part, when present.

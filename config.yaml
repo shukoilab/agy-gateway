@@ -24,7 +24,7 @@ binaries:
 
 execution:
   # The ACP argv is fixed by the gateway (always --dangerously-skip-permissions) and the system
-  # prompt is always delivered append-only; neither is configurable.
+  # prompt is always delivered as the first prompt block; neither is configurable.
   vision_mode: "reject"         # reject|flatten - agy cannot process images
   clean_workspace_between_requests: true
   max_retries: 3
@@ -78,7 +78,6 @@ admin:
     loopback_replay_timeout: "15s"
 
 openai:
-  unsupported_param_policy: "strip_and_warn"
   default_model: "gemini-3.8-flash"
   default_reasoning_effort: "medium"
   expose_reasoning_content: true

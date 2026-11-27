@@ -241,3 +241,140 @@ func TestFailoverCoordinator_FailedInstallIsNotPublished(t *testing.T) {
 		}
 	}
 }
+
+// TestFailoverCoordinator_HealthyQuotaRefusalDoesNotCool covers S12: a 429 that arrives with no
+// output while the account still has measured capacity is a refusal, not exhaustion, so the
+// credential must stay usable.
+func TestFailoverCoordinator_HealthyQuotaRefusalDoesNotCool(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Execution.RetryInitialBackoff = 10 * time.Millisecond
+	cfg.Execution.RetryMaxBackoff = 20 * time.Millisecond
+	cfg.Accounts.MinRemainingQuotaPct = 50
+
+	authMgr := auth.NewManager(cfg, nil)
+	acc := auth.Account{
+		ID: "acc_primary", Email: "primary@example.com", Tier: "payg",
+		Status: auth.StatusHealthy, Enabled: true, QuotasKnown: true,
+		Quotas: map[string]auth.QuotaGroup{
+			"gemini": {Name: "Gemini Models", RemainingPct: 97.4},
+		},
+	}
+	authMgr.SetAccountsForTest([]auth.Account{acc})
+
+	p := &Pool{cfg: cfg, authMgr: authMgr, leaseCh: make(chan *Worker, 1)}
+	w0 := createMockWorker(t, 0, &acc, cfg)
+	p.leaseCh <- w0
+
+	fc := NewFailoverCoordinator(p, authMgr, nil)
+	err := fc.ExecuteWithFailover(context.Background(), "", false, 3, func(ctx context.Context, w *Worker) error {
+		return MarkZeroTokens(errors.New("upstream error: RESOURCE_EXHAUSTED (429 Too Many Requests)"))
+	})
+	if err == nil {
+		t.Fatal("a refusal must still surface to the caller")
+	}
+
+	for _, a := range authMgr.GetAccounts() {
+		if a.ID != "acc_primary" {
+			continue
+		}
+		if a.Status != auth.StatusHealthy {
+			t.Fatalf("healthy account must not be cooled, got status %v", a.Status)
+		}
+		if !a.CooldownUntil.IsZero() {
+			t.Fatalf("healthy account must not get a cooldown deadline, got %v", a.CooldownUntil)
+		}
+	}
+}
+
+// TestFailoverCoordinator_UnknownQuotaStillCools covers the complement of S12: when the account has
+// no measured quota there is no evidence of capacity, so the pre-existing penalty still applies.
+func TestFailoverCoordinator_UnknownQuotaStillCools(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.Execution.RetryInitialBackoff = 10 * time.Millisecond
+	cfg.Execution.RetryMaxBackoff = 20 * time.Millisecond
+
+	authMgr := auth.NewManager(cfg, nil)
+	acc := auth.Account{
+		ID: "acc_unknown", Email: "unknown@example.com", Tier: "payg",
+		Status: auth.StatusHealthy, Enabled: true, QuotasKnown: false,
+	}
+	authMgr.SetAccountsForTest([]auth.Account{acc})
+
+	p := &Pool{cfg: cfg, authMgr: authMgr, leaseCh: make(chan *Worker, 1)}
+	w0 := createMockWorker(t, 0, &acc, cfg)
+	p.leaseCh <- w0
+
+	fc := NewFailoverCoordinator(p, authMgr, nil)
+	_ = fc.ExecuteWithFailover(context.Background(), "", false, 1, func(ctx context.Context, w *Worker) error {
+		return MarkZeroTokens(errors.New("upstream error: RESOURCE_EXHAUSTED (429 Too Many Requests)"))
+	})
+
+	for _, a := range authMgr.GetAccounts() {
+		if a.ID != "acc_unknown" {
+			continue
+		}
+		if a.Status == auth.StatusHealthy && a.CooldownUntil.IsZero() {
+			t.Fatal("an account with no measured quota must still be cooled on a 429")
+		}
+	}
+}
+
+// TestKnownQuotaPct_ExhaustedBucketReportsZero covers S13 at the seam the guard reads: an exhausted
+// bucket must report zero so the threshold comparison cannot treat it as healthy. The pool already
+// refuses to lease such an account, so this is asserted on the helper rather than through failover.
+func TestKnownQuotaPct_ExhaustedBucketReportsZero(t *testing.T) {
+	cfg := config.DefaultConfig()
+	authMgr := auth.NewManager(cfg, nil)
+	authMgr.SetAccountsForTest([]auth.Account{
+		{
+			ID: "acc_exhausted", Email: "ex@example.com", Tier: "payg",
+			Status: auth.StatusHealthy, Enabled: true, QuotasKnown: true,
+			Quotas: map[string]auth.QuotaGroup{
+				"gemini": {Name: "Gemini Models", RemainingPct: 80, IsExhausted: true},
+			},
+		},
+		{
+			ID: "acc_healthy", Email: "ok@example.com", Tier: "payg",
+			Status: auth.StatusHealthy, Enabled: true, QuotasKnown: true,
+			Quotas: map[string]auth.QuotaGroup{
+				"gemini": {Name: "Gemini Models", RemainingPct: 97.4},
+				"3p":     {Name: "Claude Models", RemainingPct: 55.0},
+			},
+		},
+		{ID: "acc_unknown", Email: "u@example.com", Tier: "payg", Status: auth.StatusHealthy, Enabled: true},
+	})
+
+	if pct, known := authMgr.KnownQuotaPct("acc_exhausted"); !known || pct != 0 {
+		t.Fatalf("exhausted bucket must report (0, true), got (%v, %v)", pct, known)
+	}
+	if pct, known := authMgr.KnownQuotaPct("acc_healthy"); !known || pct != 55.0 {
+		t.Fatalf("must report the worst bucket, got (%v, %v)", pct, known)
+	}
+	if _, known := authMgr.KnownQuotaPct("acc_unknown"); known {
+		t.Fatal("unknown quota must report false so the caller falls back")
+	}
+	if _, known := authMgr.KnownQuotaPct(""); known {
+		t.Fatal("empty account id must report false")
+	}
+	if _, known := authMgr.KnownQuotaPct("acc_missing"); known {
+		t.Fatal("unknown account must report false")
+	}
+}
+
+// TestMarkZeroTokens_RoundTrip proves the marker preserves the original error for classification.
+func TestMarkZeroTokens_RoundTrip(t *testing.T) {
+	base := errors.New("boom")
+	marked := MarkZeroTokens(base)
+	if !IsZeroTokens(marked) {
+		t.Fatal("marked error must report zero tokens")
+	}
+	if !errors.Is(marked, base) {
+		t.Fatal("marker must unwrap to the original error")
+	}
+	if IsZeroTokens(base) {
+		t.Fatal("unmarked error must not report zero tokens")
+	}
+	if MarkZeroTokens(nil) != nil {
+		t.Fatal("nil must stay nil")
+	}
+}

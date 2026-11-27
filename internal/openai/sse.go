@@ -10,10 +10,26 @@ import (
 
 // SSEWriter coordinates thread-safe Server-Sent Events output.
 type SSEWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	mu      sync.Mutex
-	closed  bool
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	mu        sync.Mutex
+	closed    bool
+	committed bool
+}
+
+// Committed reports whether any byte has been flushed to the client.
+//
+// @purpose Lets a handler choose between an HTTP status error and an in-band SSE error without
+// guessing from its own bookkeeping.
+// @rationale The status line is sent implicitly by the first Flush, not by NewSSEWriter, so this
+// writer is the only place that knows the truth. A handler tracking "first content chunk" instead
+// produced `superfluous response.WriteHeader` whenever a keepalive had already committed the 200.
+// @returns true once a chunk, keepalive, error frame or [DONE] has been flushed.
+// @invariants Thread-safe; never resets.
+func (sw *SSEWriter) Committed() bool {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.committed
 }
 
 // NewSSEWriter initializes headers and flusher for streaming HTTP responses.
@@ -57,6 +73,7 @@ func (sw *SSEWriter) WriteChunk(chunk *ChatCompletionChunk) error {
 		return err
 	}
 	sw.flusher.Flush()
+	sw.committed = true
 	return nil
 }
 
@@ -74,6 +91,7 @@ func (sw *SSEWriter) WriteKeepalive() error {
 		return err
 	}
 	sw.flusher.Flush()
+	sw.committed = true
 	return nil
 }
 
@@ -98,6 +116,7 @@ func (sw *SSEWriter) WriteError(message, errType string) error {
 		return err
 	}
 	sw.flusher.Flush()
+	sw.committed = true
 	return nil
 }
 
@@ -116,5 +135,6 @@ func (sw *SSEWriter) Close() error {
 		return err
 	}
 	sw.flusher.Flush()
+	sw.committed = true
 	return nil
 }

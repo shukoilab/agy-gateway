@@ -11,11 +11,28 @@ import (
 //
 // @purpose Encapsulates the 7-stage streaming event protocol for Anthropic Claude clients.
 // @rationale Provides thread-safe, non-buffering flushing of message, content block, and ping events.
+// It deliberately does not write the status line: the first flushed event commits it, so a turn that
+// fails before any event can still answer with a truthful HTTP error.
 // @preconditions w must support http.Flusher.
 type SSEWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
-	mu      sync.Mutex
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	mu        sync.Mutex
+	committed bool
+}
+
+// Committed reports whether any event byte has been flushed to the client.
+//
+// @purpose Lets the handler distinguish "no event yet, a real HTTP error is still possible" from
+// "the stream is live, only an in-band error event remains".
+// @rationale NewSSEWriter used to call WriteHeader+Flush immediately, which made every later status
+// decision a `superfluous response.WriteHeader`.
+// @returns true once a single event has been flushed.
+// @invariants Thread-safe; never resets.
+func (sw *SSEWriter) Committed() bool {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.committed
 }
 
 // NewSSEWriter initializes a new Anthropic SSE writer and sets HTTP headers.
@@ -30,8 +47,6 @@ func NewSSEWriter(w http.ResponseWriter) (*SSEWriter, error) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("anthropic-version", "2023-06-01")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
 
 	return &SSEWriter{
 		w:       w,
@@ -54,6 +69,7 @@ func (sw *SSEWriter) writeEvent(eventName string, payload any) error {
 	}
 
 	sw.flusher.Flush()
+	sw.committed = true
 	return nil
 }
 

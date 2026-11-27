@@ -126,14 +126,6 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// FR-14: report or reject fields the agent cannot honour instead of dropping them silently.
-	if _, err := applyUnsupportedParamPolicy(suppliedAnthropicUnsupportedParams(&req), h.cfg.Anthropic.UnsupportedParamPolicy, w); err != nil {
-		field, _ := IsUnsupportedParam(err)
-		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
-			fmt.Sprintf("The parameter %q is not supported by the upstream agent", field))
-		return
-	}
-
 	delimiter := h.cfg.MCP.ClientToolCalling.DelimiterTag
 	if delimiter == "" {
 		delimiter = "tool_call"
@@ -348,6 +340,10 @@ func (h *AnthropicHandlers) handleStreaming(
 	textIndex := -1
 	thinkingIndex := -1
 	messageStarted := false
+	// Accumulates the current thinking block's text so its signature derives from its content: a
+	// constant signature (HMAC over "") is identical for every block in every turn, which client SDKs
+	// use to detect replayed or forged reasoning.
+	var thinkingBuf strings.Builder
 	promptTokens := estimateAnthropicPromptTokens(promptBlocks)
 
 	startMessage := func() {
@@ -361,7 +357,8 @@ func (h *AnthropicHandlers) handleStreaming(
 		if thinkingIndex < 0 {
 			return
 		}
-		sig := anthropic.GenerateThinkingSignature("")
+		sig := anthropic.GenerateThinkingSignature(thinkingBuf.String())
+		thinkingBuf.Reset()
 		_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{Type: "signature_delta", Signature: sig})
 		_ = sseWriter.WriteContentBlockStop(thinkingIndex)
 		thinkingIndex = -1
@@ -440,11 +437,13 @@ func (h *AnthropicHandlers) handleStreaming(
 		if thinkingIndex < 0 {
 			thinkingIndex = blockIndex
 			blockIndex++
+			thinkingBuf.Reset()
 			_ = sseWriter.WriteContentBlockStart(thinkingIndex, anthropic.ContentBlock{
 				Type:     "thinking",
 				Thinking: "",
 			})
 		}
+		thinkingBuf.WriteString(chunk)
 		_ = sseWriter.WriteContentBlockDelta(thinkingIndex, anthropic.ContentBlockDelta{
 			Type:     "thinking_delta",
 			Thinking: chunk,
@@ -466,7 +465,7 @@ func (h *AnthropicHandlers) handleStreaming(
 		})
 	}
 	in.OnInternalToolProgress = func(text string) {
-		if !h.cfg.Anthropic.ExposeReasoningContent {
+		if !h.cfg.Anthropic.ExposeReasoningContent && req.Thinking == nil {
 			return
 		}
 		streamMu.Lock()
@@ -528,7 +527,7 @@ func (h *AnthropicHandlers) handleStreaming(
 	})
 
 	if err != nil {
-		if !messageStartedPtr() {
+		if !sseWriter.Committed() {
 			h.writeAnthropicTurnError(w, err)
 			return
 		}
@@ -646,10 +645,6 @@ func estimateAnthropicPromptTokens(blocks []acp.PromptBlock) int {
 // @param err Executor error.
 // @invariants Writes exactly one response.
 func (h *AnthropicHandlers) writeAnthropicTurnError(w http.ResponseWriter, err error) {
-	if field, ok := IsUnsupportedParam(err); ok {
-		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "parameter "+field+" is not supported upstream")
-		return
-	}
 	if errors.Is(err, ErrFirstTokenTimeout) {
 		h.writeAnthropicError(w, http.StatusGatewayTimeout, "api_error", "time to first token exceeded")
 		return

@@ -17,84 +17,56 @@ import (
 	"agy-gateway/internal/pool"
 )
 
-func TestBuildACPSessionNewParams_AppendOnly(t *testing.T) {
+// TestBuildACPSessionNewParams_NeverCarriesPrompt proves session/new carries no prompt text at all,
+// and that the consumer prompt is delivered as a leading block instead (S4/S5 of the matrix). The
+// vendor append dialect is unreachable by construction: _meta does not exist as a field anymore.
+func TestBuildACPSessionNewParams_NeverCarriesPrompt(t *testing.T) {
 	cfg := config.DefaultConfig()
 	cfg.Server.Port = 8182
-	cfg.Execution.StrictClientToolDelegation = true
 
-	worker := &pool.Worker{
-		Cwd:          "/var/lib/agy-gateway/workspaces/w0",
-		Capabilities: acp.AgentCapabilities{SupportsVendorSystemPrompt: true},
-	}
+	worker := &pool.Worker{Cwd: "/var/lib/agy-gateway/workspaces/w0"}
 
-	// 1. Consumer prompt plus declared tools travel on the single append carrier.
 	params := buildACPSessionNewParams(SessionSetupInput{
 		Worker:               worker,
 		Config:               cfg,
-		ConsumerSystemPrompt: "You are OpenCode running on host.",
-		LoopbackSessionID:    "sess_abc123",
-		ClientToolNames:      []string{"read", "bash"},
+		ConsumerSystemPrompt: "OPERATOR PROMPT",
+		ClientToolNames:      []string{"read"},
 	})
-
-	agyMeta, ok := params.Meta["antigravity"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected antigravity meta map, got %+v", params.Meta)
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal session/new params: %v", err)
 	}
-	sysMap, ok := agyMeta["systemPrompt"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected systemPrompt meta map, got %+v", agyMeta)
+	if strings.Contains(string(raw), "_meta") {
+		t.Fatalf("session/new must never carry _meta, got %s", raw)
 	}
-	appended, ok := sysMap["append"].(string)
-	if !ok || appended == "" {
-		t.Fatalf("expected non-empty append systemPrompt, got %+v", sysMap)
-	}
-	if _, hasOverride := sysMap["override"]; hasOverride {
-		t.Fatalf("override must never be emitted; it hangs the agent turn")
-	}
-	if !strings.Contains(appended, "You are OpenCode running on host.") {
-		t.Fatalf("consumer prompt missing from append payload: %q", appended)
-	}
-	if !strings.Contains(appended, "mcp_client-tools_read") || !strings.Contains(appended, "mcp_client-tools_bash") {
-		t.Fatalf("delegation directive missing from append payload: %q", appended)
+	if strings.Contains(string(raw), "OPERATOR PROMPT") {
+		t.Fatalf("session/new must never carry the consumer prompt, got %s", raw)
 	}
 
-	// 2. Zero prompt injection: no default persona, no precedence banner.
-	if strings.Contains(appended, "AUTHORITATIVE SYSTEM INSTRUCTIONS") {
-		t.Fatalf("hardcoded precedence banner must never be injected: %q", appended)
-	}
-	if strings.Contains(appended, "Strict Language Mirroring") {
-		t.Fatalf("hardcoded default execution protocol must never be injected: %q", appended)
-	}
-
-	// 3. Empty consumer prompt omits _meta entirely rather than sending an empty payload.
-	emptyParams := buildACPSessionNewParams(SessionSetupInput{Worker: worker, Config: cfg})
-	if emptyParams.Meta != nil {
-		t.Fatalf("no prompt must mean no _meta, got %+v", emptyParams.Meta)
-	}
-
-	// 4. Whitespace-only prompt is treated as empty.
-	blankParams := buildACPSessionNewParams(SessionSetupInput{
-		Worker: worker, Config: cfg, ConsumerSystemPrompt: "   \n\t  ",
+	effective := effectiveSystemPrompt(SessionSetupInput{
+		Config:               cfg,
+		ConsumerSystemPrompt: "OPERATOR PROMPT",
+		ClientToolNames:      []string{"read"},
 	})
-	if blankParams.Meta != nil {
-		t.Fatalf("whitespace-only prompt must mean no _meta, got %+v", blankParams.Meta)
+	if !strings.Contains(effective, "OPERATOR PROMPT") ||
+		!strings.Contains(effective, "mcp_client-tools_read") {
+		t.Fatalf("effective prompt must carry the persona and the directive, got %q", effective)
 	}
 
-	// 5. Prompt without declared tools carries no delegation directive.
-	noTools := buildACPSessionNewParams(SessionSetupInput{
-		Worker: worker, Config: cfg, ConsumerSystemPrompt: "Plain prompt",
-	})
-	plain := noTools.Meta["antigravity"].(map[string]any)["systemPrompt"].(map[string]any)["append"].(string)
-	if plain != "Plain prompt" {
-		t.Fatalf("prompt without tools must be forwarded verbatim, got %q", plain)
+	blocks := prependPromptBlocks([]acp.PromptBlock{{Type: "text", Text: "user turn"}}, effective)
+	if len(blocks) != 2 {
+		t.Fatalf("expected persona block plus the user block, got %d", len(blocks))
+	}
+	if blocks[0].Type != "text" || !strings.Contains(blocks[0].Text, "OPERATOR PROMPT") {
+		t.Fatalf("persona must be the first block, got %+v", blocks[0])
+	}
+	if blocks[1].Text != "user turn" {
+		t.Fatalf("user block must be preserved last, got %+v", blocks[1])
 	}
 
-	// 6. The loopback MCP server entry is still wired.
-	if len(params.MCPServers) != 1 || params.MCPServers[0].Name != "client-tools" {
-		t.Fatalf("expected client-tools MCPServer entry, got %+v", params.MCPServers)
-	}
-	if params.MCPServers[0].Env == nil {
-		t.Fatalf("expected non-nil empty Env slice on stdio MCPServerInfo")
+	// Empty persona must leave the blocks untouched (including nil).
+	if got := prependPromptBlocks(nil, "   "); got != nil {
+		t.Fatalf("blank prompt must not prepend a block, got %+v", got)
 	}
 }
 
@@ -116,25 +88,6 @@ func TestToolNameExtractionHelpers(t *testing.T) {
 	defs, anNames := convertAnthropicTools(anTools)
 	if len(defs) != 2 || len(anNames) != 2 || anNames[0] != "glob" || anNames[1] != "edit" {
 		t.Fatalf("unexpected Anthropic converted tools/names: %v %v", defs, anNames)
-	}
-}
-
-// TestBuildACPSessionNewParams_UnadvertisedChannelStillSends proves the gateway does not silently
-// drop a consumer prompt just because the agent failed to advertise the append capability. The
-// warning is emitted at worker start; the payload itself is unchanged.
-func TestBuildACPSessionNewParams_UnadvertisedChannelStillSends(t *testing.T) {
-	cfg := config.DefaultConfig()
-	silent := &pool.Worker{Cwd: "/var/lib/agy-gateway/workspaces/w0"}
-
-	params := buildACPSessionNewParams(SessionSetupInput{
-		Worker: silent, Config: cfg, ConsumerSystemPrompt: "OPERATOR PROMPT",
-	})
-	agy, ok := params.Meta["antigravity"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected antigravity meta even for an unadvertised channel, got %+v", params.Meta)
-	}
-	if agy["systemPrompt"].(map[string]any)["append"] != "OPERATOR PROMPT" {
-		t.Fatalf("consumer prompt must be forwarded verbatim, got %+v", agy["systemPrompt"])
 	}
 }
 

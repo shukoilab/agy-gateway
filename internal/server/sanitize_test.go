@@ -30,7 +30,6 @@ func TestClientErrorKindNeverEchoesUpstreamText(t *testing.T) {
 		{context.Canceled, "inference_cancelled"},
 		{context.DeadlineExceeded, "inference_cancelled"},
 		{ErrFirstTokenTimeout, "first_token_timeout"},
-		{&UnsupportedParamError{Field: "temperature"}, "unsupported_parameter"},
 		{&acp.ResponseError{Code: acp.ErrCodeAuthRequired, Message: secret}, "account_auth_required"},
 		{&acp.ResponseError{Code: acp.ErrCodeInvalidParams, Message: secret}, "invalid_params"},
 	}
