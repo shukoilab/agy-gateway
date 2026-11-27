@@ -101,6 +101,11 @@ type ExecutionConfig struct {
 	MaxRetries                    int           `yaml:"max_retries"`
 	RetryInitialBackoff           time.Duration `yaml:"retry_initial_backoff"`
 	RetryMaxBackoff               time.Duration `yaml:"retry_max_backoff"`
+	// MaxHistoryTokens bounds the conversational history forwarded to the agent per turn. Above
+	// ~100K estimated tokens the agent stops converging and re-issues the same tool calls, so once
+	// the rendered prompt exceeds this budget the middle turns are dropped while the opening turn
+	// and the newest turns are kept. 0 disables the bound.
+	MaxHistoryTokens int `yaml:"max_history_tokens"`
 }
 
 type StorageConfig struct {
@@ -339,6 +344,7 @@ func DefaultConfig() *Config {
 			MaxRetries:                    3,
 			RetryInitialBackoff:           500 * time.Millisecond,
 			RetryMaxBackoff:               10 * time.Second,
+			MaxHistoryTokens:              60000,
 		},
 		Storage: StorageConfig{
 			BaseDataDir:       "/var/lib/agy-gateway",
@@ -753,6 +759,11 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	if v := os.Getenv("AGY_GW_STRICT_CLIENT_TOOL_DELEGATION"); v != "" {
 		cfg.Execution.StrictClientToolDelegation = parseBoolEnv(v, cfg.Execution.StrictClientToolDelegation)
 	}
+	if v := os.Getenv("AGY_GW_MAX_HISTORY_TOKENS"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			cfg.Execution.MaxHistoryTokens = n
+		}
+	}
 
 	// 5. OpenAI & Models Overrides
 	if v := getFirstEnv("AGY_GW_DEFAULT_MODEL", "DEFAULT_MODEL"); v != "" {
@@ -1066,6 +1077,9 @@ func validate(cfg *Config) error {
 	if !validVisionMode(cfg.Execution.VisionMode) {
 		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",
 			visionModes, cfg.Execution.VisionMode)
+	}
+	if cfg.Execution.MaxHistoryTokens < 0 {
+		return fmt.Errorf("execution.max_history_tokens must be >= 0, got %d", cfg.Execution.MaxHistoryTokens)
 	}
 	if cfg.MCP.ClientToolCalling.MaxClientTools <= 0 || cfg.MCP.ClientToolCalling.MaxClientTools > 1024 {
 		return fmt.Errorf("mcp.client_tool_calling.max_client_tools must be between 1 and 1024, got %d",

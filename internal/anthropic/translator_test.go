@@ -117,3 +117,46 @@ func TestTranslator_SingleUserFastPath(t *testing.T) {
 		t.Fatalf("unexpected promptBlocks: %+v", promptBlocks)
 	}
 }
+
+// TestTranslator_ToolUseCarriesMatchingID asserts the historical assistant tool_use declares the
+// same id as its tool_result, so the model can tell executed calls from proposed ones.
+func TestTranslator_ToolUseCarriesMatchingID(t *testing.T) {
+	translator := anthropic.NewTranslator()
+
+	req := &anthropic.MessageRequest{
+		Model: "claude-sonnet-4-6",
+		Messages: []anthropic.Message{
+			{Role: "user", Content: anthropic.MessageContent{
+				Blocks: []anthropic.ContentBlock{{Type: "text", Text: "list files"}},
+			}},
+			{Role: "assistant", Content: anthropic.MessageContent{
+				Blocks: []anthropic.ContentBlock{{
+					Type:  "tool_use",
+					ID:    "toolu_abc123",
+					Name:  "terminal",
+					Input: json.RawMessage(`{"command":"ls"}`),
+				}},
+			}},
+			{Role: "user", Content: anthropic.MessageContent{
+				Blocks: []anthropic.ContentBlock{{
+					Type:      "tool_result",
+					ToolUseID: "toolu_abc123",
+					Content:   "a.go\nb.go",
+				}},
+			}},
+		},
+	}
+
+	_, blocks := translator.Translate(req, "tool_call")
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d", len(blocks))
+	}
+	prompt := blocks[0].Text
+
+	if !strings.Contains(prompt, "[Assistant called tool terminal (id: toolu_abc123) with arguments:") {
+		t.Fatalf("assistant tool_use does not carry its id:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Tool Output (id: toolu_abc123):") {
+		t.Fatalf("tool_result id missing:\n%s", prompt)
+	}
+}

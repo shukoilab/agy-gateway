@@ -57,6 +57,7 @@ This project explores a sustainable, standards-compliant alternative:
 The gateway is a **provider endpoint, not an agent harness**: the agent always runs as `agy acp --dangerously-skip-permissions`, so no turn is ever blocked behind an approval prompt, and this posture is not configurable. The consumer system prompt is forwarded verbatim and prepended as the first prompt block — the gateway injects no persona, no default protocol, and no precedence banner, and prepends nothing when the consumer supplies no prompt. Whether a turn is read-only (plan) or write-enabled (build) is therefore decided purely by the consumer system prompt, exactly as with any other model provider.
 3. **Multi-Account Resilience**: A centralized vault monitors live quota limits directly via official usage reports (`agy-auth usage --all`), managing 5-hour rolling windows and weekly quota ceilings with proactive standby rotation.
 4. **Drop-in Compatibility**: Exposes standards-compliant REST endpoints for both `/v1/chat/completions` and `/v1/messages`, enabling developers to benchmark models like Gemini 3.8 Flash (supporting up to 1M+ token context windows) using existing tooling.
+5. **Fidelity-Safe History Rendering**: Conversational history is flattened into that single prompt block because ACP has no structured transcript field, so the rendering must preserve the semantics the model relies on. Every historical assistant tool call carries the same `id` as its matching tool result, which is what lets the agent tell an already-executed call from a proposed one. The rendered history is also bounded by `execution.max_history_tokens` (default `60000` estimated tokens): beyond ~100K tokens `agy` stops converging and re-issues the same tool calls indefinitely, so when the budget is exceeded the middle turns are dropped while the opening turn (the task statement) and the newest instructions and file contents are kept intact.
 
 ---
 
@@ -237,6 +238,7 @@ The gateway follows standard 12-factor configuration principles. Key variables:
 | `AGY_GW_AUTO_UPDATE_INTERVAL` | `6h` | Cron check duration (`1h`, `6h`, `24h`) |
 | `AGY_GW_AUTO_UPDATE_ON_STARTUP` | `true` | Run initial update check immediately on boot |
 | `AGY_GW_AUTO_UPDATE_BIN_DIR` | `/var/lib/agy-gateway/bin` | Destination directory for non-root binary installation |
+| `AGY_GW_MAX_HISTORY_TOKENS` | `60000` | Estimated-token budget for the conversation history forwarded to `agy` per turn (`0` disables it). Beyond the budget the middle turns are dropped while the opening turn and the newest turns are kept, so long agentic sessions keep converging instead of repeating tool calls. |
 
 ### Optional Outbound HTTP/HTTPS Proxy
 

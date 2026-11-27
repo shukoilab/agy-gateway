@@ -30,6 +30,11 @@ execution:
   max_retries: 3
   retry_initial_backoff: "500ms"
   retry_max_backoff: "10s"
+  # Bound on the conversation history forwarded to agy per turn (estimated tokens, ~4 chars each).
+  # Above ~100K tokens the agent stops converging and repeats the same tool calls, so once the
+  # rendered prompt exceeds this budget the middle turns are dropped: the opening turn and the most
+  # recent turns are always kept. 0 disables the bound.
+  max_history_tokens: 60000
 
 storage:
   base_data_dir: "/var/lib/agy-gateway"

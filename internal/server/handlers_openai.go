@@ -57,7 +57,7 @@ func NewOpenAIHandlers(
 		failover:       failover,
 		modelRegistry:  modelRegistry,
 		loopbackServer: loopbackServer,
-		translator:     openai.NewTranslator(),
+		translator:     openai.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens),
 		logger:         logger,
 	}
 }

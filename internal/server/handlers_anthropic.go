@@ -61,7 +61,7 @@ func NewAnthropicHandlers(
 		failover:       failover,
 		modelRegistry:  modelRegistry,
 		loopbackServer: loopbackServer,
-		translator:     anthropic.NewTranslator(),
+		translator:     anthropic.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens),
 		logger:         logger.With("component", "anthropic-handlers"),
 	}
 }

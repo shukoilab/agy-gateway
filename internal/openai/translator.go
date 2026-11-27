@@ -14,11 +14,23 @@ import (
 // All tool capabilities are registered natively in ACP session/new via LoopbackServer and mcpServers.
 // @preconditions req must be non-nil.
 // @invariants Thread-safe, pure deterministic transformation.
-type Translator struct{}
+type Translator struct {
+	// maxHistoryTokens bounds the rendered history; 0 disables the bound.
+	maxHistoryTokens int
+}
 
-// NewTranslator creates an initialized Translator.
+// NewTranslator creates an initialized Translator with history bounding disabled.
 func NewTranslator() *Translator {
 	return &Translator{}
+}
+
+// NewTranslatorWithBudget creates a Translator that bounds rendered history to maxHistoryTokens.
+//
+// @purpose Prevents pathological client histories from collapsing the agent into tool-call loops.
+// @param maxHistoryTokens estimated-token budget; <= 0 disables the bound.
+// @returns a Translator ready for concurrent use.
+func NewTranslatorWithBudget(maxHistoryTokens int) *Translator {
+	return &Translator{maxHistoryTokens: maxHistoryTokens}
 }
 
 // cleanToolOutputContent strips any legacy duplicate turn headers or wrapper markers from tool result text.
@@ -50,6 +62,24 @@ func cleanToolOutputContent(content, toolCallID string) string {
 		s = strings.TrimSpace(strings.TrimPrefix(s, "Tool Error:"))
 	}
 	return s
+}
+
+// newestToolResultIndexes returns the indexes of the newest tool-result messages.
+//
+// @purpose Marks the tool results the agent must see verbatim so compaction never touches them.
+// @rationale The last few results are the evidence the current turn is reasoning over; truncating
+// them recreates the "cannot see what I just did" failure the history budget exists to prevent.
+// @param msgs the non-system conversation messages.
+// @returns a set of indexes into msgs, holding up to acp.KeepIntactToolResults entries.
+// @invariants Scans at most len(msgs) messages and never includes a non-tool role.
+func newestToolResultIndexes(msgs []ChatMessage) map[int]struct{} {
+	out := make(map[int]struct{}, acp.KeepIntactToolResults)
+	for i := len(msgs) - 1; i >= 0 && len(out) < acp.KeepIntactToolResults; i-- {
+		if strings.ToLower(msgs[i].Role) == "tool" {
+			out[i] = struct{}{}
+		}
+	}
+	return out
 }
 
 // Translate extracts pure system instructions and formats conversational history into standard ACP prompt blocks.
@@ -90,6 +120,11 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 	}
 
 	// 3. Multi-turn conversational history
+	// Identify the newest tool results: they are what the agent needs to continue, so they are
+	// never compacted even when older, oversized results exhaust the budget.
+	intactToolIdx := newestToolResultIndexes(nonSysMessages)
+	toolCap := acp.ToolResultCharsCap(t.maxHistoryTokens)
+
 	var historyBuilder strings.Builder
 	for i := 0; i < len(nonSysMessages); i++ {
 		msg := nonSysMessages[i]
@@ -114,7 +149,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 			if len(msg.ToolCalls) > 0 {
 				var calls []string
 				for _, tc := range msg.ToolCalls {
-					calls = append(calls, fmt.Sprintf("[Assistant called tool %s with arguments: %s]", tc.Function.Name, tc.Function.Arguments))
+					calls = append(calls, fmt.Sprintf("[Assistant called tool %s (id: %s) with arguments: %s]", tc.Function.Name, tc.ID, tc.Function.Arguments))
 				}
 				if content != "" {
 					fmt.Fprintf(&historyBuilder, "Assistant: %s\n%s\n\n", content, strings.Join(calls, "\n"))
@@ -126,6 +161,9 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 			}
 		case "tool":
 			cleaned := cleanToolOutputContent(content, msg.ToolCallID)
+			if _, intact := intactToolIdx[i]; !intact {
+				cleaned = acp.CompactToolOutput(cleaned, toolCap)
+			}
 			currHistory := strings.TrimSpace(historyBuilder.String())
 			if !strings.HasSuffix(currHistory, "[Tool Execution Results]") {
 				if i == 0 || strings.ToLower(nonSysMessages[i-1].Role) != "tool" {
@@ -147,6 +185,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}
+	finalPrompt = acp.BoundPrompt(finalPrompt, t.maxHistoryTokens)
 
 	return systemPrompt, []acp.PromptBlock{
 		{

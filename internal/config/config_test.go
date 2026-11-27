@@ -60,6 +60,67 @@ openai:
 	}
 }
 
+// TestConfigMaxHistoryTokens verifies the history budget knob is wired end to end.
+//
+// @purpose Guards the fix that stops unbounded histories from collapsing the agent into tool loops.
+// @preconditions ExecutionConfig exposes max_history_tokens with a non-negative invariant.
+// @invariants A negative value is rejected by validation; the env override wins over the default.
+func TestConfigMaxHistoryTokens(t *testing.T) {
+	if got := DefaultConfig().Execution.MaxHistoryTokens; got != 60000 {
+		t.Fatalf("expected default max_history_tokens 60000, got %d", got)
+	}
+
+	_ = os.Setenv("AGY_GW_MAX_HISTORY_TOKENS", "12345")
+	defer func() { _ = os.Unsetenv("AGY_GW_MAX_HISTORY_TOKENS") }()
+
+	tmpDir := t.TempDir()
+	configFile := tmpDir + "/test_config.yaml"
+	content := `
+server:
+  port: 9090
+binaries:
+  agy_path: "/usr/local/bin/agy"
+  agy_min_version: "1.5.16"
+  agy_auth_path: "/usr/local/bin/agy-auth"
+execution:
+  vision_mode: "reject"
+  max_history_tokens: 40000
+pool:
+  worker_count: 2
+`
+	if err := os.WriteFile(configFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+	cfg, err := Load(configFile)
+	if err != nil {
+		t.Fatalf("failed to load valid config: %v", err)
+	}
+	if cfg.Execution.MaxHistoryTokens != 12345 {
+		t.Errorf("expected env override 12345, got %d", cfg.Execution.MaxHistoryTokens)
+	}
+
+	_ = os.Unsetenv("AGY_GW_MAX_HISTORY_TOKENS")
+	negative := tmpDir + "/negative_config.yaml"
+	bad := `
+server:
+  port: 9090
+binaries:
+  agy_path: "/usr/local/bin/agy"
+  agy_min_version: "1.5.16"
+  agy_auth_path: "/usr/local/bin/agy-auth"
+execution:
+  max_history_tokens: -1
+pool:
+  worker_count: 2
+`
+	if err := os.WriteFile(negative, []byte(bad), 0644); err != nil {
+		t.Fatalf("failed to write negative config: %v", err)
+	}
+	if _, err := Load(negative); err == nil {
+		t.Fatal("expected validation error for negative max_history_tokens, got nil")
+	}
+}
+
 func TestConfigEnvOverridesAndDefaults(t *testing.T) {
 	// 1. Set various 12-factor environment variables
 	_ = os.Setenv("PORT", "7777")

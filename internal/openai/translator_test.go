@@ -111,3 +111,69 @@ func TestTranslator_ToolExecutionResultsGrouping(t *testing.T) {
 		t.Fatalf("unexpected injected directive in prompt:\n%s", prompt)
 	}
 }
+
+// TestTranslator_ToolCallCarriesMatchingID asserts the historical assistant tool call
+// declares the same id as its result. Without it the model cannot tell executed calls from
+// proposed ones and loops re-issuing the same probe (see the harness loop regression).
+func TestTranslator_ToolCallCarriesMatchingID(t *testing.T) {
+	translator := NewTranslator()
+
+	req := &ChatCompletionRequest{
+		Model: "gemini-3.8-flash-low",
+		Messages: []ChatMessage{
+			{Role: "user", Content: "list files"},
+			{
+				Role: "assistant",
+				ToolCalls: []ToolCall{
+					{ID: "call_abc123", Type: "function", Function: FunctionCallData{
+						Name: "terminal", Arguments: `{"command":"ls"}`,
+					}},
+				},
+			},
+			{Role: "tool", ToolCallID: "call_abc123", Content: "a.go\nb.go"},
+		},
+	}
+
+	_, blocks := translator.Translate(req, "tool_call")
+	if len(blocks) != 1 {
+		t.Fatalf("expected 1 block, got %d", len(blocks))
+	}
+	prompt := blocks[0].Text
+
+	if !strings.Contains(prompt, "[Assistant called tool terminal (id: call_abc123) with arguments:") {
+		t.Fatalf("assistant tool call does not carry its id:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Tool Output (id: call_abc123):") {
+		t.Fatalf("tool result id missing:\n%s", prompt)
+	}
+}
+
+// TestTranslator_HistoryBudgetDropsOldestTurns asserts the budget bound is applied.
+func TestTranslator_HistoryBudgetDropsOldestTurns(t *testing.T) {
+	translator := NewTranslatorWithBudget(200)
+
+	msgs := []ChatMessage{{Role: "user", Content: "BEGINNING OF CONVERSATION"}}
+	for i := 0; i < 400; i++ {
+		msgs = append(msgs,
+			ChatMessage{Role: "user", Content: strings.Repeat("padding ", 20)},
+			ChatMessage{Role: "assistant", Content: strings.Repeat("reply ", 20)},
+		)
+	}
+	msgs = append(msgs, ChatMessage{Role: "user", Content: "FINAL QUESTION"})
+
+	_, blocks := translator.Translate(&ChatCompletionRequest{Model: "m", Messages: msgs}, "tool_call")
+	prompt := blocks[0].Text
+
+	if !strings.Contains(prompt, "BEGINNING OF CONVERSATION") {
+		t.Fatal("budget must preserve the opening objective")
+	}
+	if !strings.Contains(prompt, "FINAL QUESTION") {
+		t.Fatal("budget dropped the newest turn")
+	}
+	if !strings.Contains(prompt, "[Earlier conversation omitted") {
+		t.Fatal("budget must mark the omission")
+	}
+	if len(prompt) >= 200*4*3 {
+		t.Fatalf("bounded prompt still oversized: ~%d tokens", len(prompt)/4)
+	}
+}
