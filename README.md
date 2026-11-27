@@ -126,7 +126,13 @@ AGY_GW_CLIENT_KEY_1=sk-antigravity-dev-test
 ```bash
 docker compose up -d
 ```
-Verify that the service is running and healthy:
+A fresh install boots with an **empty vault**, so the container starts and stays up in
+onboarding-only mode: the HTTP server, admin API, and `/healthz` are live, `/readyz` reports
+`not_ready` with zero workers, and inference answers `429 no_accounts` until an account is added.
+That is deliberate — the onboarding CLI runs *inside* this container, so a container that exited
+could never be onboarded.
+
+Verify that the process is alive:
 ```bash
 curl -f http://localhost:8080/healthz
 # Returns: {"status":"healthy"}
@@ -141,6 +147,10 @@ docker exec -it agy-gateway agy-accounts
 2. Open the displayed Google OAuth authorization URL in your browser.
 3. Sign in and paste the resulting redirect URL or code back into the terminal.
 4. Your account is saved to the encrypted vault and immediately available for inference.
+
+No restart is needed: the pool provisions its workers on the first request after an account
+appears, and model discovery re-runs at the same moment. `curl http://localhost:8080/readyz`
+flips to `ready` once the workers are warm.
 
 ---
 
@@ -384,6 +394,11 @@ The gateway treats each stored account as an independent quota source and binds 
 | Every account cooling or ineligible | `429` | `all_accounts_cooling` | Earliest cooldown expiry |
 | Vault holds no accounts | `429` | `no_accounts` | omitted |
 | Agent ended the turn with no output | `502` | `empty_completion` | omitted |
+
+The `no_accounts` row is what a fresh install returns: the gateway boots and serves HTTP with an
+empty vault instead of exiting, so the container stays up long enough to run `agy-accounts` inside
+it. Workers are provisioned and model discovery re-runs on the first request after an account is
+added, so no restart is needed.
 
 The last row matters: `agy` reports an internally exhausted quota as a successful `end_turn` with no content. Reporting `200` there would claim that work happened when it did not, so it is surfaced as a retryable `502` instead.
 

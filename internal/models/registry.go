@@ -48,6 +48,14 @@ type ModelRegistry struct {
 	modelList       []openai.ModelObject
 	champions       map[string]*ModelInfo
 	lastSync        time.Time
+	// syncedAccountCount is the account count observed by the last successful discovery.
+	//
+	// @purpose Lets a request notice that accounts were onboarded after boot.
+	// @rationale A fresh install boots with an empty vault, so discovery finds nothing; the operator
+	// then runs the onboarding CLI as a separate process. Without a re-sync on that transition the
+	// catalog stays empty and every request answers model_not_found long after the account exists.
+	// @invariants Written under mu in SyncModels; read under mu.
+	syncedAccountCount int
 }
 
 // NewModelRegistry initializes a new dynamic ModelRegistry.
@@ -204,7 +212,7 @@ func (mr *ModelRegistry) SyncModels(ctx context.Context) error {
 	// If discovery succeeded, update internal cache
 	if len(discovered) > 0 {
 		mr.models = discovered
-
+		mr.syncedAccountCount = len(accounts)
 		// Build sorted OpenAI model list
 		list := make([]openai.ModelObject, 0, len(discovered))
 		for _, m := range discovered {
@@ -244,6 +252,62 @@ func (mr *ModelRegistry) SyncModels(ctx context.Context) error {
 
 	mr.logger.Warn("no models discovered from accounts; registry unchanged")
 	return nil
+}
+
+// NeedsOnboarding reports that the gateway has neither accounts nor a model catalog.
+//
+// @purpose Lets the HTTP surfaces answer "not set up yet" instead of "unknown model".
+// @rationale A fresh install has an empty vault and therefore an empty catalog; reporting
+// model_not_found there sends the operator looking for a typo instead of running onboarding. A
+// registry that already knows models must never take this path, so a mismatch between a stale vault
+// read and a live catalog can never turn a valid request into a 429.
+// @preconditions None.
+// @returns True when no account is stored and no model is registered.
+// @throws None.
+// @invariants O(1); never true once a model has been discovered.
+func (mr *ModelRegistry) NeedsOnboarding() bool {
+	if mr.authMgr != nil && len(mr.authMgr.GetAccounts()) > 0 {
+		return false
+	}
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return len(mr.models) == 0
+}
+
+// RefreshIfAccountsChanged re-runs discovery when the vault gained accounts since the last sync.
+//
+// @purpose Makes an account onboarded after boot usable without restarting the gateway.
+// @rationale A fresh install starts with an empty vault, so boot-time discovery finds no models and
+// every request would answer model_not_found even after the operator ran the onboarding CLI. The
+// account count is the cheap signal that onboarding happened.
+// @preconditions ctx is the caller's request context.
+// @param ctx Cancellation root for the discovery subprocess.
+// @returns None; a discovery failure is logged and leaves the previous catalog intact.
+// @throws None.
+// @invariants O(1) with no subprocess when the account count is unchanged.
+func (mr *ModelRegistry) RefreshIfAccountsChanged(ctx context.Context) {
+	if mr.authMgr == nil {
+		return
+	}
+	// The onboarding CLI is a separate process, so the account slice in memory is stale after it
+	// runs. Re-read the vault only while it still looks empty: that is the onboarding transition, and
+	// it keeps the steady state free of an extra subprocess on every request.
+	if len(mr.authMgr.GetAccounts()) == 0 {
+		if err := mr.authMgr.Sync(ctx); err != nil {
+			mr.logger.Debug("vault re-read failed while awaiting onboarding", "err", err)
+			return
+		}
+	}
+
+	mr.mu.RLock()
+	synced := mr.syncedAccountCount
+	mr.mu.RUnlock()
+	if len(mr.authMgr.GetAccounts()) == synced {
+		return
+	}
+	if err := mr.SyncModels(ctx); err != nil {
+		mr.logger.Warn("model discovery after onboarding failed", "err", err)
+	}
 }
 
 // ListModels returns a slice of ModelObject schemas 100% compliant with OpenAI.

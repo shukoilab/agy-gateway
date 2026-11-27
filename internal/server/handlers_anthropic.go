@@ -101,6 +101,20 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 		req.Model = h.modelRegistry.AnthropicDefaultModel()
 	}
 
+	// A fresh install has an empty vault and therefore an empty catalog; say so instead of reporting
+	// an unknown model. Once an account appears this also picks up its models without a restart.
+	// Bootstrap the pool first: provisioning a worker is what materialises its credential, and model
+	// discovery reads that credential. Discovering before provisioning found nothing on a fresh
+	// install, so onboarding looked like it had failed.
+	if h.pool.Bootstrap(r.Context()) {
+		h.modelRegistry.RefreshIfAccountsChanged(r.Context())
+	}
+	if h.modelRegistry.NeedsOnboarding() {
+		h.writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
+			"no Antigravity accounts are configured (code: no_accounts); an administrator must add one")
+		return
+	}
+
 	modelEntry, found := h.modelRegistry.FindModel(req.Model)
 	if !found {
 		h.writeAnthropicError(w, http.StatusNotFound, "not_found_error", fmt.Sprintf("The model %q does not exist", req.Model))

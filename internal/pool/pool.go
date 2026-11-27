@@ -45,6 +45,21 @@ type Pool struct {
 	// costs one uncontended lock per publish and makes the write a true compare-and-swap.
 	// @invariants Never acquired while holding `mu`; never held across IO other than the bindings file.
 	bindingsMu sync.Mutex
+
+	// initMu serialises lazy worker bootstrapping for a pool that started with an empty vault.
+	//
+	// @purpose Lets an account added after boot take effect without restarting the container.
+	// @rationale A fresh install boots with no accounts (see initWorkers); the first request that
+	// arrives after `agy-accounts add` must create the workers, and exactly one caller may do it.
+	// @invariants Never acquired while holding `mu`; initWorkers takes `mu` itself.
+	initMu sync.Mutex
+
+	// booted reports that initWorkers created the worker set; false means the vault was empty at boot.
+	//
+	// @purpose Distinguishes "no workers because the vault is empty" from "no workers because of a fault".
+	// @rationale Drives the lazy bootstrap in ensureWorkers without re-provisioning on every request.
+	// @invariants Written under initMu; read under initMu.
+	booted bool
 }
 
 // NewPool initializes and starts the worker pool.
@@ -94,6 +109,26 @@ func NewTestPoolWithNoWorkers(cfg *config.Config) *Pool {
 	return &Pool{cfg: cfg, leaseCh: make(chan *Worker)}
 }
 
+// workerSnapshot returns a copy of the live worker slice under the pool lock.
+//
+// @purpose Lets callers iterate the worker set without racing a concurrent bootstrap.
+// @rationale initWorkers can now run from a request path (see ensureWorkers), which replaces the
+// slice wholesale; iterating the field directly would read it while another goroutine swaps it.
+// @preconditions None.
+// @returns The current workers; an empty slice when the pool has none.
+// @throws None.
+// @invariants O(len(workers)); the returned slice is never mutated afterwards.
+func (p *Pool) workerSnapshot() []*Worker {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.workers == nil {
+		return nil
+	}
+	out := make([]*Worker, len(p.workers))
+	copy(out, p.workers)
+	return out
+}
+
 func (p *Pool) log() *slog.Logger {
 	if p.logger == nil {
 		return slog.Default()
@@ -104,10 +139,34 @@ func (p *Pool) log() *slog.Logger {
 func (p *Pool) initWorkers(ctx context.Context) error {
 	accounts := p.authMgr.GetAccounts()
 	if len(accounts) == 0 {
-		return fmt.Errorf("no accounts are stored in the vault; run `agy-auth login` before starting the gateway")
+		// A fresh installation has an empty vault, and the only way to fill it is to run the
+		// onboarding CLI inside this container. Failing here made the container exit, so
+		// `restart: unless-stopped` turned it into a crash loop and the very command the operator
+		// needs (`docker exec -it agy-gateway agy-accounts`) could never be run: the install was
+		// permanently unbootable. Boot with zero workers instead; inference answers `no_accounts`
+		// (429) and the pool grows itself on the first request after an account is added.
+		p.log().Warn("vault holds no accounts; starting in onboarding-only mode: HTTP is up and inference " +
+			"answers no_accounts until one is added with `agy-accounts add`")
+		// Drop the phantom slots so Availability/readyz report zero workers; ensureWorkers re-allocates
+		// when an account appears.
+		p.mu.Lock()
+		p.workers = make([]*Worker, 0)
+		p.mu.Unlock()
+		return nil
 	}
 
+	p.mu.Lock()
+	if len(p.workers) != p.cfg.Pool.WorkerCount {
+		p.workers = make([]*Worker, p.cfg.Pool.WorkerCount)
+	}
+	p.mu.Unlock()
+
 	assignments := p.assignAccounts(accounts, p.cfg.Pool.WorkerCount)
+
+	// Build the set locally and publish it in one assignment: initWorkers can now run from a request
+	// path (see ensureWorkers), so a partially filled slice must never be visible to a concurrent
+	// reader. Readers still take p.mu; see reconcileBindings and accountsInUse.
+	workers := make([]*Worker, p.cfg.Pool.WorkerCount)
 
 	for i := 0; i < p.cfg.Pool.WorkerCount; i++ {
 		acc := assignments[i]
@@ -118,7 +177,7 @@ func (p *Pool) initWorkers(ctx context.Context) error {
 
 		boundAcc := acc
 		w := NewWorker(i, homeDir, tmpDir, cwd, &boundAcc, p.cfg, p.logger)
-		p.workers[i] = w
+		workers[i] = w
 		// The startup binding is reconciled once, after this loop. It must NOT be stamped here:
 		// `MarkAccountBinding(acc.ID, i)` per iteration makes the field last-writer-wins, so a shared
 		// account boots owned by its HIGHEST holder ({0,2} ⇒ 2) instead of by the reconciled lowest
@@ -135,11 +194,74 @@ func (p *Pool) initWorkers(ctx context.Context) error {
 		}(w)
 	}
 
+	// Publish the complete set in one assignment, then reconcile: boot-time binding ownership must be
+	// lowest-id-wins, which requires the whole set to be visible first.
+	p.mu.Lock()
+	p.workers = workers
+	p.mu.Unlock()
+
 	// One reconciliation for the whole boot: deterministic lowest-id ownership for any account shared
 	// by several workers, and `assigned_worker` truthful before the first lease.
 	p.reconcileBindings()
 
+	// Unsynchronised on purpose: callers are either the single-threaded boot path or ensureWorkers,
+	// which holds initMu for the whole call.
+	p.booted = true
 	return nil
+}
+
+// Bootstrap brings the pool up for a deployment that started with an empty vault.
+//
+// @purpose Makes an account onboarded after boot usable, including its models, without a restart.
+// @rationale The onboarding CLI is a separate process, so the in-memory account set is stale after it
+// runs. Re-reading the vault and provisioning the workers here is what lets the first request after
+// `agy-accounts add` succeed; provisioning also materialises each worker's credential, which is what
+// model discovery reads its token from.
+// @preconditions Caller must not hold any pool lock.
+// @param ctx Cancellation root for the vault read and worker provisioning.
+// @returns True when the vault holds at least one account after bootstrapping.
+// @throws None; a failure is logged and retried by the next call.
+// @invariants Safe to call on every request; O(1) once the pool has booted.
+func (p *Pool) Bootstrap(ctx context.Context) bool {
+	if p.authMgr == nil {
+		return false
+	}
+	if len(p.authMgr.GetAccounts()) == 0 {
+		// Only re-read while the vault still looks empty: that is the onboarding transition, and it
+		// keeps the steady state free of an extra agy-auth subprocess on every request.
+		if err := p.authMgr.Sync(ctx); err != nil {
+			p.log().Debug("vault re-read failed while awaiting onboarding", "err", err)
+		}
+	}
+	p.ensureWorkers(ctx)
+	return len(p.authMgr.GetAccounts()) > 0
+}
+
+// ensureWorkers bootstraps the worker set for a pool that booted with an empty vault.
+//
+// @purpose Makes the first inference after onboarding work without a container restart.
+// @rationale initWorkers returns early when the vault is empty, because failing there made a fresh
+// install unbootable (see the comment in initWorkers). The workers therefore have to be created
+// lazily, once an account actually exists.
+// @preconditions Caller must not hold p.mu or initMu.
+// @param ctx Cancellation root for provisioning.
+// @returns None; a provisioning error is logged and retried on the next call.
+// @throws None.
+// @invariants At most one bootstrap runs at a time; a pool that already booted does nothing.
+func (p *Pool) ensureWorkers(ctx context.Context) {
+	p.initMu.Lock()
+	defer p.initMu.Unlock()
+	if p.booted {
+		return
+	}
+	if len(p.authMgr.GetAccounts()) == 0 {
+		return
+	}
+	if err := p.initWorkers(ctx); err != nil {
+		p.log().Error("failed to bootstrap worker pool after an account was added", "err", err)
+		return
+	}
+	p.booted = true
 }
 
 // ErrNoEligibleAccounts reports that no stored account can serve the requested model right now.
@@ -424,8 +546,9 @@ func (p *Pool) reconcileBindings() {
 		return
 	}
 	// Lowest live worker id per account: deterministic, and never reports a shared account as free.
-	owner := make(map[string]int, len(p.workers))
-	for _, w := range p.workers {
+	workers := p.workerSnapshot()
+	owner := make(map[string]int, len(workers))
+	for _, w := range workers {
 		if w == nil {
 			continue
 		}
@@ -551,6 +674,16 @@ func quotaScore(acc auth.Account) float64 {
 // @invariants O(workers) attempts per call; never holds Pool.mu across a subprocess; every rejected
 // worker is returned to the lease channel exactly once.
 func (p *Pool) Acquire(ctx context.Context, model string, requiresPaidTier bool) (*Worker, error) {
+	// A pool that booted with an empty vault has no workers and an empty lease channel, so waiting
+	// would burn the acquire timeout and answer 503 "saturated" for what is really "not set up yet".
+	// Bootstrapping here is also what makes an account added after boot take effect immediately.
+	if p.authMgr != nil {
+		p.ensureWorkers(ctx)
+		if len(p.authMgr.GetAccounts()) == 0 {
+			return nil, ErrNoAccounts
+		}
+	}
+
 	acquireTimeout := p.cfg.Pool.AcquireTimeout
 	if acquireTimeout <= 0 {
 		acquireTimeout = 15 * time.Second
@@ -560,7 +693,7 @@ func (p *Pool) Acquire(ctx context.Context, model string, requiresPaidTier bool)
 	defer cancel()
 
 	// Each worker is attempted at most once per call so a permanently unusable worker cannot spin.
-	rejected := make(map[int]struct{}, len(p.workers))
+	rejected := make(map[int]struct{}, len(p.workerSnapshot()))
 	var lastEligibilityErr error
 
 	// returnWorker puts a rejected worker back without blocking past the acquire deadline.
@@ -658,8 +791,9 @@ func (p *Pool) Acquire(ctx context.Context, model string, requiresPaidTier bool)
 // @throws None.
 // @invariants O(workers); reads each worker's Account pointer once; no locks held on return.
 func (p *Pool) accountsInUse(self *Worker) map[string]int {
-	inUse := make(map[string]int, len(p.workers))
-	for _, other := range p.workers {
+	workers := p.workerSnapshot()
+	inUse := make(map[string]int, len(workers))
+	for _, other := range workers {
 		if other == nil || other == self {
 			continue
 		}
@@ -791,8 +925,9 @@ func (p *Pool) publishBinding(workerID int) {
 	// Persistence is driven from the live worker bindings rather than from the id being published, so
 	// a full pool is written even when this call is a release. File IO happens after
 	// MarkAccountBinding released accountsMu, so a slow disk can never serialise credential leasing.
-	bindings := make(map[int]string, len(p.workers))
-	for _, other := range p.workers {
+	workers := p.workerSnapshot()
+	bindings := make(map[int]string, len(workers))
+	for _, other := range workers {
 		if other == nil {
 			continue
 		}

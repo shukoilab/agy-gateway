@@ -113,6 +113,17 @@ func (qp *QuotaPoller) Stop() {
 // @invariants O(accounts × buckets) plus one subprocess; leaves statuses untouched when the fetch
 // fails so no rotation decision is ever based on stale data.
 func (qp *QuotaPoller) Poll(ctx context.Context) {
+	// A pool that booted from an empty vault must notice an account added out of band: the onboarding
+	// CLI (`agy-accounts add`) is a separate process, so nothing in this process sees the new vault
+	// entry until it is re-read. Only re-read while the account set is empty, so the normal path still
+	// runs exactly one agy-auth subprocess per interval.
+	if len(qp.mgr.GetAccounts()) == 0 {
+		if err := qp.mgr.Sync(ctx); err != nil {
+			qp.logger.Debug("vault still holds no accounts; awaiting onboarding", "err", err)
+			return
+		}
+	}
+
 	usage, err := qp.mgr.FetchAllAccountUsage(ctx)
 	if err != nil {
 		// Deliberately no state change: acting on the previous snapshot would rotate accounts on the

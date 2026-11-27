@@ -92,6 +92,20 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 		req.Model = h.modelRegistry.DefaultModel()
 	}
 
+	// A fresh install has an empty vault and therefore an empty catalog; say so instead of reporting
+	// an unknown model. Once an account appears this also picks up its models without a restart.
+	// Bootstrap the pool first: provisioning a worker is what materialises its credential, and model
+	// discovery reads that credential. Discovering before provisioning found nothing on a fresh
+	// install, so onboarding looked like it had failed.
+	if h.pool.Bootstrap(r.Context()) {
+		h.modelRegistry.RefreshIfAccountsChanged(r.Context())
+	}
+	if h.modelRegistry.NeedsOnboarding() {
+		h.writeOpenAIError(w, http.StatusTooManyRequests,
+			"No Antigravity accounts are configured; an administrator must add one", "api_error", "no_accounts", "")
+		return
+	}
+
 	modelEntry, found := h.modelRegistry.FindModel(req.Model)
 	if !found {
 		h.writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model %q does not exist", req.Model), "invalid_request_error", "model_not_found", "model")
