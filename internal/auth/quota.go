@@ -113,15 +113,13 @@ func (qp *QuotaPoller) Stop() {
 // @invariants O(accounts × buckets) plus one subprocess; leaves statuses untouched when the fetch
 // fails so no rotation decision is ever based on stale data.
 func (qp *QuotaPoller) Poll(ctx context.Context) {
-	// A pool that booted from an empty vault must notice an account added out of band: the onboarding
-	// CLI (`agy-accounts add`) is a separate process, so nothing in this process sees the new vault
-	// entry until it is re-read. Only re-read while the account set is empty, so the normal path still
-	// runs exactly one agy-auth subprocess per interval.
-	if len(qp.mgr.GetAccounts()) == 0 {
-		if err := qp.mgr.Sync(ctx); err != nil {
-			qp.logger.Debug("vault still holds no accounts; awaiting onboarding", "err", err)
-			return
-		}
+	// Sync every interval, not just while the vault looks empty. An operator can add or remove an
+	// account at any time through the CLI, which is a separate process; without a resync the daemon
+	// kept serving a deleted account as HEALTHY forever and could lease it again. One `agy-auth list`
+	// per poll interval is the price of a truthful account set.
+	if err := qp.mgr.Sync(ctx); err != nil {
+		// Keep the previous set: an unreadable vault is not evidence that accounts disappeared.
+		qp.logger.Warn("vault resync failed; retaining previous account set", "err", err)
 	}
 
 	usage, err := qp.mgr.FetchAllAccountUsage(ctx)

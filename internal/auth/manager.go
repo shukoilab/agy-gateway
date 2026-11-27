@@ -209,7 +209,6 @@ func (m *Manager) Sync(ctx context.Context) error {
 	}
 
 	m.accountsMu.Lock()
-	defer m.accountsMu.Unlock()
 
 	// Preserve runtime state across a resync. Sync reconstructs accounts from the vault, which knows
 	// nothing about quota cooldowns, so a naive rebuild would silently reset a cooling account to
@@ -221,7 +220,9 @@ func (m *Manager) Sync(ctx context.Context) error {
 	}
 
 	newAccounts := make([]Account, 0, len(rawAccounts))
+	newAccountIDs := make(map[string]struct{}, len(rawAccounts))
 	for _, raw := range rawAccounts {
+		newAccountIDs[raw.ID] = struct{}{}
 		tier := raw.Tier
 		if tier == "" && raw.Plan != "" {
 			tier = strings.ToLower(raw.Plan)
@@ -289,7 +290,69 @@ func (m *Manager) Sync(ctx context.Context) error {
 		newAccounts = append(newAccounts, acc)
 	}
 	m.accounts = newAccounts
+	m.accountsMu.Unlock()
+
+	// Purge credential copies that belong to accounts the vault no longer reports. Sync is the only
+	// place that learns an account disappeared, so it is also the only place that can clean up the
+	// plaintext refresh tokens this gateway installed for it. Without this a deleted account kept a
+	// working credential on disk under every worker HOME forever.
+	removed := make([]string, 0)
+	for id, prior := range previous {
+		if _, still := newAccountIDs[id]; !still {
+			removed = append(removed, prior.Email)
+		}
+	}
+	m.purgeWorkerCredentialsFor(removed)
 	return nil
+}
+
+// purgeWorkerCredentialsFor deletes worker credential files that belong to removed accounts.
+//
+// @purpose Removes the plaintext refresh token this gateway installed for an account that no longer
+// exists, so deleting an account leaves no usable credential behind.
+// @rationale Each worker HOME holds its own credential copy (that is what makes per-account quota
+// real). Those copies are never touched by `agy-auth remove`, which only knows the vault, so without
+// this they outlive the account indefinitely.
+// @preconditions Caller must not hold accountsMu or vaultMu.
+// @param emails Display emails of the removed accounts; empty is a no-op.
+// @returns None; unmatched or unreadable files are left alone.
+// @throws None; every failure is logged at debug level.
+// @invariants O(workerCount) file reads; never logs credential material.
+func (m *Manager) purgeWorkerCredentialsFor(emails []string) {
+	if len(emails) == 0 || m.cfg == nil || m.cfg.Storage.WorkersRootDir == "" {
+		return
+	}
+	gone := make(map[string]struct{}, len(emails))
+	for _, e := range emails {
+		if e != "" {
+			gone[strings.ToLower(e)] = struct{}{}
+		}
+	}
+	if len(gone) == 0 {
+		return
+	}
+
+	for i := 0; i < m.cfg.Pool.WorkerCount; i++ {
+		path := filepath.Join(m.cfg.Storage.WorkersRootDir, fmt.Sprintf("w%d", i),
+			".gemini", "antigravity-cli", "antigravity-oauth-token")
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		var payload exportedCredential
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			continue
+		}
+		if _, bad := gone[strings.ToLower(payload.IDTokenEmail)]; !bad {
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			m.logger.Debug("could not remove credential of a deleted account", "workerID", i, "err", err)
+			continue
+		}
+		m.logger.Info("removed credential of a deleted account", "workerID", i,
+			"email", payload.IDTokenEmail)
+	}
 }
 
 // truncateForError bounds a raw payload quoted in an error message.
@@ -981,13 +1044,36 @@ func (m *Manager) RotateAccount(ctx context.Context) error {
 	return err
 }
 
-// RemoveAccount executes agy-auth remove <query> --yes.
+// RemoveAccount deletes an account from the vault and purges what this gateway installed for it.
+//
+// @purpose Makes deletion complete from the gateway's point of view, not just in the vault.
+// @rationale `agy-auth remove` alone leaves two copies of the credential alive: the live mirror token
+// under the gateway's HOME (unless `--logout` is passed) and the per-worker copy under each worker
+// HOME. It also leaves this process's account set stale, so rotation kept offering the deleted
+// account as a healthy candidate until a restart. Removing with `--logout` and resyncing immediately
+// closes all three.
+// @preconditions The vault holds an account matching query.
+// @param ctx Cancellation root for the removal and the follow-up resync.
+// @param query Account id, alias, or email as `agy-auth` accepts.
+// @returns A wrapped error when the removal subprocess fails. A failed resync is logged, not returned:
+// the account is already gone and reporting failure would invite a second removal attempt.
+// @throws None directly; the subprocess error is wrapped.
+// @invariants Two subprocesses at most; never holds vaultMu across the resync.
 func (m *Manager) RemoveAccount(ctx context.Context, query string) error {
 	m.vaultMu.Lock()
-	defer m.vaultMu.Unlock()
+	_, err := m.execAgyAuth(ctx, "remove", query, "--yes", "--logout")
+	m.vaultMu.Unlock()
+	if err != nil {
+		return err
+	}
 
-	_, err := m.execAgyAuth(ctx, "remove", query, "--yes")
-	return err
+	// Sync must run outside vaultMu (it takes the same lock) and is what purges the worker credential
+	// copies of the account that just disappeared.
+	if syncErr := m.Sync(ctx); syncErr != nil {
+		m.logger.Warn("vault resync after account removal failed; the next poll will retry",
+			"err", syncErr)
+	}
+	return nil
 }
 
 // SetAlias executes agy-auth alias set <query> <alias>.

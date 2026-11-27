@@ -337,7 +337,7 @@ docker exec -it agy-gateway agy-accounts
 - `[3] Switch Active Account`: Change the primary account in the vault.
 - `[4] Force Account Rotation`: Manually cycle to the next healthy account.
 - `[5] Set Account Alias`: Assign a human-readable name to an account.
-- `[7] Remove Account`: Permanently delete stored credentials.
+- `[7] Remove Account`: Delete an account and purge what the gateway installed for it: the vault entry, the live mirror credential (`agy-auth remove --logout`), and every worker-HOME credential copy. The account set is resynced immediately, so rotation cannot lease the deleted account even before the next poll, and no restart is required.
 - `[8] Clean Vault Cache`: Purge orphaned tokens and temporary files.
 - `[10] Anthropic Model Aliases & Ranking`: View active model mappings, pin manual overrides, and trigger capability recalculations.
 - `[11] Auto-Updater & Binary Versions`: Inspect active binary paths, check upstream releases, and trigger manual upgrades.
@@ -381,7 +381,7 @@ The gateway treats each stored account as an independent quota source and binds 
 | `allocation_strategy` | `AGY_GW_ALLOCATION_STRATEGY` | `round_robin` | Worker-to-account assignment policy: `round_robin`, `least_used`, or `sticky`. |
 | `min_remaining_quota_pct` | `AGY_GW_MIN_REMAINING_QUOTA_PCT` | `5.0` | Floor below which a bucket counts as depleted. An account whose quota could not be read ranks **below** a known-good one but stays usable (rank 1), so one failed quota call never takes the pool offline. |
 | `auto_rotate_enabled` | `AGY_GW_AUTO_ROTATE_ENABLED` | `true` | Derive cooldowns from live quota. When `false`, quota data is still refreshed but statuses never change. |
-| `quota_poll_interval` | `AGY_GW_QUOTA_POLL_INTERVAL` | `30s` | Background poll cadence (minimum `10s`). |
+| `quota_poll_interval` | `AGY_GW_QUOTA_POLL_INTERVAL` | `30s` | Background poll cadence (minimum `10s`). Each poll also resyncs the account set from the vault, so an account added or removed through the CLI is picked up without a restart. |
 | `default_cooldown_5h` | `AGY_GW_DEFAULT_COOLDOWN_5H` | `30m` | Fallback cooldown when a 5-hour bucket reports no reset time. |
 | `default_cooldown_weekly` | `AGY_GW_DEFAULT_COOLDOWN_WEEKLY` | `24h` | Fallback cooldown when a weekly bucket reports no reset time. |
 | `credential_op_timeout` | `AGY_GW_CREDENTIAL_OP_TIMEOUT` | `20s` | Deadline for one credential export/install, including process-group kill on expiry. |

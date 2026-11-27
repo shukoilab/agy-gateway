@@ -835,16 +835,24 @@ func (p *Pool) reconcileWorkerAccount(ctx context.Context, w *Worker, model stri
 	minPct := p.cfg.Accounts.MinRemainingQuotaPct
 
 	// Fast path: adopt the manager's fresher view of the bound account, then judge it.
+	//
+	// The bound account must still EXIST in the vault for this path to apply. When an operator removes
+	// an account, the worker keeps a pointer to the snapshot it was leased with; judging that stale
+	// pointer granted the lease for an account that no longer exists, which is how rotation kept
+	// landing on a deleted account. A binding absent from the vault is treated as unusable so the
+	// rotation path below rebinds the worker to a live account (or fails with no eligible account).
 	if bound := w.GetAccount(); bound != nil {
+		found := false
 		for i := range accounts {
 			if accounts[i].ID == bound.ID {
 				fresh := accounts[i]
 				w.SetAccount(&fresh)
 				bound = &fresh
+				found = true
 				break
 			}
 		}
-		if bound.IsEligibleForModel(model, requiresPaidTier, minPct) {
+		if found && bound.IsEligibleForModel(model, requiresPaidTier, minPct) {
 			// The binding is already truthful for this worker; re-publishing it keeps
 			// `assigned_worker` correct for a worker that started before the manager existed and for
 			// any path that rebound the account without a rotation.
@@ -888,6 +896,11 @@ func (p *Pool) reconcileWorkerAccount(ctx context.Context, w *Worker, model stri
 		"model", model,
 		"reason", "lease_eligibility")
 	w.SetAccount(next)
+	// The running agy process authenticated as the previous account at spawn time, so the credential
+	// just installed on disk is not in effect for it. Tainting makes Release respawn the worker, which
+	// is the only way the new credential is actually used. Without this a worker whose account was
+	// deleted would keep serving turns with the deleted account's still-valid token.
+	w.TaintedForRecycle.Store(true)
 	// Publish only after SetAccount: reporting a binding whose credential failed to install would
 	// misattribute quota spend to a worker that never used the account. The old account needs no
 	// explicit release — publishBinding reconciles `assigned_worker` from the live workers, so once
