@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.17.0] - 2026-11-28
+
+### Features
+
+* **accounts:** implement multi-account CRUD, allocation, workspace durability and quota-refusal failover ([6ad561b](https://github.com/shukoilab/agy-gateway/commit/6ad561b6e921bfee73aed3afbcd1b19a998734e5))
+* **acp:** align gateway with the Zed reference implementation ([30c80f1](https://github.com/shukoilab/agy-gateway/commit/30c80f17b030a34155ab04853df524c5e0732552))
+
 ## [3.16.8] - 2026-11-27
 
 ### Bug Fixes
