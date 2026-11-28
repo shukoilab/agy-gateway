@@ -15,25 +15,29 @@ import (
 	"sync"
 	"time"
 
+	"agy-gateway/internal/version"
+
 	"gopkg.in/yaml.v3"
 )
 
 // Config represents the top-level unified gateway configuration.
 type Config struct {
-	Server        ServerConfig     `yaml:"server"`
-	Security      SecurityConfig   `yaml:"security"`
-	Binaries      BinariesConfig   `yaml:"binaries"`
-	Execution     ExecutionConfig  `yaml:"execution"`
-	Storage       StorageConfig    `yaml:"storage"`
-	Pool          PoolConfig       `yaml:"pool"`
-	Accounts      AccountsConfig   `yaml:"accounts"`
-	Admin         AdminConfig      `yaml:"admin"`
-	OpenAI        OpenAIConfig     `yaml:"openai"`
-	Anthropic     AnthropicConfig  `yaml:"anthropic"`
-	Proxy         ProxyConfig      `yaml:"proxy"`
-	AutoUpdate    AutoUpdateConfig `yaml:"auto_update"`
-	MCP           MCPConfig        `yaml:"mcp"`
-	Observability ObsConfig        `yaml:"observability"`
+	Server        ServerConfig       `yaml:"server"`
+	Security      SecurityConfig     `yaml:"security"`
+	Binaries      BinariesConfig     `yaml:"binaries"`
+	Execution     ExecutionConfig    `yaml:"execution"`
+	Identity      IdentityConfig     `yaml:"identity"`
+	Capabilities  CapabilitiesConfig `yaml:"capabilities"`
+	Storage       StorageConfig      `yaml:"storage"`
+	Pool          PoolConfig         `yaml:"pool"`
+	Accounts      AccountsConfig     `yaml:"accounts"`
+	Admin         AdminConfig        `yaml:"admin"`
+	OpenAI        OpenAIConfig       `yaml:"openai"`
+	Anthropic     AnthropicConfig    `yaml:"anthropic"`
+	Proxy         ProxyConfig        `yaml:"proxy"`
+	AutoUpdate    AutoUpdateConfig   `yaml:"auto_update"`
+	MCP           MCPConfig          `yaml:"mcp"`
+	Observability ObsConfig          `yaml:"observability"`
 
 	// Compiled regex patterns for zero-runtime-allocation routing & validation
 	QueryRegex *regexp.Regexp `yaml:"-"`
@@ -108,6 +112,53 @@ type ExecutionConfig struct {
 	// analysis. Whole turns are dropped only when the prose alone exceeds the budget, and then the
 	// opening turn and the newest turns are kept. 0 disables the bound.
 	MaxHistoryTokens int `yaml:"max_history_tokens"`
+	// UnsupportedParameterPolicy decides what happens to provider parameters that ACP cannot express
+	// (temperature, top_p, stop, penalties, max_tokens, seed, logit_bias, logprobs, …). ACP exposes
+	// only model, thought_level and mode, so those fields can never be honoured; silently accepting
+	// them hides that from the caller. "ignore" (default) accepts them and names them in the
+	// x-agy-ignored-params response header so a harness can see the truth; "reject" answers with the
+	// provider's own invalid_request_error naming the first unsupported parameter.
+	UnsupportedParameterPolicy string `yaml:"unsupported_parameter_policy"`
+}
+
+// IdentityConfig controls what the gateway announces in `initialize.clientInfo`.
+//
+// @purpose Lets the operator choose the client fingerprint the agent sees.
+// @rationale The reference behaviour (Zed ↔ agy) is what the gateway is a bridge for, so the
+// default is the Zed fingerprint: agy branches on the client name for a few vendor paths and its
+// logs read "Zed". A deployment that must not impersonate an editor can switch to `gateway`.
+//
+// @invariants Name/Title/Version are always non-empty after validation; Version is data loaded
+// from YAML/env, never a value baked into code, so an operator can match a newer Zed without a
+// rebuild.
+type IdentityConfig struct {
+	// Profile selects the preset: "zed" (default) or "gateway".
+	Profile string `yaml:"profile"`
+	Name    string `yaml:"name"`
+	Title   string `yaml:"title"`
+	Version string `yaml:"version"`
+}
+
+// CapabilitiesConfig controls which client capabilities the gateway advertises in `initialize`.
+//
+// @purpose Separates "what we tell the agent we can do" from "what we actually implement".
+// @rationale Advertising a capability without its handler makes agy emit requests the gateway
+// answers with method-not-found, which stalls the turn. Validation therefore fails startup when a
+// profile advertises fs or terminal and the corresponding handlers are not enabled.
+//
+// @invariants Profile "zed" advertises fs+terminal (all handlers registered by the acp transport);
+// "sandbox" advertises neither.
+type CapabilitiesConfig struct {
+	// Profile selects the preset: "zed" (default) or "sandbox".
+	Profile string `yaml:"profile"`
+	// FS enables the fs.readTextFile/fs.writeTextFile advertisement.
+	FS bool `yaml:"fs"`
+	// Terminal enables the terminal capability advertisement.
+	Terminal bool `yaml:"terminal"`
+	// Elicitation enables the elicitation capability advertisement.
+	Elicitation bool `yaml:"elicitation"`
+	// SessionMetadata enables session.compaction/configOptions/notices advertisement.
+	SessionMetadata bool `yaml:"session_metadata"`
 }
 
 type StorageConfig struct {
@@ -198,18 +249,6 @@ func (p *ProxyConfig) ExportToEnv() {
 		_ = os.Setenv("NO_PROXY", p.NoProxy)
 		_ = os.Setenv("no_proxy", p.NoProxy)
 	}
-}
-
-// RedactedURL returns a copy of the given proxy URL with credentials masked as ***** for safe logging.
-func (p *ProxyConfig) RedactedURL(rawURL string) string {
-	if rawURL == "" {
-		return ""
-	}
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-	return u.Redacted()
 }
 
 // EnvSlice returns a slice of environment variable strings ("KEY=VALUE") for child subprocesses.
@@ -309,6 +348,28 @@ type MCPClientToolCallingConfig struct {
 
 type MCPConfig struct {
 	ClientToolCalling MCPClientToolCallingConfig `yaml:"client_tool_calling"`
+	// Media governs consumer-supplied image references. An API consumer can point an image part at
+	// any URL, so this policy is what stops the gateway from being used as an SSRF proxy.
+	Media MediaConfig `yaml:"media"`
+}
+
+// MediaConfig is the operator-facing image resolution policy.
+//
+// @purpose Bounds where and how much image data the gateway will ingest.
+// @rationale Sensible defaults are enforced by the resolver even when this block is absent, so an
+// empty config cannot disable the size ceiling or the host policy.
+type MediaConfig struct {
+	// AllowRemote permits http(s) image references. When false only inline data: URIs are accepted.
+	AllowRemote bool `yaml:"allow_remote"`
+	// MaxBytes bounds the decoded payload of one image.
+	MaxBytes int64 `yaml:"max_bytes"`
+	// FetchTimeout bounds one remote fetch including redirects.
+	FetchTimeout time.Duration `yaml:"fetch_timeout"`
+	// AllowedMimeTypes is the accepted media type set. Empty means png/jpeg/gif/webp.
+	AllowedMimeTypes []string `yaml:"allowed_mime_types"`
+	// AllowPrivateHosts permits loopback/private/link-local destinations. Off by default because
+	// those are exactly what an SSRF attempt targets.
+	AllowPrivateHosts bool `yaml:"allow_private_hosts"`
 }
 
 type ObsConfig struct {
@@ -350,11 +411,25 @@ func DefaultConfig() *Config {
 		Execution: ExecutionConfig{
 			CleanWorkspaceBetweenRequests: true,
 			StrictClientToolDelegation:    true,
-			VisionMode:                    "reject",
+			VisionMode:                    VisionModeAuto,
 			MaxRetries:                    3,
 			RetryInitialBackoff:           500 * time.Millisecond,
 			RetryMaxBackoff:               10 * time.Second,
 			MaxHistoryTokens:              60000,
+			UnsupportedParameterPolicy:    UnsupportedParameterPolicyIgnore,
+		},
+		Identity: IdentityConfig{
+			Profile: IdentityProfileZed,
+			Name:    "zed",
+			Title:   "Zed",
+			Version: DefaultZedClientVersion,
+		},
+		Capabilities: CapabilitiesConfig{
+			Profile:         CapabilitiesProfileZed,
+			FS:              true,
+			Terminal:        true,
+			Elicitation:     true,
+			SessionMetadata: true,
 		},
 		Storage: StorageConfig{
 			BaseDataDir:       "/var/lib/agy-gateway",
@@ -441,6 +516,13 @@ func DefaultConfig() *Config {
 				MaxInterceptedToolCalls: 16,
 				ToolCallCollectWindow:   time.Second,
 				DelimiterTag:            "tool_call",
+			},
+			Media: MediaConfig{
+				AllowRemote:       true,
+				MaxBytes:          8 << 20, // 8 MiB per image
+				FetchTimeout:      10 * time.Second,
+				AllowedMimeTypes:  []string{"image/png", "image/jpeg", "image/gif", "image/webp"},
+				AllowPrivateHosts: false,
 			},
 		},
 		Observability: ObsConfig{
@@ -529,19 +611,21 @@ var removedEnvKeys = []string{
 // This map is the single source of truth for both the YAML and env key sets; keys absent here emit no
 // note, which Validate-free lookups in tests assert against.
 var removedKeyNotes = map[string]string{
-	"execution.acp_session_mode":                "plan vs build is now decided by the consumer system prompt",
-	"execution.auto_approve_permissions":        "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"execution.system_prompt_channel":           "the consumer system prompt is always sent as the first prompt block",
-	"binaries.agy_acp_args":                     "the ACP argv is fixed by the gateway",
-	"AGY_GW_ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
-	"ACP_SESSION_MODE":                          "plan vs build is now decided by the consumer system prompt",
-	"AGY_GW_AUTO_APPROVE_PERMISSIONS":           "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"AGY_GW_SYSTEM_PROMPT_CHANNEL":              "the consumer system prompt is always sent as the first prompt block",
-	"AGY_GW_AGY_ACP_ARGS":                       "the ACP argv is fixed by the gateway",
-	"openai.unsupported_param_policy":           "every parameter is accepted; fields with no ACP surface are ignored",
-	"anthropic.unsupported_param_policy":        "every parameter is accepted; fields with no ACP surface are ignored",
-	"AGY_GW_UNSUPPORTED_PARAM_POLICY":           "every parameter is accepted; fields with no ACP surface are ignored",
-	"AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY": "every parameter is accepted; fields with no ACP surface are ignored",
+	"execution.acp_session_mode":         "plan vs build is now decided by the consumer system prompt",
+	"execution.auto_approve_permissions": "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"execution.system_prompt_channel":    "the consumer system prompt is always sent as the first prompt block",
+	"binaries.agy_acp_args":              "the ACP argv is fixed by the gateway",
+	"AGY_GW_ACP_SESSION_MODE":            "plan vs build is now decided by the consumer system prompt",
+	"ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
+	"AGY_GW_AUTO_APPROVE_PERMISSIONS":    "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"AGY_GW_SYSTEM_PROMPT_CHANNEL":       "the consumer system prompt is always sent as the first prompt block",
+	"AGY_GW_AGY_ACP_ARGS":                "the ACP argv is fixed by the gateway",
+	// Both policies were replaced by one key covering every provider:
+	// execution.unsupported_parameter_policy / AGY_GW_UNSUPPORTED_PARAMETER_POLICY (ignore|reject).
+	"openai.unsupported_param_policy":           "replaced by execution.unsupported_parameter_policy (ignore|reject)",
+	"anthropic.unsupported_param_policy":        "replaced by execution.unsupported_parameter_policy (ignore|reject)",
+	"AGY_GW_UNSUPPORTED_PARAM_POLICY":           "replaced by AGY_GW_UNSUPPORTED_PARAMETER_POLICY (ignore|reject)",
+	"AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY": "replaced by AGY_GW_UNSUPPORTED_PARAMETER_POLICY (ignore|reject)",
 }
 
 // collectRemovedEnvKeys returns the removed environment variables that are still exported.
@@ -775,6 +859,65 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 		}
 	}
 
+	// 4b. Identity & capabilities overrides
+	if v := os.Getenv("AGY_GW_IDENTITY_PROFILE"); v != "" {
+		cfg.Identity.Profile = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_IDENTITY_NAME"); v != "" {
+		cfg.Identity.Name = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_IDENTITY_TITLE"); v != "" {
+		cfg.Identity.Title = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_IDENTITY_VERSION"); v != "" {
+		cfg.Identity.Version = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_CAPABILITIES_PROFILE"); v != "" {
+		cfg.Capabilities.Profile = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_CAPABILITIES_FS"); v != "" {
+		cfg.Capabilities.FS = parseBoolEnv(v, cfg.Capabilities.FS)
+	}
+	if v := os.Getenv("AGY_GW_CAPABILITIES_TERMINAL"); v != "" {
+		cfg.Capabilities.Terminal = parseBoolEnv(v, cfg.Capabilities.Terminal)
+	}
+	if v := os.Getenv("AGY_GW_CAPABILITIES_ELICITATION"); v != "" {
+		cfg.Capabilities.Elicitation = parseBoolEnv(v, cfg.Capabilities.Elicitation)
+	}
+	if v := os.Getenv("AGY_GW_CAPABILITIES_SESSION_METADATA"); v != "" {
+		cfg.Capabilities.SessionMetadata = parseBoolEnv(v, cfg.Capabilities.SessionMetadata)
+	}
+
+	// 4c. Media policy overrides
+	if v := os.Getenv("AGY_GW_MEDIA_ALLOW_REMOTE"); v != "" {
+		cfg.MCP.Media.AllowRemote = parseBoolEnv(v, cfg.MCP.Media.AllowRemote)
+	}
+	if v := os.Getenv("AGY_GW_MEDIA_MAX_BYTES"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			cfg.MCP.Media.MaxBytes = n
+		}
+	}
+	if v := os.Getenv("AGY_GW_MEDIA_FETCH_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.MCP.Media.FetchTimeout = d
+		}
+	}
+	if v := os.Getenv("AGY_GW_MEDIA_ALLOWED_MIME_TYPES"); v != "" {
+		parts := strings.Split(v, ",")
+		types := make([]string, 0, len(parts))
+		for _, p := range parts {
+			if t := strings.ToLower(strings.TrimSpace(p)); t != "" {
+				types = append(types, t)
+			}
+		}
+		if len(types) > 0 {
+			cfg.MCP.Media.AllowedMimeTypes = types
+		}
+	}
+	if v := os.Getenv("AGY_GW_MEDIA_ALLOW_PRIVATE_HOSTS"); v != "" {
+		cfg.MCP.Media.AllowPrivateHosts = parseBoolEnv(v, cfg.MCP.Media.AllowPrivateHosts)
+	}
+
 	// 5. OpenAI & Models Overrides
 	if v := getFirstEnv("AGY_GW_DEFAULT_MODEL", "DEFAULT_MODEL"); v != "" {
 		cfg.OpenAI.DefaultModel = v
@@ -832,6 +975,9 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	}
 	if v := os.Getenv("AGY_GW_VISION_MODE"); v != "" {
 		cfg.Execution.VisionMode = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("AGY_GW_UNSUPPORTED_PARAMETER_POLICY"); v != "" {
+		cfg.Execution.UnsupportedParameterPolicy = strings.ToLower(strings.TrimSpace(v))
 	}
 	if v := os.Getenv("AGY_GW_CONFIG_SWITCH_TIMEOUT"); v != "" {
 		cfg.Pool.ConfigSwitchTimeout = parseDurationEnv(v, cfg.Pool.ConfigSwitchTimeout)
@@ -1087,6 +1233,49 @@ func validate(cfg *Config) error {
 	if !validVisionMode(cfg.Execution.VisionMode) {
 		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",
 			visionModes, cfg.Execution.VisionMode)
+	}
+	if !validUnsupportedParameterPolicy(cfg.Execution.UnsupportedParameterPolicy) {
+		return fmt.Errorf("execution.unsupported_parameter_policy must be one of %v, got %q",
+			unsupportedParameterPolicies, cfg.Execution.UnsupportedParameterPolicy)
+	}
+	if !validIdentityProfile(cfg.Identity.Profile) {
+		return fmt.Errorf("identity.profile must be one of %v, got %q",
+			identityProfiles, cfg.Identity.Profile)
+	}
+	if strings.TrimSpace(cfg.Identity.Name) == "" {
+		return fmt.Errorf("identity.name cannot be empty")
+	}
+	if strings.TrimSpace(cfg.Identity.Title) == "" {
+		return fmt.Errorf("identity.title cannot be empty")
+	}
+	if strings.TrimSpace(cfg.Identity.Version) == "" {
+		return fmt.Errorf("identity.version cannot be empty")
+	}
+	if !validCapabilityProfile(cfg.Capabilities.Profile) {
+		return fmt.Errorf("capabilities.profile must be one of %v, got %q",
+			capabilityProfiles, cfg.Capabilities.Profile)
+	}
+	// Advertise only what is implemented. The acp transport always registers fs + terminal handlers,
+	// so advertising them is honest; the sandbox profile deliberately advertises neither so the
+	// agent never offers native file/command tools inside the isolated workspace.
+	if cfg.Capabilities.Profile == CapabilitiesProfileSandbox {
+		cfg.Capabilities.FS = false
+		cfg.Capabilities.Terminal = false
+		cfg.Capabilities.Elicitation = false
+		cfg.Capabilities.SessionMetadata = false
+	}
+	// The gateway profile restores the gateway's own fingerprint. Only applied when the operator has
+	// not overridden the individual fields, so a deliberate custom name still wins.
+	if cfg.Identity.Profile == IdentityProfileGateway {
+		if cfg.Identity.Name == "" || cfg.Identity.Name == "zed" {
+			cfg.Identity.Name = "agy-gateway"
+		}
+		if cfg.Identity.Title == "" || cfg.Identity.Title == "Zed" {
+			cfg.Identity.Title = "Antigravity Gateway"
+		}
+		if cfg.Identity.Version == "" || cfg.Identity.Version == DefaultZedClientVersion {
+			cfg.Identity.Version = version.Get()
+		}
 	}
 	if cfg.Execution.MaxHistoryTokens < 0 {
 		return fmt.Errorf("execution.max_history_tokens must be >= 0, got %d", cfg.Execution.MaxHistoryTokens)

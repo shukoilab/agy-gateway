@@ -100,8 +100,78 @@ func IsThoughtLevel(value string) bool {
 // visionModes enumerates image/embedded-content handling.
 //
 // @purpose Validation set for execution.vision_mode.
-// @rationale agy advertises image support but fails every such turn with a 400 surfaced as assistant text.
-var visionModes = []string{"reject", "flatten"}
+// @rationale `auto` forwards image blocks to the agent, which supports them natively
+// (promptCapabilities.image proved true on agy 1.5.18). `reject` refuses them at the provider
+// boundary for deployments that must not accept binary payloads. The former `flatten` value was
+// removed: it never produced a working image path, because the content decoder dropped every
+// image part and the ACP prompt block had no data field to carry one.
+var visionModes = []string{VisionModeAuto, VisionModeReject}
+
+// VisionModeAuto forwards image blocks to the agent.
+const VisionModeAuto = "auto"
+
+// VisionModeReject refuses image blocks at the provider boundary.
+const VisionModeReject = "reject"
+
+// UnsupportedParameterPolicyIgnore accepts provider parameters ACP cannot express and reports them.
+const UnsupportedParameterPolicyIgnore = "ignore"
+
+// UnsupportedParameterPolicyReject refuses such parameters with a provider-native error.
+const UnsupportedParameterPolicyReject = "reject"
+
+// unsupportedParameterPolicies enumerates the accepted execution.unsupported_parameter_policy values.
+var unsupportedParameterPolicies = []string{UnsupportedParameterPolicyIgnore, UnsupportedParameterPolicyReject}
+
+// validUnsupportedParameterPolicy reports whether p is an accepted policy value.
+//
+// @purpose Validation helper for execution.unsupported_parameter_policy.
+// @param p Candidate value.
+// @returns True for ignore/reject, case-insensitively.
+// @invariants Pure, O(2).
+func validUnsupportedParameterPolicy(p string) bool {
+	v := strings.ToLower(strings.TrimSpace(p))
+	for _, c := range unsupportedParameterPolicies {
+		if v == c {
+			return true
+		}
+	}
+	return false
+}
+
+// Identity profile presets.
+const (
+	// IdentityProfileZed announces the editor fingerprint observed in the reference capture.
+	IdentityProfileZed = "zed"
+	// IdentityProfileGateway announces the gateway's own identity.
+	IdentityProfileGateway = "gateway"
+)
+
+// identityProfiles enumerates the supported identity presets.
+var identityProfiles = []string{IdentityProfileZed, IdentityProfileGateway}
+
+// Capability profile presets.
+const (
+	// CapabilitiesProfileZed advertises the fs/terminal/elicitation capabilities Zed advertises.
+	CapabilitiesProfileZed = "zed"
+	// CapabilitiesProfileSandbox advertises none of them.
+	CapabilitiesProfileSandbox = "sandbox"
+)
+
+// capabilityProfiles enumerates the supported capability presets.
+var capabilityProfiles = []string{CapabilitiesProfileZed, CapabilitiesProfileSandbox}
+
+// DefaultZedClientVersion is the Zed version string captured from the reference implementation.
+//
+// @purpose Supplies the identity.version default so the value is data, not a code literal repeated
+// at the construction site.
+// @rationale Zed 1.30.2+stable.398.610ea4b8de1c6e887f03563f067278002f41256e is the client whose
+// traffic produced docs/acp-conformance.md. Operators override it via
+// identity.version / AGY_GW_IDENTITY_VERSION when chasing a newer Zed.
+const DefaultZedClientVersion = "1.30.2+stable.398.610ea4b8de1c6e887f03563f067278002f41256e"
+
+func validIdentityProfile(v string) bool { return contains(identityProfiles, v) }
+
+func validCapabilityProfile(v string) bool { return contains(capabilityProfiles, v) }
 
 // allocationStrategies enumerates how the pool assigns accounts to workers.
 //

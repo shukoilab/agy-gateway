@@ -28,7 +28,7 @@ import (
 )
 
 // @title           agy-gateway API
-// @version         3.16.8
+// @version         3.17.0
 // @description     An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).
 // @termsOfService  https://github.com/shukoilab/agy-gateway
 

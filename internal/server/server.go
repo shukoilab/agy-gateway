@@ -50,11 +50,6 @@ func NewServer(
 		mux.HandleFunc("GET "+metricsPath, opsHandlers.HandleMetrics)
 	}
 
-	// 1b. Internal Loopback MCP Bridge Endpoint (Localhost JSON-RPC 2.0 router for agy acp stdio bridge)
-	if loopbackServer != nil {
-		mux.HandleFunc("POST /internal/mcp/", loopbackServer.ServeHTTP)
-	}
-
 	// 2. OpenAI Endpoints (Protected by ClientAuth)
 	mux.Handle("POST /v1/chat/completions", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleChatCompletions)))
 	mux.Handle("GET /v1/models", mw.ClientAuth(http.HandlerFunc(openaiHandlers.HandleListModels)))

@@ -18,6 +18,7 @@ import (
 	"agy-gateway/internal/acp"
 	"agy-gateway/internal/config"
 	"agy-gateway/internal/mcp"
+	"agy-gateway/internal/media"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/openai"
 	"agy-gateway/internal/pool"
@@ -32,6 +33,7 @@ type OpenAIHandlers struct {
 	failover       *pool.FailoverCoordinator
 	modelRegistry  *models.ModelRegistry
 	loopbackServer *mcp.LoopbackServer
+	toolSockets    *mcp.SocketServer
 	translator     *openai.Translator
 	logger         *slog.Logger
 }
@@ -57,8 +59,10 @@ func NewOpenAIHandlers(
 		failover:       failover,
 		modelRegistry:  modelRegistry,
 		loopbackServer: loopbackServer,
-		translator:     openai.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens),
-		logger:         logger,
+		toolSockets:    mcp.NewSocketServer(loopbackServer, logger),
+		translator: openai.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens).
+			WithMedia(media.NewResolver(mediaConfig(cfg))),
+		logger: logger,
 	}
 }
 
@@ -113,15 +117,30 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 
 	if req.N != nil && *req.N > 1 {
-		h.writeOpenAIError(w, http.StatusBadRequest, "n > 1 is not supported by this gateway", "invalid_request_error", "unsupported_value", "n")
+		h.writeOpenAIError(w, http.StatusBadRequest, "Only n=1 is supported", "invalid_request_error", "invalid_value", "n")
 		return
 	}
 
-	// FR-07: agy advertises image support but the model rejects every image with INVALID_ARGUMENT.
+	// ACP can express only model, thought_level and mode. Every other provider parameter is either
+	// reported truthfully in a response header (default) or refused outright, per
+	// execution.unsupported_parameter_policy. Never silently accepted.
+	unsupported := ignoredOpenAIParams(&req)
+	if rejectUnsupportedParams(h.cfg, unsupported, func(status int, message, errType, errCode, param string) {
+		h.writeOpenAIError(w, status, message, errType, errCode, param)
+	}) {
+		return
+	}
+	if joined := annotateIgnoredParams(w, unsupported); joined != "" {
+		h.logger.Debug("openai request carries parameters ACP cannot honour", "ignored", sortedCopy(unsupported))
+	}
+
+	// Images are forwarded to the agent as real ACP image blocks; `vision_mode: reject` is the
+	// explicit opt-out for deployments that must not accept binary payloads. The error shape is the
+	// provider's own, not a gateway-invented code.
 	if where := openAIVisionRequest(&req); where != "" && visionModeRejects(h.cfg) {
 		h.writeOpenAIError(w, http.StatusBadRequest,
-			fmt.Sprintf("Image content is not supported by the upstream agent (%s). Send a textual description instead, or set execution.vision_mode=flatten to degrade silently.", where),
-			"invalid_request_error", "image_not_supported", "messages")
+			fmt.Sprintf("Image input is disabled by this deployment (vision_mode=reject); the offending content is at %s", where),
+			"invalid_request_error", "invalid_value", "messages")
 		return
 	}
 
@@ -130,7 +149,12 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
-	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
+	systemPrompt, promptBlocks, mediaErr := h.translator.TranslateWithMedia(r.Context(), &req, delimiter)
+	if mediaErr != nil {
+		h.writeOpenAIError(w, mediaErrorStatus(mediaErr),
+			fmt.Sprintf("Invalid image input: %v", mediaErr), "invalid_request_error", "invalid_value", "messages")
+		return
+	}
 
 	h.logger.Debug("openai completion request received",
 		"model", req.Model,
@@ -186,8 +210,8 @@ func (h *OpenAIHandlers) handleSync(
 			return
 		}
 		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-		in.LoopbackSessionID = loopbackSessionID
-		in.LoopbackToken = state.Token
+		in.ClientToolSessionID = loopbackSessionID
+		in.ClientToolSockets = h.toolSockets
 		in.LoopbackState = state
 		in.ClientToolNames = extractOpenAIToolNames(req.Tools)
 	}
@@ -210,6 +234,17 @@ func (h *OpenAIHandlers) handleSync(
 	if err != nil {
 		h.writeTurnError(w, err, h.cfg.Pool.FirstTokenTimeout)
 		return
+	}
+
+	// The applied model and reasoning level are facts the caller cannot infer from the provider
+	// schema, and the agent's own conversation title has no field anywhere. Report all three as
+	// headers so a harness can see what actually happened upstream.
+	w.Header().Set("X-Agy-Model", modelEntry.UpstreamModel)
+	if outcome.AppliedThoughtLevel != "" {
+		w.Header().Set("X-Agy-Thought-Level", outcome.AppliedThoughtLevel)
+	}
+	if outcome.SessionTitle != "" {
+		w.Header().Set("X-Agy-Session-Title", outcome.SessionTitle)
 	}
 
 	_, toolCalls := assembleOpenAITools(outcome)
@@ -271,6 +306,15 @@ func (h *OpenAIHandlers) handleStreaming(
 	createdTime int64,
 ) {
 	telemetry.DefaultMetrics.RequestsStreaming.Add(1)
+
+	// These two are known before the turn runs, and the SSE writer commits the status line on the
+	// first flush — so they must be set here, not after the turn. X-Agy-Session-Title is not set for
+	// streaming responses: the agent assigns the title mid-conversation and the header block is long
+	// gone by then. Harnesses that need it read the sync endpoint or the admin API.
+	w.Header().Set("X-Agy-Model", modelEntry.UpstreamModel)
+	if thoughtLevel != "" {
+		w.Header().Set("X-Agy-Thought-Level", thoughtLevel)
+	}
 
 	sseWriter, err := openai.NewSSEWriter(w)
 	if err != nil {
@@ -340,8 +384,8 @@ func (h *OpenAIHandlers) handleStreaming(
 			return
 		}
 		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-		in.LoopbackSessionID = loopbackSessionID
-		in.LoopbackToken = state.Token
+		in.ClientToolSessionID = loopbackSessionID
+		in.ClientToolSockets = h.toolSockets
 		in.LoopbackState = state
 		in.ClientToolNames = extractOpenAIToolNames(req.Tools)
 	}
@@ -420,8 +464,7 @@ func (h *OpenAIHandlers) handleStreaming(
 		return
 	}
 
-	_, toolCalls := assembleOpenAITools(outcome)
-	_ = toolCalls
+	_, _ = assembleOpenAITools(outcome)
 
 	finishReason := "stop"
 	if len(outcome.Tools) > 0 {
@@ -636,7 +679,24 @@ func (h *OpenAIHandlers) writeTurnError(w http.ResponseWriter, err error, ttft t
 		return
 	}
 	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeInvalidParams {
-		h.writeOpenAIError(w, http.StatusBadRequest, "upstream rejected the request: "+respErr.Message, "invalid_request_error", "model_not_available", "model")
+		// ACP answers -32602 for an unknown session, an unknown config option, or a level the
+		// selected model does not offer. Those are all caller-fixable, so they map to a
+		// provider-native 400 rather than a server fault. The offending parameter is named only when
+		// the message actually identifies one — inventing "model" for a session fault would mislead.
+		param := ""
+		lower := strings.ToLower(respErr.Message)
+		if strings.Contains(lower, "model") || strings.Contains(lower, "thinking level") ||
+			strings.Contains(lower, "thought") || strings.Contains(lower, "config option") {
+			param = "model"
+		}
+		h.writeOpenAIError(w, http.StatusBadRequest, "upstream rejected the request: "+respErr.Message, "invalid_request_error", "invalid_value", param)
+		return
+	}
+	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeMethodNotFound {
+		// The agent does not implement a method the gateway needs: a version/support fault, never the
+		// caller's fault, so it stays a 500 and never leaks the method name upward.
+		h.logger.Error("upstream agent does not implement a required ACP method", "err", err)
+		h.writeOpenAIError(w, http.StatusInternalServerError, "Inference error", "api_error", "inference_error", "")
 		return
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

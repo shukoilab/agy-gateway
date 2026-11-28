@@ -162,10 +162,19 @@ func (m *ChatMessage) ContentString() string {
 	case []any:
 		var sb string
 		for _, part := range v {
-			if pm, ok := part.(map[string]any); ok {
-				if t, ok := pm["text"].(string); ok {
-					sb += t
-				}
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, ok := pm["text"].(string); ok {
+				sb += t
+				continue
+			}
+			// An image part has no textual form. Saying so is mandatory: previously this branch
+			// dropped it, so a conversation history containing an image looked to the agent as if
+			// the user had sent nothing at all.
+			if typ, _ := pm["type"].(string); typ == "image_url" || typ == "input_image" {
+				sb += "[image]"
 			}
 		}
 		return sb
@@ -175,4 +184,79 @@ func (m *ChatMessage) ContentString() string {
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
+}
+
+// ContentParts decodes the polymorphic `content` field into ordered typed parts.
+//
+// @purpose Gives the translator a real content-part view instead of a text-only string.
+// @rationale ContentString concatenated only `part["text"]`, so an image part vanished without a
+// trace: the request "succeeded" with the image silently dropped. Images are a first-class ACP
+// prompt block, so they must survive decoding.
+//
+// @preconditions None; Content may be a string, a []any of maps, or nil.
+// @param None.
+// @returns Ordered parts whose Type is "text" or "image_url"; a plain string yields one text part.
+// @throws None; malformed parts are skipped rather than failing the whole request.
+// @invariants O(len(parts)).
+func (m *ChatMessage) ContentParts() []ContentPart {
+	switch v := m.Content.(type) {
+	case string:
+		if v == "" {
+			return nil
+		}
+		return []ContentPart{{Type: "text", Text: v}}
+	case []any:
+		parts := make([]ContentPart, 0, len(v))
+		for _, raw := range v {
+			pm, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := pm["type"].(string)
+			switch typ {
+			case "text", "input_text":
+				text, _ := pm["text"].(string)
+				parts = append(parts, ContentPart{Type: "text", Text: text})
+			case "image_url", "input_image":
+				part := ContentPart{Type: "image_url"}
+				switch img := pm["image_url"].(type) {
+				case map[string]any:
+					if u, ok := img["url"].(string); ok {
+						part.ImageURL = &ImageURL{URL: u}
+					}
+				case string:
+					part.ImageURL = &ImageURL{URL: img}
+				}
+				// Some clients send `url` at the part level rather than nested.
+				if part.ImageURL == nil {
+					if u, ok := pm["url"].(string); ok {
+						part.ImageURL = &ImageURL{URL: u}
+					}
+				}
+				if part.ImageURL != nil && part.ImageURL.URL != "" {
+					parts = append(parts, part)
+				}
+			}
+		}
+		return parts
+	case nil:
+		return nil
+	default:
+		return nil
+	}
+}
+
+// HasImage reports whether the message carries at least one image part.
+//
+// @purpose Lets callers branch on image presence without decoding twice.
+// @param None.
+// @returns true when a decodable image part exists.
+// @invariants O(len(parts)).
+func (m *ChatMessage) HasImage() bool {
+	for _, p := range m.ContentParts() {
+		if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+			return true
+		}
+	}
+	return false
 }

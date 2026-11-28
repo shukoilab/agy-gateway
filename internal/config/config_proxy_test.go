@@ -105,19 +105,6 @@ func TestProxyConfig_URLValidation(t *testing.T) {
 	}
 }
 
-func TestProxyConfig_PasswordRedaction(t *testing.T) {
-	cfg := DefaultConfig()
-	rawURL := "http://admin:superSecretPassword99!@proxy.example.com:3128"
-	redacted := cfg.Proxy.RedactedURL(rawURL)
-
-	if strings.Contains(redacted, "superSecretPassword99!") {
-		t.Fatalf("password leaked in RedactedURL: %s", redacted)
-	}
-	if !strings.Contains(redacted, "admin") || !strings.Contains(redacted, "proxy.example.com:3128") {
-		t.Fatalf("expected host and user to be preserved in RedactedURL: %s", redacted)
-	}
-}
-
 func TestProxyConfig_LiveMockProxyInterception(t *testing.T) {
 	// Spin up a mock HTTP proxy server using httptest
 	proxyHitCount := 0

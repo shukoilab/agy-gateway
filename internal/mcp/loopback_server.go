@@ -3,13 +3,10 @@
 package mcp
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -26,8 +23,6 @@ var (
 	// Failing loudly is required: silently truncating the list would make the model call tools that
 	// the client never advertised.
 	ErrTooManyTools = errors.New("too many client tools declared")
-	// ErrUnauthorized is returned when the loopback bearer token does not match the session token.
-	ErrUnauthorized = errors.New("mcp session token invalid")
 )
 
 // MCPToolDefinition represents an official Model Context Protocol tool schema.
@@ -46,10 +41,7 @@ type InterceptedToolCall struct {
 
 // SessionState encapsulates registered tools and intercepted calls for an active session.
 type SessionState struct {
-	SessionID string
-	// Token is the per-session bearer credential the stdio bridge must present. Session ids appear
-	// in process arguments, so they cannot double as a secret.
-	Token      string
+	SessionID  string
 	Tools      []MCPToolDefinition
 	Calls      chan InterceptedToolCall
 	CreatedAt  time.Time
@@ -114,19 +106,6 @@ func NewLoopbackServer(maxTools ...int) *LoopbackServer {
 
 // DefaultMaxClientTools is the fallback ceiling when the caller supplies none.
 const DefaultMaxClientTools = 128
-
-// newSessionToken mints a full-entropy bearer token for one loopback session.
-//
-// @purpose Gives the stdio bridge a credential that is not derivable from the session id.
-// @rationale Session ids are passed on the child process command line and therefore appear in `ps`;
-// a short suffix of the same UUID would be guessable enough to matter.
-// @preconditions None.
-// @returns A 32-hex-character random token.
-// @throws None; falls back to a random UUID string.
-// @invariants O(1), cryptographically random, never logged.
-func newSessionToken() string {
-	return strings.ReplaceAll(uuid.NewString(), "-", "")
-}
 
 // RegisterSession registers an array of OpenAI tools under a unique session ID.
 //
@@ -219,7 +198,6 @@ func (s *LoopbackServer) register(sessionID string, defs []MCPToolDefinition) (*
 
 	state := &SessionState{
 		SessionID:  sessionID,
-		Token:      newSessionToken(),
 		Tools:      defs,
 		Calls:      make(chan InterceptedToolCall, 32),
 		CreatedAt:  time.Now(),
@@ -264,28 +242,6 @@ func (s *LoopbackServer) UnregisterSession(sessionID string) {
 		delete(s.sessions, sessionID)
 		slog.Debug("loopback session unregistered", "sessionID", sessionID)
 	}
-}
-
-// ValidateToken constant-time-compares a presented bearer token with the session token.
-//
-// @purpose Authenticates the stdio bridge before any MCP method is dispatched.
-// @rationale The bridge runs as a child of agy and reaches the gateway over loopback HTTP; without a
-// credential any local process could invoke tools/call against a live session.
-// @preconditions The session must be registered.
-// @param sessionID Session whose token to compare against.
-// @param presented Caller-supplied token; may be empty.
-// @returns nil when the token matches, ErrUnauthorized otherwise.
-// @throws None.
-// @invariants O(len(token)) constant-time; no early exit on mismatch.
-func (s *LoopbackServer) ValidateToken(sessionID, presented string) error {
-	state, err := s.GetSession(sessionID)
-	if err != nil {
-		return ErrUnauthorized
-	}
-	if presented == "" || subtle.ConstantTimeCompare([]byte(state.Token), []byte(presented)) != 1 {
-		return ErrUnauthorized
-	}
-	return nil
 }
 
 // jsonrpcRequest represents an incoming JSON-RPC 2.0 message.
@@ -446,53 +402,6 @@ func (s *LoopbackServer) HandleJSONRPC(sessionID string, reqBytes []byte) ([]byt
 		Error:   rpcErr,
 	}
 	return json.Marshal(resp)
-}
-
-// ServeHTTP provides a native HTTP endpoint for MCP over HTTP transport.
-// Route: POST /internal/mcp/:sessionId
-func (s *LoopbackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(pathParts) < 3 || pathParts[0] != "internal" || pathParts[1] != "mcp" {
-		http.Error(w, "Invalid MCP endpoint URL path", http.StatusBadRequest)
-		return
-	}
-	sessionID := pathParts[2]
-
-	// Constant-time bearer check: the session token is minted at registration and injected into the
-	// bridge process environment, so an unauthenticated caller cannot enumerate or hijack sessions.
-	presented := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-	if err := s.ValidateToken(sessionID, presented); err != nil {
-		slog.Warn("loopback mcp request rejected", "sessionID", sessionID, "presentedLen", len(presented), "err", err)
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":{"message":"invalid or missing session token","type":"authentication_error"}}`))
-		return
-	}
-	slog.Debug("loopback mcp request accepted", "sessionID", sessionID)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read request body: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	respBytes, err := s.HandleJSONRPC(sessionID, body)
-	if err != nil {
-		http.Error(w, "MCP error: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if respBytes == nil {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(respBytes)
 }
 
 // MatchAndNormalizeToolName checks if an incoming tool name matches any registered client tool.

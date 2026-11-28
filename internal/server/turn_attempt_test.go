@@ -138,8 +138,8 @@ func writeFrame(w io.Writer, id int64, result string) {
 // session channel, leaving every failover retry without client tools.
 // @rationale The session is registered once per HTTP request while
 // executeTurnAttempt runs once per attempt; closing it inside the attempt made
-// attempt 2 reuse a token that GetSession and ValidateToken already rejected,
-// so tool delegation failed silently with HTTP 401 from the bridge.
+// attempt 2 reuse a session the loopback server had already dropped, so tool
+// delegation failed silently because every bridge call was rejected.
 // @preconditions A fresh loopback server and config.
 // @param t (testing.T) - Standard Go test handle.
 // @returns None.
@@ -158,20 +158,20 @@ func TestTurnAttemptKeepsLoopbackSessionOpenAcrossAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register session: %v", err)
 	}
-	if err := loopback.ValidateToken("sess_attempt", state.Token); err != nil {
-		t.Fatalf("token must be valid before the attempt: %v", err)
+	if _, err := loopback.GetSession("sess_attempt"); err != nil {
+		t.Fatalf("session must exist before the attempt: %v", err)
 	}
 
 	w := newTurnAttemptTestWorker(t, cfg, nil)
 	in := turnInput{
-		Ctx:               context.Background(),
-		ModelEntry:        &models.ModelInfo{ID: "test", UpstreamModel: "gemini-3.8-flash"},
-		ThoughtLevel:      "medium",
-		SystemPrompt:      "",
-		PromptBlocks:      []acp.PromptBlock{{Type: "text", Text: "hi"}},
-		LoopbackSessionID: "sess_attempt",
-		LoopbackToken:     state.Token,
-		LoopbackState:     state,
+		Ctx:                 context.Background(),
+		ModelEntry:          &models.ModelInfo{ID: "test", UpstreamModel: "gemini-3.8-flash"},
+		ThoughtLevel:        "medium",
+		SystemPrompt:        "",
+		PromptBlocks:        []acp.PromptBlock{{Type: "text", Text: "hi"}},
+		ClientToolSessionID: "sess_attempt",
+		ClientToolSockets:   mcp.NewSocketServer(loopback, nil),
+		LoopbackState:       state,
 	}
 
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -183,8 +183,8 @@ func TestTurnAttemptKeepsLoopbackSessionOpenAcrossAttempts(t *testing.T) {
 		if _, err := loopback.GetSession("sess_attempt"); err != nil {
 			t.Fatalf("session closed after attempt %d: %v", attempt, err)
 		}
-		if err := loopback.ValidateToken("sess_attempt", state.Token); err != nil {
-			t.Fatalf("token rejected after attempt %d: %v", attempt, err)
+		if _, err := loopback.GetSession("sess_attempt"); err != nil {
+			t.Fatalf("session rejected after attempt %d: %v", attempt, err)
 		}
 		select {
 		case state.Calls <- mcp.InterceptedToolCall{ID: "probe", Name: "get_weather"}:

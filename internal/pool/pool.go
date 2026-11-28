@@ -12,6 +12,7 @@ import (
 
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/config"
+	"agy-gateway/internal/telemetry"
 )
 
 // ErrQueueSaturated reports that every worker stayed leased past the acquire timeout.
@@ -994,12 +995,24 @@ func (p *Pool) Release(w *Worker) {
 		w.CleanWorkspace()
 
 		// Check if recycling is mandated
-		shouldRecycle := w.TaintedForRecycle.Load() ||
-			(p.cfg.Pool.MaxRequestsPerWorker > 0 && w.RequestCount.Load() >= int64(p.cfg.Pool.MaxRequestsPerWorker)) ||
-			(p.cfg.Pool.MaxWorkerUptime > 0 && time.Since(w.CreatedAt) >= p.cfg.Pool.MaxWorkerUptime)
+		tainted := w.TaintedForRecycle.Load()
+		requestCeiling := p.cfg.Pool.MaxRequestsPerWorker > 0 && w.RequestCount.Load() >= int64(p.cfg.Pool.MaxRequestsPerWorker)
+		uptimeCeiling := p.cfg.Pool.MaxWorkerUptime > 0 && time.Since(w.CreatedAt) >= p.cfg.Pool.MaxWorkerUptime
+		shouldRecycle := tainted || requestCeiling || uptimeCeiling
 
 		if shouldRecycle {
-			p.log().Info("proactively recycling worker", "workerID", w.ID, "tainted", w.TaintedForRecycle.Load())
+			p.log().Info("proactively recycling worker", "workerID", w.ID, "tainted", tainted)
+			// Counted by reason so a rising taint count (an account or transport fault) is
+			// distinguishable from ordinary rotation waste.
+			telemetry.DefaultMetrics.WorkerRecycleTotal.Add(1)
+			switch {
+			case tainted:
+				telemetry.DefaultMetrics.WorkerRecycleTainted.Add(1)
+			case requestCeiling:
+				telemetry.DefaultMetrics.WorkerRecycleRequests.Add(1)
+			default:
+				telemetry.DefaultMetrics.WorkerRecycleUptime.Add(1)
+			}
 			w.Close()
 
 			// Reset worker state

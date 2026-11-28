@@ -22,10 +22,31 @@ binaries:
   agy_min_version: "1.5.16"
   agy_auth_path: "/usr/local/bin/agy-auth"
 
+# Identity presented to the ACP agent during initialize. "zed" sends the reference editor
+# fingerprint that agy was verified against; "gateway" reports this process instead. The version
+# string is data (config/env), never a code literal, so it can track the verified reference.
+identity:
+  profile: "zed"
+  name: "zed"
+  title: "Zed"
+  version: "1.30.2+stable.398.610ea4b8de1c6e887f03563f067278002f41256e"
+
+# Client capabilities advertised to the ACP agent. "zed" advertises filesystem and terminal
+# access (the gateway implements both handlers); "sandbox" advertises none of them. Advertising a
+# capability without its handler stalls the turn, so the profiles always match the implementation.
+capabilities:
+  profile: "zed"
+  fs: true
+  terminal: true
+  elicitation: true
+  session_metadata: true
+
 execution:
   # The ACP argv is fixed by the gateway (always --dangerously-skip-permissions) and the system
   # prompt is always delivered as the first prompt block; neither is configurable.
-  vision_mode: "reject"         # reject|flatten - agy cannot process images
+  # auto forwards image content to agy, which decodes and describes it natively; reject refuses
+  # image input with a provider-native 400 (for deployments that must not accept binary payloads).
+  vision_mode: "auto"
   clean_workspace_between_requests: true
   max_retries: 3
   retry_initial_backoff: "500ms"
@@ -36,6 +57,19 @@ execution:
   # preserves every assistant turn. Whole turns are only dropped when prose alone exceeds the budget,
   # and then the opening turn and the newest turns are kept. 0 disables the bound.
   max_history_tokens: 60000
+  # ACP can only set model, thought_level and mode, so every other sampling parameter a client
+  # sends (temperature, top_p, max_tokens, ...) is structurally absent upstream. "ignore" accepts
+  # them and names them in the X-Agy-Ignored-Params response header; "reject" answers a
+  # provider-native invalid_request_error naming the first unsupported parameter.
+  unsupported_parameter_policy: "ignore"
+  # Media policy for consumer-supplied image references. Remote fetches are a server-side request
+  # forgery surface, so they are bounded and private/link-local addresses are refused.
+  media:
+    allow_remote: true
+    max_bytes: 8388608
+    fetch_timeout: "10s"
+    allowed_mime_types: ["image/png", "image/jpeg", "image/gif", "image/webp"]
+    allow_private_hosts: false
 
 storage:
   base_data_dir: "/var/lib/agy-gateway"

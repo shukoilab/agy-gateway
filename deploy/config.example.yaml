@@ -22,12 +22,34 @@ binaries:
   agy_min_version: "1.5.16"
   agy_auth_path: "/usr/local/bin/agy-auth"
 
+# Identity + capabilities advertised to the ACP agent during initialize. "zed" sends the reference
+# fingerprint agy was verified against; "gateway" reports this process. Version is data, not a literal.
+identity:
+  profile: "zed"
+  name: "zed"
+  title: "Zed"
+  version: "1.30.2+stable.398.610ea4b8de1c6e887f03563f067278002f41256e"
+
+capabilities:
+  profile: "zed"      # zed advertises fs+terminal (handlers implemented); sandbox advertises none
+  fs: true
+  terminal: true
+  elicitation: true
+  session_metadata: true
+
 execution:
   # The ACP argv is fixed by the gateway (always --dangerously-skip-permissions) and the system
   # prompt is always delivered as the first prompt block; neither is configurable.
-  vision_mode: "reject"         # reject|flatten - agy cannot process images
+  vision_mode: "auto"           # auto forwards images (agy decodes them); reject refuses them
   clean_workspace_between_requests: true
   max_history_tokens: 60000     # estimated-token budget for forwarded history; 0 disables
+  unsupported_parameter_policy: "ignore"  # ignore (header) | reject (provider-native 400)
+  media:
+    allow_remote: true
+    max_bytes: 8388608
+    fetch_timeout: "10s"
+    allowed_mime_types: ["image/png", "image/jpeg", "image/gif", "image/webp"]
+    allow_private_hosts: false
 
 storage:
   base_data_dir: "/var/lib/agy-gateway"

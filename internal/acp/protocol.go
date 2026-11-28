@@ -37,6 +37,7 @@ const (
 	UpdateToolCall          = "tool_call"
 	UpdateToolCallUpdate    = "tool_call_update"
 	UpdateUsage             = "usage_update"
+	UpdateSessionInfo       = "session_info_update"
 	UpdateAvailableCommands = "available_commands_update"
 	UpdateConfigOption      = "config_option_update"
 	UpdateNotice            = "notice"
@@ -286,16 +287,33 @@ type SetConfigOptionParams struct {
 // PromptBlock represents rich content in an ACP session/prompt request.
 //
 // @purpose Carries one ACP ContentBlock of the subset the gateway actually forwards.
-// @rationale The ACP v1 ContentBlock union is wider (image/audio/resource); those variants are refused
-// by the model on agy 1.5.16, so the gateway never populates their payload fields.
+// @rationale ACP v1 ContentBlock is a union that includes image blocks, and `agy` accepts them
+// (promptCapabilities.image: true). The earlier version of this type had no payload field for image
+// bytes, so images could only be replaced by a text placeholder — a silently broken feature rather
+// than a refused one.
 //
-// @invariants Type is "text" or "resource_link" in practice; Text is set for text blocks.
+// @invariants Type is "text" or "image"; Text is set for text blocks, Data+MimeType for image blocks.
 type PromptBlock struct {
-	Type     string `json:"type"` // "text", "resource_link", "image", "audio", "resource"
+	Type     string `json:"type"` // "text", "image", ...
 	Text     string `json:"text,omitempty"`
-	URI      string `json:"uri,omitempty"`
+	Data     string `json:"data,omitempty"`     // base64 payload for image blocks (no data: prefix)
+	MimeType string `json:"mimeType,omitempty"` // e.g. "image/png"
+	URI      string `json:"uri,omitempty"`      // client-side pseudo-URL; informational
 	Name     string `json:"name,omitempty"`
-	MimeType string `json:"mimeType,omitempty"`
+}
+
+// NewImageBlock builds an ACP image content block from raw base64 data.
+//
+// @purpose Single construction point so callers cannot emit an image block without its mime type.
+// @preconditions data is base64 (no `data:` prefix) and mimeType is a non-empty media type.
+// @param mimeType Declared media type of the image.
+// @param data Base64-encoded image bytes.
+// @param uri Optional client-side reference; ignored by the agent.
+// @returns A prompt block of type "image".
+// @throws None.
+// @invariants O(1).
+func NewImageBlock(mimeType, data, uri string) PromptBlock {
+	return PromptBlock{Type: "image", Data: data, MimeType: mimeType, URI: uri}
 }
 
 // SanitizeToolArguments removes agent-injected keys that are not part of a tool's declared input schema.

@@ -1,6 +1,7 @@
 package anthropic
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"agy-gateway/internal/acp"
+	"agy-gateway/internal/media"
 )
 
 // Translator converts Anthropic MessageRequest structures into ACP prompt payloads.
@@ -21,6 +23,8 @@ import (
 type Translator struct {
 	// maxHistoryTokens bounds the rendered history; 0 disables the bound.
 	maxHistoryTokens int
+	// media resolves consumer-supplied image references. nil keeps the translator text-only.
+	media *media.Resolver
 }
 
 // NewTranslator creates an initialized Translator with history bounding disabled.
@@ -35,6 +39,87 @@ func NewTranslator() *Translator {
 // @returns a Translator ready for concurrent use.
 func NewTranslatorWithBudget(maxHistoryTokens int) *Translator {
 	return &Translator{maxHistoryTokens: maxHistoryTokens}
+}
+
+// WithMedia attaches an image resolver, enabling Anthropic image blocks to become ACP image blocks.
+//
+// @purpose Enables the multimodal path without changing the text-only constructors.
+// @rationale The fetch policy belongs to the server layer, so the resolver is injected.
+// @preconditions r may be nil, which restores text-only behaviour.
+// @param r Resolver built from configuration.
+// @returns The same Translator, for chaining.
+// @throws None.
+// @invariants O(1).
+func (t *Translator) WithMedia(r *media.Resolver) *Translator {
+	t.media = r
+	return t
+}
+
+// TranslateWithMedia renders the conversation and appends images from the newest user turn.
+//
+// @purpose Carries Anthropic `image` blocks through to the agent instead of replacing them with text.
+// @rationale The previous implementation emitted the literal "[Image Attached]", so the model was
+// asked about an image it never received. `agy` accepts image blocks natively.
+// @preconditions t.media may be nil, in which case images fall back to the placeholder.
+// @param ctx Cancellation root for remote fetches.
+// @param req Decoded request.
+// @param delimiter Legacy text-tool delimiter tag.
+// @returns System prompt, ordered blocks, and the first image resolution error.
+// @throws None; image failures are returned for the handler to map to a provider error.
+// @invariants O(rendered history + images).
+func (t *Translator) TranslateWithMedia(ctx context.Context, req *MessageRequest, delimiter string) (string, []acp.PromptBlock, error) {
+	systemPrompt, blocks := t.Translate(req, delimiter)
+	if t.media == nil || req == nil || len(req.Messages) == 0 {
+		return systemPrompt, blocks, nil
+	}
+	last := req.Messages[len(req.Messages)-1]
+	if !strings.EqualFold(last.Role, "user") {
+		return systemPrompt, blocks, nil
+	}
+	images, err := t.imageBlocks(ctx, last)
+	if err != nil {
+		return "", nil, err
+	}
+	return systemPrompt, append(blocks, images...), nil
+}
+
+// imageBlocks resolves the image blocks of one message into ACP image blocks.
+//
+// @purpose Single resolution path for Anthropic image content.
+// @rationale Both base64 and URL sources must be handled, and both must pass the same policy.
+// @preconditions msg may carry no images.
+// @param ctx Cancellation root for remote fetches.
+// @param msg The user message.
+// @returns Ordered image blocks.
+// @throws The first resolution error.
+// @invariants O(blocks); one fetch per image.
+func (t *Translator) imageBlocks(ctx context.Context, msg Message) ([]acp.PromptBlock, error) {
+	var blocks []acp.PromptBlock
+	for _, block := range msg.Content.Blocks {
+		if block.Type != "image" || block.Source == nil {
+			continue
+		}
+		src := block.Source
+		switch strings.ToLower(src.Type) {
+		case "base64":
+			ref := "data:" + src.MediaType + ";base64," + src.Data
+			mimeType, data, err := t.media.Resolve(ctx, ref)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, acp.NewImageBlock(mimeType, data, ""))
+		case "url":
+			if src.URL == "" {
+				continue
+			}
+			mimeType, data, err := t.media.Resolve(ctx, src.URL)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, acp.NewImageBlock(mimeType, data, src.URL))
+		}
+	}
+	return blocks, nil
 }
 
 // Translate converts the Anthropic conversation into an ACP prompt payload.
@@ -255,6 +340,8 @@ func (t *Translator) formatUserMessage(sb *strings.Builder, msg Message, intactT
 				toolResults = append(toolResults, fmt.Sprintf("Tool Output (id: %s): %s", block.ToolUseID, resStr))
 			}
 		case "image":
+			// History rendering stays textual by contract; the newest turn's images travel as real
+			// ACP image blocks via TranslateWithMedia, which is why this marker says where they were.
 			textParts = append(textParts, "[Image Attached]")
 		}
 	}

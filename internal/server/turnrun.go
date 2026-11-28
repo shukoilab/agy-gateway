@@ -38,13 +38,21 @@ type turnInput struct {
 	SystemPrompt string
 	PromptBlocks []acp.PromptBlock
 
-	// Loopback session used for client tool delegation. Empty when the caller declared no tools.
-	LoopbackSessionID string
-	LoopbackToken     string
+	// Client-tool delegation state. ClientToolSessionID is the registry key the bridge's calls are
+	// attributed to and is empty when the caller declared no tools; ClientToolRegistry owns the
+	// SessionState for that key.
+	ClientToolSessionID string
+	// ClientToolSockets serves the registry over a per-turn Unix socket in the worker's TMPDIR.
+	ClientToolSockets *mcp.SocketServer
 	LoopbackState     *mcp.SessionState
 	ClientToolNames   []string
 	// StopSequences are client-supplied sequences that must truncate the stream gateway-side.
 	StopSequences []string
+	// AdditionalDirectories are extra workspace roots the consumer granted (OpenAI has no field for
+	// this, Anthropic neither; populated from the admin/config layer when available).
+	AdditionalDirectories []string
+	// ClientMCPServers are MCP servers the consumer declared, forwarded to session/new verbatim.
+	ClientMCPServers []acp.MCPServerInfo
 	// ParseTextToolCalls recovers tool calls a model emitted as delimiter-tagged text instead of native
 	// ACP tool_call updates. Provider-specific because the parser and payload shape differ.
 	ParseTextToolCalls func(text string) (string, []toolCollectorEntry)
@@ -78,6 +86,14 @@ type turnResult struct {
 	StopMatched     bool
 	MatchedSequence string
 	FirstTokenSeen  bool
+	// SessionTitle is the agent's auto-generated conversation title (session_info_update). It is the
+	// only human-meaningful name a session ever gets, and both provider schemas lack a field for it,
+	// so it is surfaced as a response header and through the admin API instead of being discarded.
+	SessionTitle string
+	// AppliedThoughtLevel is the reasoning level actually in force upstream. It can differ from the
+	// requested one when the selected model does not offer it, so reporting it is what makes a
+	// downgrade visible instead of silent.
+	AppliedThoughtLevel string
 }
 
 // ErrFirstTokenTimeout reports that no token arrived within the configured budget.
@@ -119,7 +135,7 @@ func executeTurnAttempt(
 		ctx = in.Ctx
 	}
 
-	sessionID, promptBlocks, closeSession, err := setupACPSession(ctx, worker, cfg, logger, in)
+	sessionID, promptBlocks, closeSession, appliedThoughtLevel, err := setupACPSession(ctx, worker, cfg, logger, in)
 	if err != nil {
 		return result, err
 	}
@@ -129,6 +145,7 @@ func executeTurnAttempt(
 	if len(promptBlocks) > 0 {
 		in.PromptBlocks = promptBlocks
 	}
+	result.AppliedThoughtLevel = appliedThoughtLevel
 
 	delimiter := cfg.MCP.ClientToolCalling.DelimiterTag
 	if delimiter == "" {
@@ -156,9 +173,16 @@ func executeTurnAttempt(
 	loopbackState := in.LoopbackState
 
 	notifyOnce := sync.Once{}
+	// promptStart anchors both TTFT and the turn-duration measurement; declared here because the
+	// first-token callback is defined before the prompt is actually submitted.
+	var promptStart time.Time
 	notifyFirstToken := func() {
 		notifyOnce.Do(func() {
 			result.FirstTokenSeen = true
+			if !promptStart.IsZero() {
+				telemetry.DefaultMetrics.TTFTMillisSum.Add(time.Since(promptStart).Milliseconds())
+				telemetry.DefaultMetrics.TTFTCount.Add(1)
+			}
 			if in.OnFirstToken != nil {
 				in.OnFirstToken()
 			}
@@ -334,6 +358,15 @@ func executeTurnAttempt(
 				mu.Unlock()
 			}
 
+		case acp.UpdateSessionInfo:
+			// The agent names the conversation itself; the title is the only stable human label a
+			// session gets. Providers have no field for it, so it is reported out of band.
+			if update.Update.Title != "" {
+				mu.Lock()
+				result.SessionTitle = update.Update.Title
+				mu.Unlock()
+			}
+
 		case acp.UpdateToolCall:
 			if loopbackState == nil {
 				if in.OnInternalToolProgress != nil {
@@ -433,10 +466,25 @@ func executeTurnAttempt(
 	}
 
 	var promptResult acp.PromptResult
+	promptStart = time.Now()
+	telemetry.DefaultMetrics.PromptsStarted.Add(1)
 	callErr := worker.Transport.Call(promptCtx, "session/prompt", acp.PromptParams{
 		SessionID: sessionID,
 		Prompt:    in.PromptBlocks,
 	}, &promptResult)
+	telemetry.DefaultMetrics.TurnMillisSum.Add(time.Since(promptStart).Milliseconds())
+	telemetry.DefaultMetrics.TurnCount.Add(1)
+
+	// Classified here so every early return below is counted exactly once without repeating the call
+	// at each of them.
+	promptSucceeded := false
+	defer func() {
+		if promptSucceeded {
+			telemetry.DefaultMetrics.PromptsCompleted.Add(1)
+			return
+		}
+		telemetry.DefaultMetrics.PromptsFailed.Add(1)
+	}()
 
 	// Close both producers before snapshotting. Order matters: refuse late callbacks first, then close
 	// the loopback channel and join its drainer (which must not be blocked on `bar`), and only then
@@ -503,6 +551,7 @@ func executeTurnAttempt(
 		// the gateway itself cancelled once it had what the client needed.
 		if errors.Is(callErr, context.Canceled) &&
 			(result.Text != "" || len(result.Tools) > 0 || streamParser.IsTerminated() || result.StopMatched) {
+			promptSucceeded = true
 			return result, nil
 		}
 		// Record whether the turn produced anything, so failover can tell a refusal from a real
@@ -513,6 +562,7 @@ func executeTurnAttempt(
 		return result, callErr
 	}
 
+	promptSucceeded = true
 	return result, nil
 }
 
@@ -542,17 +592,42 @@ func setupACPSession(
 	cfg *config.Config,
 	logger *slog.Logger,
 	in turnInput,
-) (string, []acp.PromptBlock, func(), error) {
+) (string, []acp.PromptBlock, func(), string, error) {
 	sessCtx, cancelSess := context.WithTimeout(ctx, cfg.Pool.HandshakeTimeout)
 	defer cancelSess()
 
+	// Publish the client-tool endpoint BEFORE session/new. agy spawns the stdio bridge while completing
+	// the handshake, so a socket created afterwards races the MCP initialise and surfaces as a failed
+	// tool registry.
+	var toolListener *mcp.Listener
+	var sockPath string
+	if in.ClientToolSessionID != "" && in.ClientToolSockets != nil {
+		// Short name: the unix path limit is ~108 bytes and TMPDIR already carries the worker id.
+		name := "mcp-" + strings.ReplaceAll(uuid.NewString()[:8], "-", "") + ".sock"
+		ln, err := in.ClientToolSockets.Listen(worker.TmpDir, name, in.ClientToolSessionID)
+		if err != nil {
+			return "", nil, nil, "", err
+		}
+		toolListener = ln
+		sockPath = ln.Path()
+	}
+	// Closed on every path below: without it a failed handshake would leave a listening socket for the
+	// life of the worker.
+	closeToolSocket := func() {
+		if toolListener != nil {
+			toolListener.Close()
+		}
+	}
+
 	newParams := buildACPSessionNewParams(SessionSetupInput{
-		Worker:               worker,
-		Config:               cfg,
-		ConsumerSystemPrompt: in.SystemPrompt,
-		LoopbackSessionID:    in.LoopbackSessionID,
-		LoopbackToken:        in.LoopbackToken,
-		ClientToolNames:      in.ClientToolNames,
+		Worker:                worker,
+		Config:                cfg,
+		ConsumerSystemPrompt:  in.SystemPrompt,
+		ClientToolSessionID:   in.ClientToolSessionID,
+		ClientToolSocketPath:  sockPath,
+		ClientToolNames:       in.ClientToolNames,
+		AdditionalDirectories: in.AdditionalDirectories,
+		ClientMCPServers:      in.ClientMCPServers,
 	})
 
 	var newResult acp.SessionNewResult
@@ -560,21 +635,43 @@ func setupACPSession(
 		var respErr *acp.ResponseError
 		if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeAuthRequired {
 			if sleepErr := sleepCtx(sessCtx, time.Second); sleepErr != nil {
-				return "", nil, nil, sleepErr
+				closeToolSocket()
+				return "", nil, nil, "", sleepErr
 			}
 			err = worker.Transport.Call(sessCtx, "session/new", newParams, &newResult)
 		}
 		if err != nil {
-			return "", nil, nil, err
+			closeToolSocket()
+			return "", nil, nil, "", err
 		}
 	}
 	if newResult.SessionID == "" {
-		return "", nil, nil, errors.New("session/new returned an empty session id")
+		closeToolSocket()
+		return "", nil, nil, "", errors.New("session/new returned an empty session id")
 	}
+
+	// Declare which directories this session may touch. The fs handlers refuse every path outside
+	// these roots, so registering them is what makes the advertised fs capability safe rather than an
+	// arbitrary file read/write primitive for a remote harness.
+	if handlers := worker.Transport.Handlers(); handlers != nil {
+		roots := make([]string, 0, len(newParams.AdditionalDirectories)+1)
+		roots = append(roots, worker.Cwd)
+		roots = append(roots, newParams.AdditionalDirectories...)
+		handlers.RegisterSession(newResult.SessionID, roots)
+	}
+	telemetry.DefaultMetrics.SessionsCreated.Add(1)
 
 	// The closer MUST run after session/prompt completes. A defer here would tear the session down
 	// as soon as this helper returns, so every subsequent prompt fails with "Session not found".
 	closer := func() {
+		// Drains and closes the client-tool socket first: the bridge's in-flight tools/call must reach
+		// the registry, and the child must observe EOF instead of a rejected request.
+		closeToolSocket()
+		if handlers := worker.Transport.Handlers(); handlers != nil {
+			// Kills any terminal the turn started and forgets the roots.
+			handlers.UnregisterSession(newResult.SessionID)
+		}
+		telemetry.DefaultMetrics.SessionsClosed.Add(1)
 		if !worker.Capabilities.SupportsSessionClose {
 			return
 		}
@@ -587,13 +684,14 @@ func setupACPSession(
 		}
 	}
 
-	if _, err := applySessionConfigOptions(
+	appliedThoughtLevel, err := "", error(nil)
+	if _, appliedThoughtLevel, err = applySessionConfigOptions(
 		sessCtx, worker, newResult,
 		in.ModelEntry.UpstreamModel, in.ThoughtLevel,
 		cfg.Pool.ConfigSwitchTimeout, logger,
 	); err != nil {
 		closer()
-		return "", nil, nil, err
+		return "", nil, nil, "", err
 	}
 
 	// The consumer system prompt is delivered as the first prompt block. It must never travel in
@@ -605,7 +703,7 @@ func setupACPSession(
 		ClientToolNames:      in.ClientToolNames,
 	}))
 
-	return newResult.SessionID, blocks, closer, nil
+	return newResult.SessionID, blocks, closer, appliedThoughtLevel, nil
 }
 
 // sleepCtx waits for d or until the context is done.

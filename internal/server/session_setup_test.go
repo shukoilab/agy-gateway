@@ -224,7 +224,7 @@ func TestApplySessionConfigOptions_TracksLiveOptionSet(t *testing.T) {
 				write(id, string(raw))
 			})
 
-			_, err := applySessionConfigOptions(context.Background(), worker,
+			_, _, err := applySessionConfigOptions(context.Background(), worker,
 				acp.SessionNewResult{SessionID: "sess_live", ConfigOptions: modelOnly},
 				tc.model, "medium", time.Second, nil)
 			if err != nil {
@@ -289,7 +289,7 @@ func TestApplySessionConfigOptions_NoModelOptionStillAppliesLaterOptions(t *test
 		write(id, string(raw))
 	})
 
-	appliedModel, err := applySessionConfigOptions(context.Background(), worker,
+	appliedModel, _, err := applySessionConfigOptions(context.Background(), worker,
 		acp.SessionNewResult{SessionID: "sess_nomodel", ConfigOptions: noModelOption},
 		"gemini-4-hydrogen-xhigh", "medium", time.Second, nil)
 	if err != nil {

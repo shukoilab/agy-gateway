@@ -117,8 +117,27 @@ func TestValidate_RejectsInvalidEnums(t *testing.T) {
 // TestDefaults_MatchVerifiedAgentBehaviour pins the defaults that encode hard-won empirical facts.
 func TestDefaults_MatchVerifiedAgentBehaviour(t *testing.T) {
 	cfg := DefaultConfig()
-	if cfg.Execution.VisionMode != "reject" {
-		t.Errorf("vision_mode must default to reject (agy advertises image support but fails every image turn); got %q", cfg.Execution.VisionMode)
+	// vision_mode defaults to auto: image blocks are forwarded to agy, which decodes them natively
+	// (promptCapabilities.image proved true, and a probe answered "Red" for a PNG). `reject` remains
+	// available for deployments that must not accept binary payloads.
+	if cfg.Execution.VisionMode != VisionModeAuto {
+		t.Errorf("vision_mode must default to %q; got %q", VisionModeAuto, cfg.Execution.VisionMode)
+	}
+	// The identity defaults to the reference editor fingerprint, with the version as data.
+	if cfg.Identity.Profile != IdentityProfileZed {
+		t.Errorf("identity.profile must default to %q, got %q", IdentityProfileZed, cfg.Identity.Profile)
+	}
+	if cfg.Identity.Name != "zed" || cfg.Identity.Title != "Zed" {
+		t.Errorf("identity defaults must be the Zed fingerprint, got %q/%q", cfg.Identity.Name, cfg.Identity.Title)
+	}
+	if cfg.Identity.Version != DefaultZedClientVersion {
+		t.Errorf("identity.version = %q, want %q", cfg.Identity.Version, DefaultZedClientVersion)
+	}
+	// Advertising fs/terminal without handlers stalls the turn, so the zed profile must advertise
+	// both — the transport registers them.
+	if !cfg.Capabilities.FS || !cfg.Capabilities.Terminal {
+		t.Errorf("capabilities zed profile must advertise fs and terminal, got fs=%v terminal=%v",
+			cfg.Capabilities.FS, cfg.Capabilities.Terminal)
 	}
 	if cfg.Binaries.AgyMinVersion == "" {
 		t.Error("agy_min_version must not be empty")

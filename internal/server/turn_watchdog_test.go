@@ -92,20 +92,19 @@ func newWatchdogTestWorker(t *testing.T, cfg *config.Config, script func(emit fu
 // turnAttemptInputFor builds the turn input the watchdog tests execute.
 //
 // @purpose Keeps the two watchdog tests from repeating seven fields each.
-// @param sessionID Loopback session registered for the attempt.
-// @param token Token of that session.
+// @param sessionID Registry key the bridge's calls are attributed to.
 // @param state The session state holding the call channel.
 // @returns A turnInput ready for executeTurnAttempt.
 // @invariants Pure.
-func turnAttemptInputFor(sessionID, token string, state *mcp.SessionState) turnInput {
+func turnAttemptInputFor(sessionID string, state *mcp.SessionState) turnInput {
 	return turnInput{
-		Ctx:               context.Background(),
-		ModelEntry:        &models.ModelInfo{ID: "test", UpstreamModel: "gemini-3.8-flash"},
-		ThoughtLevel:      "medium",
-		PromptBlocks:      []acp.PromptBlock{{Type: "text", Text: "hi"}},
-		LoopbackSessionID: sessionID,
-		LoopbackToken:     token,
-		LoopbackState:     state,
+		Ctx:                 context.Background(),
+		ModelEntry:          &models.ModelInfo{ID: "test", UpstreamModel: "gemini-3.8-flash"},
+		ThoughtLevel:        "medium",
+		PromptBlocks:        []acp.PromptBlock{{Type: "text", Text: "hi"}},
+		ClientToolSessionID: sessionID,
+		ClientToolSockets:   mcp.NewSocketServer(nil, nil),
+		LoopbackState:       state,
 	}
 }
 
@@ -186,7 +185,7 @@ func TestTurnAttempt_ActivityAfterToolCallDoesNotCancel(t *testing.T) {
 
 	state := registerReadTool(t, "sess_watchdog_activity")
 	res, err := executeTurnAttempt(context.Background(), w, cfg, nil,
-		turnAttemptInputFor("sess_watchdog_activity", state.Token, state))
+		turnAttemptInputFor("sess_watchdog_activity", state))
 	if err != nil {
 		t.Fatalf("attempt failed: %v", err)
 	}
@@ -230,7 +229,7 @@ func TestTurnAttempt_SilentGapAfterToolCallKeepsBothCalls(t *testing.T) {
 
 	state := registerReadTool(t, "sess_watchdog_gap")
 	res, err := executeTurnAttempt(context.Background(), w, cfg, nil,
-		turnAttemptInputFor("sess_watchdog_gap", state.Token, state))
+		turnAttemptInputFor("sess_watchdog_gap", state))
 	if err != nil {
 		t.Fatalf("attempt failed: %v", err)
 	}

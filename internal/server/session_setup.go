@@ -23,9 +23,17 @@ type SessionSetupInput struct {
 	Worker               *pool.Worker
 	Config               *config.Config
 	ConsumerSystemPrompt string
-	LoopbackSessionID    string
-	LoopbackToken        string
+	// ClientToolSessionID keys the in-memory tool registry the bridge calls are attributed to.
+	ClientToolSessionID string
+	// ClientToolSocketPath is the per-session Unix socket the stdio bridge dials. Empty disables the
+	// client-tools MCP server entirely (a turn with no declared tools).
+	ClientToolSocketPath string
 	ClientToolNames      []string
+	// AdditionalDirectories are extra absolute workspace roots the consumer granted for this turn.
+	AdditionalDirectories []string
+	// ClientMCPServers are MCP servers declared by the consumer (stdio/http/sse), forwarded verbatim
+	// per docs/acp-conformance.md §4.1 so a harness's own context servers reach the agent.
+	ClientMCPServers []acp.MCPServerInfo
 }
 
 // buildACPSessionNewParams builds the ACP session/new payload for one turn.
@@ -49,30 +57,37 @@ func buildACPSessionNewParams(in SessionSetupInput) acp.SessionNewParams {
 		CWD: in.Worker.Cwd,
 	}
 
-	port := 8080
-	if in.Config != nil {
-		port = in.Config.Server.Port
+	// Forward the consumer's extra workspace roots. agy uses them for reads and writes outside cwd,
+	// and the reference client sends them on every session/new (docs/acp-conformance.md §4.1).
+	if len(in.AdditionalDirectories) > 0 {
+		clean := make([]string, 0, len(in.AdditionalDirectories))
+		for _, dir := range in.AdditionalDirectories {
+			if d := strings.TrimSpace(dir); d != "" {
+				clean = append(clean, d)
+			}
+		}
+		newParams.AdditionalDirectories = clean
 	}
 
-	if in.LoopbackSessionID != "" {
+	// Consumer-declared MCP servers travel verbatim: the agent materialises their tools itself
+	// (`mcp_<name>_<tool>`), exactly as it does for the reference editor.
+	newParams.MCPServers = append(newParams.MCPServers, in.ClientMCPServers...)
+
+	if in.ClientToolSocketPath != "" {
 		execPath, err := os.Executable()
 		if err != nil || execPath == "" {
 			execPath = "agy-gateway"
 		}
-		env := make([]acp.EnvVariable, 0, 1)
-		if in.LoopbackToken != "" {
-			// The bridge presents this token to /internal/mcp/. It travels in the child environment
-			// rather than argv so it does not appear in `ps` output.
-			env = append(env, acp.EnvVariable{Name: "AGY_GW_MCP_TOKEN", Value: in.LoopbackToken})
-		}
-		newParams.MCPServers = []acp.MCPServerInfo{
-			{
-				Name:    "client-tools",
-				Command: execPath,
-				Args:    []string{"mcp-bridge", "--session-id", in.LoopbackSessionID, "--port", fmt.Sprintf("%d", port)},
-				Env:     env,
-			},
-		}
+		// The socket path is the credential: it lives in this worker's private TMPDIR (0700) and the
+		// socket file itself is 0600, so no other uid can connect. It travels in the environment
+		// rather than argv so it does not appear in `ps` output.
+		env := []acp.EnvVariable{{Name: "AGY_GW_MCP_SOCKET", Value: in.ClientToolSocketPath}}
+		newParams.MCPServers = append(newParams.MCPServers, acp.MCPServerInfo{
+			Name:    "client-tools",
+			Command: execPath,
+			Args:    []string{"mcp-bridge"},
+			Env:     env,
+		})
 	}
 
 	return newParams
@@ -180,14 +195,14 @@ func applySessionConfigOptions(
 	requestedModel, thoughtLevel string,
 	switchTimeout time.Duration,
 	logger *slog.Logger,
-) (appliedModel string, err error) {
+) (appliedModel string, appliedThoughtLevel string, err error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	appliedModel = requestedModel
 
 	if newResult.SessionID == "" {
-		return appliedModel, fmt.Errorf("session/new returned an empty session id")
+		return appliedModel, "", fmt.Errorf("session/new returned an empty session id")
 	}
 
 	// The agent rewrites its option set when the model changes: switching to claude-sonnet-4-6
@@ -202,15 +217,14 @@ func applySessionConfigOptions(
 		}
 		return nil
 	}
-	advertisedThoughtLevel := byID(acp.ConfigIDThoughtLevel) != nil
 
 	if cfg := byID(acp.ConfigIDModel); cfg != nil {
 		refreshed, callErr := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDModel, requestedModel, switchTimeout)
 		if callErr != nil {
 			if !cfg.HoldsValue(requestedModel) {
-				return "", fmt.Errorf("model %q is not available on the upstream agent: %w", requestedModel, callErr)
+				return "", "", fmt.Errorf("model %q is not available on the upstream agent: %w", requestedModel, callErr)
 			}
-			return "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
+			return "", "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
 		}
 		if len(refreshed) > 0 {
 			options = refreshed
@@ -218,7 +232,7 @@ func applySessionConfigOptions(
 	} else if requestedModel != "" {
 		refreshed, callErr := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDModel, requestedModel, switchTimeout)
 		if callErr != nil {
-			return "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
+			return "", "", fmt.Errorf("failed to apply model %q: %w", requestedModel, callErr)
 		}
 		if len(refreshed) > 0 {
 			options = refreshed
@@ -230,25 +244,40 @@ func applySessionConfigOptions(
 		cfg := byID(acp.ConfigIDThoughtLevel)
 		switch {
 		case cfg != nil && !cfg.HoldsValue(value):
-			logger.Warn("requested thought level is not offered by the agent; falling back",
-				"requested", value, "fallback", cfg.CurrentValue, "sessionId", newResult.SessionID)
+			// The model offers no such level (e.g. gemini-3.8-flash has no xhigh). Applying the
+			// model's own default is the honest outcome; the caller reports it in a response header
+			// rather than failing a request the model can otherwise serve.
+			logger.Info("requested thought level is not offered by this model; applying its default",
+				"requested", value, "applied", cfg.CurrentValue, "sessionId", newResult.SessionID)
 			value = cfg.CurrentValue
-		case cfg == nil && advertisedThoughtLevel:
-			// The selected model dropped the option: it has no thinking level. Sending the value
-			// anyway earns -32602 on every turn of the session.
-			logger.Debug("selected model exposes no thought level; using the model default",
+		case cfg == nil:
+			// The live option set has no thought_level: either the selected model never offered one
+			// (claude-*, gpt-oss-*) or it dropped the option after the model switch. Sending the
+			// value anyway earns -32602 on every turn of the session, so the agent default is used.
+			logger.Info("selected model exposes no thought level; using the model default",
 				"requested", value, "sessionId", newResult.SessionID)
 			value = ""
 		}
 		if value != "" {
-			if _, err := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDThoughtLevel, value, switchTimeout); err != nil {
+			// The response is the only authoritative statement of what is now in force.
+			refreshed, callErr := callSetConfigOption(ctx, worker, newResult.SessionID, acp.ConfigIDThoughtLevel, value, switchTimeout)
+			if callErr != nil {
 				logger.Warn("thought level rejected by agent; turn continues at agent default",
-					"requested", value, "err", err, "sessionId", newResult.SessionID)
+					"requested", value, "err", callErr, "sessionId", newResult.SessionID)
+			} else {
+				appliedThoughtLevel = value
+				if len(refreshed) > 0 {
+					for i := range refreshed {
+						if refreshed[i].ID == acp.ConfigIDThoughtLevel && refreshed[i].CurrentValue != "" {
+							appliedThoughtLevel = refreshed[i].CurrentValue
+						}
+					}
+				}
 			}
 		}
 	}
 
-	return appliedModel, nil
+	return appliedModel, appliedThoughtLevel, nil
 }
 
 // callSetConfigOption performs one bounded session/set_config_option request.

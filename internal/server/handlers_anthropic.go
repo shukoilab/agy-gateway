@@ -19,6 +19,7 @@ import (
 	"agy-gateway/internal/anthropic"
 	"agy-gateway/internal/config"
 	"agy-gateway/internal/mcp"
+	"agy-gateway/internal/media"
 	"agy-gateway/internal/models"
 	"agy-gateway/internal/pool"
 	"agy-gateway/internal/retry"
@@ -36,6 +37,7 @@ type AnthropicHandlers struct {
 	failover       *pool.FailoverCoordinator
 	modelRegistry  *models.ModelRegistry
 	loopbackServer *mcp.LoopbackServer
+	toolSockets    *mcp.SocketServer
 	translator     *anthropic.Translator
 	logger         *slog.Logger
 }
@@ -61,8 +63,10 @@ func NewAnthropicHandlers(
 		failover:       failover,
 		modelRegistry:  modelRegistry,
 		loopbackServer: loopbackServer,
-		translator:     anthropic.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens),
-		logger:         logger.With("component", "anthropic-handlers"),
+		toolSockets:    mcp.NewSocketServer(loopbackServer, logger),
+		translator: anthropic.NewTranslatorWithBudget(cfg.Execution.MaxHistoryTokens).
+			WithMedia(media.NewResolver(mediaConfig(cfg))),
+		logger: logger.With("component", "anthropic-handlers"),
 	}
 }
 
@@ -133,10 +137,29 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// FR-07: agy advertises image/embedded context but the model rejects both with INVALID_ARGUMENT.
+	// ACP can express only model, thought_level and mode; every other Anthropic parameter is either
+	// reported in a response header (default) or refused, per execution.unsupported_parameter_policy.
+	// The Anthropic error envelope has no `param` field, so the parameter name is part of the message.
+	unsupported := ignoredAnthropicParams(&anthropicRequestView{
+		Temperature:   req.Temperature,
+		TopP:          req.TopP,
+		TopK:          req.TopK,
+		StopSequences: req.StopSequences,
+	})
+	if len(unsupported) > 0 && h.cfg != nil &&
+		strings.EqualFold(h.cfg.Execution.UnsupportedParameterPolicy, config.UnsupportedParameterPolicyReject) {
+		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"Unsupported parameter: "+unsupported[0]+" cannot be represented by the Antigravity ACP backend")
+		return
+	}
+	if joined := annotateIgnoredParams(w, unsupported); joined != "" {
+		h.logger.Debug("anthropic request carries parameters ACP cannot honour", "ignored", sortedCopy(unsupported))
+	}
+
+	// Images are forwarded as real ACP image blocks; `vision_mode: reject` is the explicit opt-out.
 	if where := anthropicVisionRequest(&req); where != "" && visionModeRejects(h.cfg) {
 		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
-			fmt.Sprintf("Image content is not supported by the upstream agent (%s). Send a textual description instead.", where))
+			fmt.Sprintf("Image input is disabled by this deployment (vision_mode=reject); the offending block is at %s", where))
 		return
 	}
 
@@ -144,7 +167,12 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 	if delimiter == "" {
 		delimiter = "tool_call"
 	}
-	systemPrompt, promptBlocks := h.translator.Translate(&req, delimiter)
+	systemPrompt, promptBlocks, mediaErr := h.translator.TranslateWithMedia(r.Context(), &req, delimiter)
+	if mediaErr != nil {
+		h.writeAnthropicError(w, mediaErrorStatus(mediaErr),
+			"invalid_request_error", fmt.Sprintf("Invalid image input: %v", mediaErr))
+		return
+	}
 
 	h.logger.Debug("anthropic message request received",
 		"model", req.Model,
@@ -230,8 +258,8 @@ func (h *AnthropicHandlers) handleSync(
 			return
 		}
 		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-		in.LoopbackSessionID = loopbackSessionID
-		in.LoopbackToken = state.Token
+		in.ClientToolSessionID = loopbackSessionID
+		in.ClientToolSockets = h.toolSockets
 		in.LoopbackState = state
 		in.ClientToolNames = toolNames
 	}
@@ -309,6 +337,13 @@ func (h *AnthropicHandlers) handleSync(
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("anthropic-version", "2023-06-01")
+	w.Header().Set("X-Agy-Model", modelEntry.UpstreamModel)
+	if outcome.AppliedThoughtLevel != "" {
+		w.Header().Set("X-Agy-Thought-Level", outcome.AppliedThoughtLevel)
+	}
+	if outcome.SessionTitle != "" {
+		w.Header().Set("X-Agy-Session-Title", outcome.SessionTitle)
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
@@ -323,6 +358,14 @@ func (h *AnthropicHandlers) handleStreaming(
 	completionID string,
 ) {
 	telemetry.DefaultMetrics.RequestsStreaming.Add(1)
+
+	// The SSE writer commits the status line on its first flush, so anything the caller must be able
+	// to read has to be set before it: the resolved model and the requested reasoning level are both
+	// known here. X-Agy-Session-Title is sync-only — the agent names the conversation mid-turn.
+	w.Header().Set("X-Agy-Model", modelEntry.UpstreamModel)
+	if thoughtLevel != "" {
+		w.Header().Set("X-Agy-Thought-Level", thoughtLevel)
+	}
 
 	sseWriter, err := anthropic.NewSSEWriter(w)
 	if err != nil {
@@ -403,8 +446,8 @@ func (h *AnthropicHandlers) handleStreaming(
 			return
 		}
 		defer h.loopbackServer.UnregisterSession(loopbackSessionID)
-		in.LoopbackSessionID = loopbackSessionID
-		in.LoopbackToken = state.Token
+		in.ClientToolSessionID = loopbackSessionID
+		in.ClientToolSockets = h.toolSockets
 		in.LoopbackState = state
 		in.ClientToolNames = toolNames
 	}
@@ -696,6 +739,13 @@ func (h *AnthropicHandlers) writeAnthropicTurnError(w http.ResponseWriter, err e
 	}
 	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeInvalidParams {
 		h.writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "upstream rejected the request: "+respErr.Message)
+		return
+	}
+	if errors.As(err, &respErr) && respErr.Code == acp.ErrCodeMethodNotFound {
+		// A method the gateway requires but the agent does not implement: a support fault, not the
+		// caller's, so it stays a 500 and the method name never reaches the client.
+		h.logger.Error("upstream agent does not implement a required ACP method", "err", err)
+		h.writeAnthropicError(w, http.StatusInternalServerError, "api_error", "Inference error")
 		return
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

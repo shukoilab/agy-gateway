@@ -1,10 +1,12 @@
 package openai
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"agy-gateway/internal/acp"
+	"agy-gateway/internal/media"
 )
 
 // Translator converts OpenAI request messages into ACP prompt payloads.
@@ -17,6 +19,9 @@ import (
 type Translator struct {
 	// maxHistoryTokens bounds the rendered history; 0 disables the bound.
 	maxHistoryTokens int
+	// media resolves consumer-supplied image references. nil keeps the translator text-only, which
+	// is what existing callers and tests get from NewTranslator.
+	media *media.Resolver
 }
 
 // NewTranslator creates an initialized Translator with history bounding disabled.
@@ -31,6 +36,21 @@ func NewTranslator() *Translator {
 // @returns a Translator ready for concurrent use.
 func NewTranslatorWithBudget(maxHistoryTokens int) *Translator {
 	return &Translator{maxHistoryTokens: maxHistoryTokens}
+}
+
+// WithMedia attaches an image resolver, enabling image content parts to become ACP image blocks.
+//
+// @purpose Enables the multimodal path without changing the text-only constructors.
+// @rationale Image fetching carries SSRF policy that belongs to the server layer, so the resolver
+// is injected rather than constructed here.
+// @preconditions r may be nil, which restores text-only behaviour.
+// @param r Resolver built from configuration.
+// @returns The same Translator, for chaining.
+// @throws None.
+// @invariants O(1); the Translator must be built before it is shared.
+func (t *Translator) WithMedia(r *media.Resolver) *Translator {
+	t.media = r
+	return t
 }
 
 // cleanToolOutputContent strips any legacy duplicate turn headers or wrapper markers from tool result text.
@@ -167,7 +187,48 @@ func renderedOverheadChars(msgs []ChatMessage, intact map[int]struct{}, maxHisto
 // block; neither the spec-level `systemPrompt` field (accepted and discarded by the agent) nor the
 // vendor `_meta` dialect (policy-guarded, can answer a synthetic 429) is used.
 // Tool declarations are NOT injected into prompt text; they are provided natively via LoopbackServer mcpServers.
-func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []acp.PromptBlock) {
+//
+// Text-only entry point. Image parts are rendered as a `[image]` placeholder; use TranslateWithMedia to
+// forward them as real ACP image blocks.
+func (t *Translator) Translate(req *ChatCompletionRequest, delimiter string) (string, []acp.PromptBlock) {
+	systemPrompt, blocks, _ := t.render(context.Background(), req, delimiter, false)
+	return systemPrompt, blocks
+}
+
+// TranslateWithMedia is Translate plus image resolution.
+//
+// @purpose Turns OpenAI image_url parts into ACP image blocks, honouring the media policy.
+// @rationale ACP accepts a heterogeneous prompt array: text blocks interleaved with images. Emitting
+// them in order is what preserves the caller's intent ("look at this, then answer").
+//
+// @preconditions t.media may be nil, in which case image parts fall back to a placeholder.
+// @param ctx Cancellation root for any remote image fetch.
+// @param req Decoded request.
+// @param delimiter Tag handed to the legacy text-tool fallback.
+// @returns System prompt, ordered prompt blocks, and the first image resolution error.
+// @throws None; a resolution failure is returned so the handler can answer with a provider error.
+// @invariants O(rendered history + images); image fetches are sequential and bounded by t.media.Timeout.
+func (t *Translator) TranslateWithMedia(ctx context.Context, req *ChatCompletionRequest, delimiter string) (string, []acp.PromptBlock, error) {
+	return t.render(ctx, req, delimiter, t.media != nil)
+}
+
+// render is the single implementation behind both entry points.
+//
+// @purpose Keeps one rendering path so the text-only and multimodal outputs cannot drift.
+// @rationale A second parallel implementation would eventually disagree with the budget accounting
+// and the chunk grouping, which is where the loop bug lived.
+// @preconditions req may be nil.
+// @param ctx Cancellation root for image fetches.
+// @param req Decoded request.
+// @param delimiter Legacy text-tool delimiter tag.
+// @param withMedia Emit ACP image blocks rather than a placeholder.
+// @returns System prompt, ordered blocks, and the first image error.
+// @throws None; image failures are returned.
+// @invariants O(rendered history + images).
+func (t *Translator) render(ctx context.Context, req *ChatCompletionRequest, _ string, withMedia bool) (string, []acp.PromptBlock, error) {
+	if req == nil {
+		return "", []acp.PromptBlock{{Type: "text", Text: "Hello"}}, nil
+	}
 	var sysMessages []string
 	var nonSysMessages []ChatMessage
 
@@ -187,6 +248,15 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 
 	// 2. Fast-path: single user message turn
 	if len(nonSysMessages) == 1 && strings.ToLower(nonSysMessages[0].Role) == "user" {
+		if withMedia {
+			blocks, err := t.userBlocks(ctx, nonSysMessages[0])
+			if err != nil {
+				return "", nil, err
+			}
+			if len(blocks) > 0 {
+				return systemPrompt, blocks, nil
+			}
+		}
 		userText := strings.TrimSpace(nonSysMessages[0].ContentString())
 		if userText == "" {
 			userText = "Hello"
@@ -196,7 +266,7 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 				Type: "text",
 				Text: userText,
 			},
-		}
+		}, nil
 	}
 
 	// 3. Multi-turn conversational history
@@ -301,10 +371,106 @@ func (t *Translator) Translate(req *ChatCompletionRequest, _ string) (string, []
 	if finalPrompt == "" {
 		finalPrompt = "Hello"
 	}
-	return systemPrompt, []acp.PromptBlock{
-		{
-			Type: "text",
-			Text: finalPrompt,
-		},
+	blocks := []acp.PromptBlock{{Type: "text", Text: finalPrompt}}
+
+	// Images in the newest user turn are forwarded as real ACP image blocks after the rendered
+	// history. Older turns stay textual: the agent only needs the latest attachments to act, and
+	// re-uploading every image ever sent would defeat the history budget.
+	if withMedia && len(nonSysMessages) > 0 {
+		last := nonSysMessages[len(nonSysMessages)-1]
+		if strings.EqualFold(last.Role, "user") {
+			images, err := t.imageBlocks(ctx, last)
+			if err != nil {
+				return "", nil, err
+			}
+			blocks = append(blocks, images...)
+		}
 	}
+	return systemPrompt, blocks, nil
+}
+
+// imageBlocks resolves the image parts of one message into ACP image blocks.
+//
+// @purpose Isolates image resolution so both the fast path and the history path share it.
+// @rationale Allowing a single unresolved image silently would reintroduce the original defect:
+// the agent answering about an image it never received.
+// @preconditions msg may carry no images.
+// @param ctx Cancellation root for remote fetches.
+// @param msg Message whose parts are inspected.
+// @returns Ordered image blocks; empty when the message has none.
+// @throws The first resolution error (unsupported scheme, forbidden host, oversize, bad type).
+// @invariants O(parts); one fetch per image.
+func (t *Translator) imageBlocks(ctx context.Context, msg ChatMessage) ([]acp.PromptBlock, error) {
+	if t.media == nil {
+		return nil, nil
+	}
+	var blocks []acp.PromptBlock
+	for _, part := range msg.ContentParts() {
+		if part.Type != "image_url" || part.ImageURL == nil || part.ImageURL.URL == "" {
+			continue
+		}
+		mimeType, data, err := t.media.Resolve(ctx, part.ImageURL.URL)
+		if err != nil {
+			return nil, err
+		}
+		blocks = append(blocks, acp.NewImageBlock(mimeType, data, part.ImageURL.URL))
+	}
+	return blocks, nil
+}
+
+// userBlocks renders one user message as ordered text and image blocks.
+//
+// @purpose Preserves the caller's interleaving ("look at this, then answer") for the single-turn case.
+// @rationale This is the path every multimodal request takes, so it must not reorder parts.
+// @preconditions msg is a user message.
+// @param ctx Cancellation root for remote fetches.
+// @param msg The user message.
+// @returns Ordered blocks; empty when the message renders to nothing.
+// @throws The first image resolution error.
+// @invariants O(parts).
+func (t *Translator) userBlocks(ctx context.Context, msg ChatMessage) ([]acp.PromptBlock, error) {
+	parts := msg.ContentParts()
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	hasImage := false
+	for _, p := range parts {
+		if p.Type == "image_url" && p.ImageURL != nil && p.ImageURL.URL != "" {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		return nil, nil
+	}
+
+	// Merge consecutive text parts so the agent receives paragraphs, not word soup, and drop empty
+	// text between images so no blank blocks are sent.
+	var blocks []acp.PromptBlock
+	var pending strings.Builder
+	flushText := func() {
+		text := strings.TrimSpace(pending.String())
+		pending.Reset()
+		if text != "" {
+			blocks = append(blocks, acp.PromptBlock{Type: "text", Text: text})
+		}
+	}
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			pending.WriteString(p.Text)
+		case "image_url":
+			if p.ImageURL == nil || p.ImageURL.URL == "" {
+				continue
+			}
+			flushText()
+			mimeType, data, err := t.media.Resolve(ctx, p.ImageURL.URL)
+			if err != nil {
+				return nil, err
+			}
+			blocks = append(blocks, acp.NewImageBlock(mimeType, data, p.ImageURL.URL))
+		}
+	}
+	flushText()
+	return blocks, nil
 }

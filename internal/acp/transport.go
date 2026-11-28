@@ -29,6 +29,13 @@ type Transport struct {
 	updateListenerMu sync.RWMutex
 	updateListener   func(update SessionUpdateParams)
 
+	// handlers answers the agent→client requests implied by the advertised capabilities.
+	// @purpose Turns an advertised capability into an answered one.
+	// @rationale Advertising fs/terminal makes agy emit read_file/write_file/run_command; without a
+	// handler the request is answered with method-not-found and the turn stalls. nil disables all
+	// non-permission handlers (the sandbox profile).
+	handlers *ClientHandlers
+
 	closed atomic.Bool
 	doneCh chan struct{}
 
@@ -76,6 +83,31 @@ func (t *Transport) SetUpdateListener(fn func(update SessionUpdateParams)) {
 	t.updateListener = fn
 }
 
+// SetHandlers installs the agent→client request handlers.
+//
+// @purpose Wires the fs/terminal implementations to the transport once, before the first prompt.
+// @rationale The handler set must match the advertised capabilities; installing it after the
+// handshake would leave a window where the agent's first read_file request is unanswered.
+//
+// @param h Handler set, or nil to answer every non-permission request with method-not-found.
+// @returns None.
+// @invariants O(1); callers install it immediately after constructing the transport.
+func (t *Transport) SetHandlers(h *ClientHandlers) {
+	t.handlers = h
+}
+
+// Handlers returns the installed handler set, or nil.
+//
+// @purpose Lets the owner (worker) register session roots on the same object the transport uses.
+// @rationale Without this accessor the worker would have to keep a second reference and could drift
+// from the one actually serving requests.
+// @param None.
+// @returns The installed handler set, or nil.
+// @invariants O(1).
+func (t *Transport) Handlers() *ClientHandlers {
+	return t.handlers
+}
+
 // Close gracefully closes the transport and releases active resources.
 func (t *Transport) Close() error {
 	if t.closed.CompareAndSwap(false, true) {
@@ -94,6 +126,12 @@ func (t *Transport) Close() error {
 			delete(t.pending, id)
 		}
 		t.pendingMu.Unlock()
+
+		// Reap every terminal the session started. A child that outlives the transport is a zombie
+		// process, and process-group kill is the only way to reach its grandchildren.
+		if t.handlers != nil {
+			t.handlers.Close()
+		}
 
 		return errors.Join(errs...)
 	}
@@ -344,9 +382,27 @@ func (t *Transport) dispatchResponse(resp *Response) {
 
 func (t *Transport) handleIncomingRequest(req *Request) {
 	t.logger.Debug("acp incoming request received", "method", req.Method, "id", req.ID)
-	if req.Method == "session/request_permission" {
+	switch req.Method {
+	case "session/request_permission":
 		t.handlePermissionRequest(req)
 		return
+	case "elicitation/create":
+		// A strict YOLO gateway has nothing to ask the user; cancelling is the documented
+		// "no answer" outcome and keeps the turn moving.
+		t.replyRaw(req.ID, json.RawMessage(`{"action":"cancel"}`))
+		return
+	}
+
+	if t.handlers != nil {
+		result, handled, err := t.handlers.Handle(req.Method, req.Params)
+		if handled {
+			if err != nil {
+				t.replyError(req.ID, err)
+				return
+			}
+			t.replyRaw(req.ID, result)
+			return
+		}
 	}
 
 	// For unsupported agent requests, send method not found error
@@ -359,6 +415,55 @@ func (t *Transport) handleIncomingRequest(req *Request) {
 		},
 	}
 	_ = t.send(resp)
+}
+
+// replyRaw writes a successful JSON-RPC response for reqID.
+//
+// @purpose Single emission helper for handler results.
+// @rationale Keeps the response envelope in one place so no path can omit jsonrpc/version.
+// @preconditions result is valid JSON (or nil for an empty object).
+// @param reqID The JSON-RPC id being answered.
+// @param result Marshalled result payload.
+// @returns None.
+// @throws None; a marshal-level failure cannot occur for already-marshalled bytes.
+// @invariants Emits at most one response per call.
+func (t *Transport) replyRaw(reqID any, result json.RawMessage) {
+	if len(result) == 0 {
+		result = json.RawMessage("{}")
+	}
+	resp := Response{JSONRPC: JSONRPCVersion, ID: reqID, Result: result}
+	if err := t.send(resp); err != nil {
+		t.logger.Error("failed to send handler response", "error", err)
+	}
+}
+
+// replyError writes a JSON-RPC error response for reqID.
+//
+// @purpose Reports a handler failure to the agent in the canonical error shape.
+// @rationale agy expects `{code,message}` only; the error text is already sanitised by the handler
+// so no filesystem path or internal state leaks upstream.
+// @preconditions reqID identifies the request being answered.
+// @param reqID The JSON-RPC id being answered.
+// @param err The failure to report.
+// @returns None.
+// @throws None.
+// @invariants Emits at most one response per call.
+func (t *Transport) replyError(reqID any, err error) {
+	code := ErrCodeInternalError
+	message := "request failed"
+	var respErr *ResponseError
+	if errors.As(err, &respErr) {
+		code = respErr.Code
+		message = respErr.Message
+	}
+	resp := Response{
+		JSONRPC: JSONRPCVersion,
+		ID:      reqID,
+		Error:   &ResponseError{Code: code, Message: message},
+	}
+	if sendErr := t.send(resp); sendErr != nil {
+		t.logger.Error("failed to send error response", "error", sendErr)
+	}
 }
 
 // handlePermissionRequest answers a session/request_permission request from the agent.

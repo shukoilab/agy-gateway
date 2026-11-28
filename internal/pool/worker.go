@@ -14,7 +14,6 @@ import (
 	"agy-gateway/internal/acp"
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/config"
-	"agy-gateway/internal/version"
 )
 
 // Worker represents a warm, isolated agy acp process instance.
@@ -123,30 +122,33 @@ func (w *Worker) Start(ctx context.Context) error {
 
 	w.Process = proc
 	w.Transport = transport
+	// Install the fs/terminal handlers whenever either capability is advertised. Advertising without
+	// a handler makes the agent's read_file/write_file/run_command requests go unanswered, which
+	// stalls the turn until the idle watchdog cancels it.
+	if w.cfg.Capabilities.FS || w.cfg.Capabilities.Terminal {
+		transport.SetHandlers(acp.NewClientHandlers(0, 0, 0))
+	}
 
-	// Perform initialize handshake as a pure AI gateway client
-	// Note: We deliberately do NOT advertise filesystem ('fs') or terminal execution ('terminal')
-	// capabilities because agy-gateway delegates all tool execution to the external client (e.g. OpenCode)
-	// on the host. Advertising phantom capabilities causes Antigravity ACP to declare native container
-	// tools (run_command) to the LLM, leading to environment confusion and container tool failures.
+	// Perform initialize handshake as a pure AI gateway client. The payload mirrors the reference
+	// client (docs/acp-conformance.md §3): a real client fingerprint plus the full capability
+	// block. Both come from configuration so an operator can select the gateway profile or the
+	// sandbox profile without a rebuild, and so no literal lives at the call site.
 	initCtx, cancel := context.WithTimeout(ctx, w.cfg.Pool.HandshakeTimeout)
 	defer cancel()
 
-	initParams := map[string]any{
-		"protocolVersion": 1,
-		"clientInfo": map[string]any{
-			"name":    "agy-gateway",
-			"title":   "Antigravity Gateway",
-			"version": version.Version,
+	initParams := acp.BuildInitializeParams(
+		acp.ClientIdentity{
+			Name:    w.cfg.Identity.Name,
+			Title:   w.cfg.Identity.Title,
+			Version: w.cfg.Identity.Version,
 		},
-		"clientCapabilities": map[string]any{
-			"fs": map[string]any{
-				"readTextFile":  false,
-				"writeTextFile": false,
-			},
-			"terminal": false, // Canonical ACP v1 boolean capability
+		acp.ClientCapabilities{
+			FS:              w.cfg.Capabilities.FS,
+			Terminal:        w.cfg.Capabilities.Terminal,
+			Elicitation:     w.cfg.Capabilities.Elicitation,
+			SessionMetadata: w.cfg.Capabilities.SessionMetadata,
 		},
-	}
+	)
 
 	var initResult map[string]any
 	if err := transport.Call(initCtx, "initialize", initParams, &initResult); err != nil {

@@ -504,16 +504,19 @@ func (m *StopSequenceMatcher) MatchedSequence() string {
 
 // visionModeRejects reports whether the configured policy refuses image and embedded blocks.
 //
-// @purpose Centralises the FR-07 decision.
+// @purpose Centralises the vision policy decision.
 // @rationale Two adapters must agree on this or the same request behaves differently per endpoint.
+// The previous implementation keyed off the removed "flatten" value, which made every mode except a
+// value it never accepted behave as reject — so the default was a hard refusal even though agy
+// accepts image blocks natively.
 // @param cfg Gateway configuration.
-// @returns true when image and embedded content must be rejected.
+// @returns true only when the operator explicitly selected `vision_mode: reject`.
 // @invariants Pure.
 func visionModeRejects(cfg *config.Config) bool {
 	if cfg == nil {
-		return true
+		return false
 	}
-	return !strings.EqualFold(strings.TrimSpace(cfg.Execution.VisionMode), "flatten")
+	return strings.EqualFold(strings.TrimSpace(cfg.Execution.VisionMode), config.VisionModeReject)
 }
 
 // rejectLocked records an invalid tool call without emitting it.

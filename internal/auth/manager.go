@@ -1012,6 +1012,13 @@ func (m *Manager) ProvisionWorkerHome(workerID int, accountID string) (string, s
 			return "", "", "", fmt.Errorf("failed to create directory %s: %w", d, err)
 		}
 	}
+	// The worker's TMPDIR holds the per-session MCP socket, and the directory is that socket's access
+	// control: since TMPDIR is inherited by the child agent as its temp dir, it must not be readable
+	// or traversable by another uid in the container, or any local process could invoke the consumer's
+	// tools. Tightened after creation so an existing 0755 directory from an older build is fixed too.
+	if err := os.Chmod(tmpDir, 0o700); err != nil {
+		return "", "", "", fmt.Errorf("failed to restrict %s: %w", tmpDir, err)
+	}
 
 	if accountID == "" {
 		// Directory-only provisioning: the caller installs a credential separately, so an existing
