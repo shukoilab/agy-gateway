@@ -71,7 +71,7 @@ func (c *AccountsCLI) RunInteractive(ctx context.Context) error {
 			c.interactiveRemove(ctx, reader)
 
 		case "8":
-			if err := c.Clean(ctx, false); err != nil {
+			if err := c.Clean(ctx, false, false); err != nil {
 				fmt.Fprintf(c.out, "Error cleaning vault: %v\n", err)
 			}
 
@@ -272,5 +272,11 @@ func (c *AccountsCLI) runAddWizard(ctx context.Context, reader *bufio.Reader, al
 
 	fmt.Fprintln(c.out, "Authentication successful! Account credentials saved to vault.")
 	_ = c.mgr.Sync(ctx)
+	// The plan label is reporting-only but the operator expects `list` to show the real tier right
+	// after adding: a missing plan renders "Unknown", which reads as a probe failure rather than a
+	// fresh account. Failure here must not fail the add — the account is already stored.
+	if err := c.mgr.RefreshPlan(ctx); err != nil {
+		fmt.Fprintf(c.out, "Note: plan label unavailable (%v); the account is stored and usable.\n", err)
+	}
 	return nil
 }

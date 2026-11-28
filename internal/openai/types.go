@@ -28,6 +28,10 @@ type ChatCompletionRequest struct {
 	ReasoningEffort     string                     `json:"reasoning_effort,omitempty" enums:"low,medium,high" example:"medium"`
 	ResponseFormat      any                        `json:"response_format,omitempty" swaggertype:"object"`
 	User                string                     `json:"user,omitempty" example:"client_user_123"`
+	// PromptCacheKey is the body-level conversation identifier several harnesses send instead of a
+	// header (LangChain/Fireworks and OpenCode both populate it). Honoured only when no affinity header
+	// is present, and used solely to pick a per-conversation workspace directory.
+	PromptCacheKey string `json:"prompt_cache_key,omitempty"`
 	// Seed, Logprobs, TopLogprobs and LogitBias exist only so the FR-14 policy can see
 	// them: decoding drops unknown keys, which would let them be silently ignored.
 	Seed        *int64         `json:"seed,omitempty" example:"42"`

@@ -6,7 +6,7 @@ import "fmt"
 // Version represents the active semantic version of agy-gateway.
 // Can be dynamically overridden at compile time via Go ldflags:
 // -ldflags="-X agy-gateway/internal/version.Version=X.Y.Z"
-var Version = "3.17.0"
+var Version = "3.18.3"
 
 // Get returns the current semantic version string.
 //

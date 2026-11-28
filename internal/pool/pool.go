@@ -138,6 +138,16 @@ func (p *Pool) log() *slog.Logger {
 }
 
 func (p *Pool) initWorkers(ctx context.Context) error {
+	// Reap worker homes that no live slot owns before provisioning. A lowered worker_count, or a
+	// home left behind by an account deletion, otherwise keeps another account's credential and
+	// conversation caches on disk forever. Failing here must not block boot: the surplus is dead
+	// weight, not a prerequisite for serving traffic.
+	if served, err := ReapOrphanWorkerHomes(p.cfg, false); err != nil {
+		p.log().Warn("could not reap every orphan worker home", "err", err, "remaining", len(served))
+	} else if len(served) > 0 {
+		p.log().Info("reaped orphan worker homes", "count", len(served))
+	}
+
 	accounts := p.authMgr.GetAccounts()
 	if len(accounts) == 0 {
 		// A fresh installation has an empty vault, and the only way to fill it is to run the
@@ -377,22 +387,41 @@ func (p *Pool) assignAccounts(accounts []auth.Account, workerCount int) []auth.A
 			}
 		}
 	default: // round_robin
+		// Skip ineligible accounts so a cooling or disabled account is never handed out while a usable
+		// one exists. The previous `accounts[i%len]` ignored eligibility entirely, which meant a
+		// cooling account could be assigned at boot and fail its first lease.
+		pool := make([]auth.Account, 0, len(accounts))
+		for _, acc := range accounts {
+			if eligible(acc) {
+				pool = append(pool, acc)
+			}
+		}
+		if len(pool) == 0 {
+			pool = accounts
+		}
 		for i := 0; i < workerCount; i++ {
-			chosen := accounts[i%len(accounts)]
+			chosen := pool[i%len(pool)]
 			usedPerAccount[chosen.ID]++
 			assignments[i] = chosen
 			assigned[i] = true
 		}
 	}
 
-	// Any slot left unfilled (fewer eligible accounts than workers) falls back to vault order so the
-	// pool still starts with a usable account per worker; materialisation reports a real error later
+	// Any slot left unfilled (fewer eligible accounts than workers) falls back to an eligible account
+	// from the whole set; only when nothing at all is eligible does it fall back to vault order, so the
+	// pool still starts with a usable account per worker and materialisation reports a real error later
 	// if the credential turns out to be broken.
 	for i := 0; i < workerCount; i++ {
 		if !assigned[i] {
-			chosen := accounts[i%len(accounts)]
-			usedPerAccount[chosen.ID]++
-			assignments[i] = chosen
+			pick := accounts[i%len(accounts)]
+			for _, acc := range accounts {
+				if eligible(acc) {
+					pick = acc
+					break
+				}
+			}
+			usedPerAccount[pick.ID]++
+			assignments[i] = pick
 		}
 	}
 
@@ -896,6 +925,9 @@ func (p *Pool) reconcileWorkerAccount(ctx context.Context, w *Worker, model stri
 		"toAccount", next.ID,
 		"model", model,
 		"reason", "lease_eligibility")
+	// The agent caches under this HOME belong to the account that just left. Leaving them would hand
+	// the new account the previous account's conversation state and stale context.
+	w.PurgeAccountCaches()
 	w.SetAccount(next)
 	// The running agy process authenticated as the previous account at spawn time, so the credential
 	// just installed on disk is not in effect for it. Tainting makes Release respawn the worker, which
@@ -991,8 +1023,10 @@ func (p *Pool) Release(w *Worker) {
 	go func() {
 		defer p.bgWg.Done()
 
-		// Clean transient workspace files
-		w.CleanWorkspace()
+		// The workspace is NOT cleaned here. It is the durable context every account shares, so
+		// deleting it between turns made the agent rewrite its own output forever. Account-owned agent
+		// caches are purged at rebind time (reconcileWorkerAccount) instead, and the workspace is only
+		// cleared by the operator's explicit `agy-accounts clean --workspace`.
 
 		// Check if recycling is mandated
 		tainted := w.TaintedForRecycle.Load()

@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -135,13 +137,50 @@ type Manager struct {
 	// @invariants Assigned only in tests, before concurrent use begins.
 	listForTest func(ctx context.Context) ([]byte, error)
 
+	// listPlanForTest overrides the `agy-auth list --json` plan query during tests.
+	//
+	// @purpose Keeps RefreshPlan testable without a vault.
+	// @rationale The plan read is a separate command from the vault read, so it needs its own seam.
+	// @invariants Assigned only in tests, before concurrent use begins.
+	listPlanForTest func(ctx context.Context) ([]byte, error)
+
 	// fetchUsageForTest overrides FetchAllAccountUsage during tests.
 	//
 	// @purpose Lets poller behaviour be driven by controlled payloads.
-	// @rationale Poll logic is a pure function of the payload and account set; stubbing only the fetch
+	// @rationale Poll logic is a pure function of the account set and payload; stubbing only the fetch
 	// keeps the real status-transition code under test.
 	// @invariants Assigned only in tests, before concurrent use begins.
 	fetchUsageForTest func(ctx context.Context) (map[string]AccountUsage, error)
+
+	// agyForTest overrides the `agy` subprocess for tests.
+	//
+	// @purpose Lets the `agy /usage` quota fallback and `agy models` discovery be exercised without a
+	// real binary, while the surrounding credential-borrowing and decoding code still runs for real.
+	// @rationale Both paths share ExecAgy, so one seam covers them and keeps a single place where the
+	// child environment is described. Stubbing the binary path instead would require writing an
+	// executable per test.
+	// @invariants Assigned only in tests, before concurrent use begins; nil means "spawn for real".
+	agyForTest func(ctx context.Context, homeDir string, args []string) ([]byte, error)
+
+	// agyAuthForTest overrides the `agy-auth` subprocess for tests.
+	//
+	// @purpose Lets error-shape handling (for example `ambiguous_query` with candidates) be tested
+	// without a real vault.
+	// @rationale The vault error contract is what the CLI and admin API surface verbatim, so the test
+	// must be able to produce the exact payload.
+	// @invariants Assigned only in tests, before concurrent use begins; nil means "spawn for real".
+	agyAuthForTest func(ctx context.Context, args []string) ([]byte, error)
+
+	// plans caches the human plan label per account id, for reporting only.
+	//
+	// @purpose Separates the expensive-but-informative `plan` read from the cheap vault truth read.
+	// @rationale `list --json --no-usage` (155 ms) omits `plan`, while only `list --json` (≈1.9 s,
+	// because it also fetches quota) carries it. Running the expensive command on every poll would
+	// double the poll cost for a display string, so it is refreshed at boot, after add, and after
+	// switch/rotate, and read from here in between.
+	// @invariants Guarded by vaultMu; empty means "unknown", which must render as unknown and never
+	// as "free" (upstream omits `plan` when quota is unavailable). Never consulted by eligibility.
+	plans map[string]string
 }
 
 // NewManager creates an initialized Account Manager.
@@ -157,6 +196,22 @@ func NewManager(cfg *config.Config, logger *slog.Logger) *Manager {
 }
 
 // Sync queries agy-auth and updates the internal account list.
+//
+// @purpose Rebuilds the account set from the vault, the only authority on which credentials exist.
+// @rationale The command matters as much as the parse. `list --all --json` (measured 1960 ms) omits
+// `auth_method`, `expired`, `stored`, and `plan`, so every field the decoder asked for beyond
+// id/email/alias arrived empty: `Tier` was always "" (which made a Pro account render as Free) and
+// the `expired` branch was unreachable dead code. `list --json --no-usage` (measured 155 ms) is the
+// cheap command that actually emits those fields. `plan` is deliberately NOT read here — it lives in
+// the separate cache refreshed by RefreshPlan, because only `list --json` (with usage) carries it and
+// that command costs ~1.9 s.
+// @preconditions m.cfg is configured.
+// @param ctx Cancellation root for the subprocess.
+// @returns A wrapped error when the vault cannot be read or the payload cannot be parsed. A parse
+// failure never mutates the previous set.
+// @throws None directly; subprocess and parse errors are wrapped.
+// @invariants O(accounts); at most one subprocess; holds vaultMu for the duration; never puts `plan`
+// or `usage` in the returned set (reporting-only, see D3).
 func (m *Manager) Sync(ctx context.Context) error {
 	m.vaultMu.Lock()
 	defer m.vaultMu.Unlock()
@@ -166,7 +221,7 @@ func (m *Manager) Sync(ctx context.Context) error {
 	if m.listForTest != nil {
 		out, err = m.listForTest(ctx)
 	} else {
-		out, err = m.execAgyAuth(ctx, "list", "--all", "--json")
+		out, err = m.execAgyAuth(ctx, "list", "--json", "--no-usage")
 	}
 	if err != nil {
 		return fmt.Errorf("agy-auth list failed: %w", err)
@@ -180,7 +235,23 @@ func (m *Manager) Sync(ctx context.Context) error {
 		Plan       string `json:"plan"`
 		Tier       string `json:"tier"`
 		Active     bool   `json:"active"`
-		Expired    bool   `json:"expired"`
+		// Expired is the refresher's own state for the access token, NOT a dead credential.
+		//
+		// @purpose Documents why this field is parsed but never mapped to AUTH_EXPIRED.
+		// @rationale `agy-auth list --json` reports `expired: true` for an access token that has
+		// simply passed its short lifetime while the refresh token is still valid — `agy -p` answers
+		// normally with that same credential (measured). Treating it as a fault made the gateway
+		// refuse an account that works, so expiry is now a non-event; only `Stored == false` (the
+		// snapshot is gone) removes an account.
+		Expired bool `json:"expired"`
+		// Stored is false only when the vault keeps a registry row whose snapshot file is missing.
+		//
+		// @purpose Distinguishes "an account exists" from "an account is merely remembered".
+		// @rationale agy-auth emits `stored: false` for registry rows without a snapshot; such a row
+		// cannot be exported, so advertising it as a usable account only causes a failing lease.
+		// A pointer is used because the field is absent in other payload shapes: an absent `stored`
+		// must mean "stored" (the pre-existing behaviour), never "missing".
+		Stored *bool `json:"stored"`
 	}
 
 	var rawAccounts []rawAccountItem
@@ -222,16 +293,17 @@ func (m *Manager) Sync(ctx context.Context) error {
 	newAccounts := make([]Account, 0, len(rawAccounts))
 	newAccountIDs := make(map[string]struct{}, len(rawAccounts))
 	for _, raw := range rawAccounts {
+		// A registry row without a stored snapshot cannot be exported, so it can never serve a turn.
+		// Dropping it here keeps the account set equal to the set of usable credentials. An absent
+		// `stored` field is not evidence of absence: only an explicit `false` excludes the account.
+		if raw.Stored != nil && !*raw.Stored && raw.ID != "" {
+			m.logger.Info("ignoring vault entry with no stored snapshot", "accountID", raw.ID, "email", raw.Email)
+			continue
+		}
 		newAccountIDs[raw.ID] = struct{}{}
 		tier := raw.Tier
 		if tier == "" && raw.Plan != "" {
 			tier = strings.ToLower(raw.Plan)
-		}
-		status := StatusHealthy
-		vaultExpired := false
-		if raw.Expired {
-			status = StatusAuthExpired
-			vaultExpired = true
 		}
 
 		acc := Account{
@@ -241,9 +313,8 @@ func (m *Manager) Sync(ctx context.Context) error {
 			Alias:          raw.Alias,
 			AuthMethod:     raw.AuthMethod,
 			Tier:           tier,
-			Status:         status,
+			Status:         StatusHealthy,
 			Enabled:        true,
-			VaultExpired:   vaultExpired,
 			AssignedWorker: -1,
 			Quotas:         make(map[string]QuotaGroup),
 			// Deliberately zero, not time.Now(): this field reports the last LEASE, and a freshly
@@ -266,26 +337,12 @@ func (m *Manager) Sync(ctx context.Context) error {
 			acc.FamilyCooldowns = prior.FamilyCooldowns
 			acc.AssignedWorker = prior.AssignedWorker
 			acc.LastUsed = prior.LastUsed
-			switch {
-			case status == StatusAuthExpired:
-				// The vault itself says this credential is dead: only `agy-auth login` fixes it, so any
-				// runtime retry window inherited above must not make it look recoverable.
-				acc.CooldownUntil = time.Time{}
-				acc.VaultExpired = true
-			case prior.Status == StatusAuthExpired && prior.VaultExpired:
-				// The vault previously reported this credential expired and now reports it healthy: the
-				// operator re-logged in. Keeping the carried-forward AUTH_EXPIRED would make that login
-				// invisible until a restart, which is the whole defect this branch exists to prevent.
-				m.logger.Info("vault no longer reports the credential expired; restoring account",
-					"accountID", acc.ID)
-				acc.Status = StatusHealthy
-				acc.CooldownUntil = time.Time{}
-				acc.VaultExpired = false
-			default:
-				// Runtime-owned state: keep whatever the fault/retry machinery recorded.
-				acc.Status = prior.Status
-				acc.VaultExpired = prior.VaultExpired
-			}
+
+			// Runtime-owned state: keep whatever the fault/retry machinery recorded. A vault-reported
+			// expiry is no longer mapped to AUTH_EXPIRED (see rawAccountItem.Expired), so the only
+			// way Status is AUTH_EXPIRED here is a runtime credential fault — which the bounded retry
+			// window owns.
+			acc.Status = prior.Status
 		}
 		newAccounts = append(newAccounts, acc)
 	}
@@ -306,21 +363,112 @@ func (m *Manager) Sync(ctx context.Context) error {
 	return nil
 }
 
-// purgeWorkerCredentialsFor deletes worker credential files that belong to removed accounts.
+// RefreshPlan re-reads each account's plan label for display.
 //
-// @purpose Removes the plaintext refresh token this gateway installed for an account that no longer
-// exists, so deleting an account leaves no usable credential behind.
+// @purpose Keeps the Pro/Free label truthful without paying its cost on every poll.
+// @rationale `list --json --no-usage` is the cheap vault read but carries no `plan`; only
+// `list --json` does, and it also performs a quota lookup (≈1.9 s). Calling it at boot, after `add`,
+// and after `switch`/`rotate` is enough because a plan changes only when the account does.
+// @preconditions m.cfg is configured.
+// @param ctx Cancellation root for the subprocess.
+// @returns A wrapped error when the subprocess fails or the payload cannot be parsed; the previously
+// cached labels are then retained.
+// @throws None directly.
+// @invariants One subprocess at most; never consults or mutates eligibility state; a missing `plan`
+// for an account is stored as empty so the reader can render it as unknown rather than guessing.
+func (m *Manager) RefreshPlan(ctx context.Context) error {
+	var out []byte
+	var err error
+	if m.listPlanForTest != nil {
+		out, err = m.listPlanForTest(ctx)
+	} else {
+		out, err = m.execAgyAuth(ctx, "list", "--json")
+	}
+	if err != nil {
+		return fmt.Errorf("agy-auth list --json failed: %w", err)
+	}
+
+	type rawPlanItem struct {
+		ID   string `json:"id"`
+		Plan string `json:"plan"`
+	}
+	var envFormat struct {
+		Data struct {
+			Accounts []rawPlanItem `json:"accounts"`
+		} `json:"data"`
+	}
+	var accounts []rawPlanItem
+	if err := json.Unmarshal(out, &envFormat); err == nil && envFormat.Data.Accounts != nil {
+		accounts = envFormat.Data.Accounts
+	} else if err := json.Unmarshal(out, &accounts); err != nil || accounts == nil {
+		return fmt.Errorf("failed to parse agy-auth plan payload: %q", truncateForError(out))
+	}
+
+	plans := make(map[string]string, len(accounts))
+	for _, acc := range accounts {
+		if acc.ID == "" {
+			continue
+		}
+		plans[acc.ID] = strings.ToLower(strings.TrimSpace(acc.Plan))
+	}
+
+	m.vaultMu.Lock()
+	m.plans = plans
+	m.accountsMu.Lock()
+	// Reconcile the cached label into the account set so readers do not have to consult two places.
+	// Tier is reporting-only: nothing in eligibility reads it.
+	for i := range m.accounts {
+		m.accounts[i].Tier = plans[m.accounts[i].ID]
+	}
+	m.accountsMu.Unlock()
+	m.vaultMu.Unlock()
+	return nil
+}
+
+// planLabelFor returns the cached display label for an account id.
+//
+// @purpose Gives the admin API and CLI one place that decides how an unknown plan is rendered.
+// @rationale Reporting `free` for an account whose plan was never read is a factual claim the vault
+// did not make. Upstream omits `plan` entirely when quota is unavailable, so absence must render as
+// unknown.
+// @preconditions None.
+// @param accountID Account to look up.
+// @returns The capitalised plan name, or "Unknown" when no plan has been read for it.
+// @throws None.
+// @invariants O(1) map read under vaultMu; never mutates state.
+func (m *Manager) planLabelFor(accountID string) string {
+	m.vaultMu.Lock()
+	plan := m.plans[accountID]
+	m.vaultMu.Unlock()
+	plan = strings.TrimSpace(plan)
+	if plan == "" {
+		return "Unknown"
+	}
+	return strings.ToUpper(plan[:1]) + plan[1:]
+}
+
+// purgeWorkerCredentialsFor deletes the worker HOME of every account that no longer exists.
+//
+// @purpose Leaves nothing behind when an account is deleted: not the plaintext refresh token, not the
+// agent's conversation cache, not the brain artifacts, not an orphan home that the next boot would
+// reuse for a different account.
 // @rationale Each worker HOME holds its own credential copy (that is what makes per-account quota
 // real). Those copies are never touched by `agy-auth remove`, which only knows the vault, so without
-// this they outlive the account indefinitely.
+// this they outlive the account indefinitely. The previous version also two narrower bugs: it was
+// bounded by `cfg.Pool.WorkerCount`, so lowering the count left `w2`/`w3` holding deleted
+// credentials forever (one of them world-readable), and it deleted only the token file, leaving the
+// deleted account's `conversations/`, `conversation_summaries.db*` and `brain/` on disk.
 // @preconditions Caller must not hold accountsMu or vaultMu.
 // @param emails Display emails of the removed accounts; empty is a no-op.
-// @returns None; unmatched or unreadable files are left alone.
-// @throws None; every failure is logged at debug level.
-// @invariants O(workerCount) file reads; never logs credential material.
-func (m *Manager) purgeWorkerCredentialsFor(emails []string) {
+// @returns The worker indices whose HOME was removed. Removal is best-effort per directory: a
+// failure is logged and the rest still proceed.
+// @throws None; every failure is logged.
+// @invariants O(worker directories on disk), NOT O(WorkerCount) — the scan is over `wN` entries
+// actually present, so a stale home from a previous, larger configuration is still found. Never logs
+// credential material.
+func (m *Manager) purgeWorkerCredentialsFor(emails []string) []int {
 	if len(emails) == 0 || m.cfg == nil || m.cfg.Storage.WorkersRootDir == "" {
-		return
+		return nil
 	}
 	gone := make(map[string]struct{}, len(emails))
 	for _, e := range emails {
@@ -329,13 +477,19 @@ func (m *Manager) purgeWorkerCredentialsFor(emails []string) {
 		}
 	}
 	if len(gone) == 0 {
-		return
+		return nil
 	}
 
-	for i := 0; i < m.cfg.Pool.WorkerCount; i++ {
-		path := filepath.Join(m.cfg.Storage.WorkersRootDir, fmt.Sprintf("w%d", i),
-			".gemini", "antigravity-cli", "antigravity-oauth-token")
-		raw, err := os.ReadFile(path)
+	homes, err := workerHomeDirs(m.cfg.Storage.WorkersRootDir)
+	if err != nil {
+		m.logger.Debug("could not enumerate worker homes for purge", "err", err)
+		return nil
+	}
+
+	var removed []int
+	for _, h := range homes {
+		tokenPath := filepath.Join(h.path, ".gemini", "antigravity-cli", "antigravity-oauth-token")
+		raw, err := os.ReadFile(tokenPath)
 		if err != nil {
 			continue
 		}
@@ -346,13 +500,62 @@ func (m *Manager) purgeWorkerCredentialsFor(emails []string) {
 		if _, bad := gone[strings.ToLower(payload.IDTokenEmail)]; !bad {
 			continue
 		}
-		if err := os.Remove(path); err != nil {
-			m.logger.Debug("could not remove credential of a deleted account", "workerID", i, "err", err)
+		if err := os.RemoveAll(h.path); err != nil {
+			m.logger.Warn("could not remove the worker home of a deleted account",
+				"workerID", h.id, "err", err)
 			continue
 		}
-		m.logger.Info("removed credential of a deleted account", "workerID", i,
+		m.logger.Info("removed worker home of a deleted account", "workerID", h.id,
 			"email", payload.IDTokenEmail)
+		removed = append(removed, h.id)
 	}
+	return removed
+}
+
+// workerHome is one `wN` directory found under the workers root.
+type workerHome struct {
+	id   int
+	path string
+}
+
+// workerHomeDirs lists every `wN` worker HOME that exists on disk.
+//
+// @purpose Removes the "only the first WorkerCount directories matter" assumption that left stale
+// homes holding deleted credentials after an operator lowered the count.
+// @rationale The directory name encodes the worker index and nothing else in the tree matches `^w\d+$`
+// at the top level, so a directory listing is the authoritative inventory. It is derived from the
+// filesystem, not from configuration, because configuration is exactly what changed.
+// @preconditions root is the configured workers root; it may not exist.
+// @param root WorkersRootDir.
+// @returns Every `wN` directory, sorted by numeric id for deterministic logs. A missing root is an
+// empty slice, not an error.
+// @throws A wrapped error only when the directory exists but cannot be read.
+// @invariants O(entries); ignores files and any name that is not `w<digits>`.
+func workerHomeDirs(root string) ([]workerHome, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	homes := make([]workerHome, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if len(name) < 2 || name[0] != 'w' {
+			continue
+		}
+		id, convErr := strconv.Atoi(name[1:])
+		if convErr != nil || id < 0 {
+			continue
+		}
+		homes = append(homes, workerHome{id: id, path: filepath.Join(root, name)})
+	}
+	sort.Slice(homes, func(i, j int) bool { return homes[i].id < homes[j].id })
+	return homes, nil
 }
 
 // truncateForError bounds a raw payload quoted in an error message.
@@ -459,6 +662,38 @@ func (m *Manager) SetFetchUsageForTest(fn func(ctx context.Context) (map[string]
 }
 
 // SetAccountsForTest injects accounts directly into the manager for unit and integration testing.
+// SetAgyForTest replaces the `agy` subprocess for tests.
+//
+// @purpose Lets the quota fallback and model discovery be exercised without a real binary.
+// @rationale Both paths route through ExecAgy, so one seam covers them and the child environment stays
+// described in exactly one place.
+// @preconditions Only call from tests, before concurrent use begins.
+// @param fn Replacement runner; nil restores real process execution.
+// @returns None.
+// @throws None.
+// @invariants Stores one function pointer; never spawns anything itself.
+func (m *Manager) SetAgyForTest(fn func(ctx context.Context, homeDir string, args []string) ([]byte, error)) {
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+	m.agyForTest = fn
+}
+
+// SetAgyAuthForTest replaces the `agy-auth` subprocess for tests.
+//
+// @purpose Lets vault error shapes (for example `ambiguous_query`) be produced exactly.
+// @rationale The CLI and admin API surface the vault error verbatim, so the test must be able to
+// generate the real payload.
+// @preconditions Only call from tests, before concurrent use begins.
+// @param fn Replacement runner; nil restores real process execution.
+// @returns None.
+// @throws None.
+// @invariants Stores one function pointer; never spawns anything itself.
+func (m *Manager) SetAgyAuthForTest(fn func(ctx context.Context, args []string) ([]byte, error)) {
+	m.vaultMu.Lock()
+	defer m.vaultMu.Unlock()
+	m.agyAuthForTest = fn
+}
+
 func (m *Manager) SetAccountsForTest(accounts []Account) {
 	m.accountsMu.Lock()
 	defer m.accountsMu.Unlock()
@@ -556,6 +791,49 @@ func (m *Manager) MarkAccountUsed(accountID string, now time.Time) {
 	}
 }
 
+// MarkFamilyCooldown cools exactly one quota family of an account.
+//
+// @purpose Applies a refusal the gateway could attribute to a specific family.
+// @rationale A quota refusal names no family, but the gateway knows which model was requested. Cooling
+// both families would take a whole account out of rotation because one of its two independent windows
+// ran out — the exact over-cooling the family split exists to prevent.
+// @preconditions None; an unknown account id or an unknown family (empty string) is a no-op.
+// @param accountID Account to cool.
+// @param family Quota family to cool; "" is ignored because it cannot be attributed.
+// @param until Absolute end of the cooldown; a past time clears the family instead.
+// @returns None; mutates manager state.
+// @throws None.
+// @invariants O(accounts); takes accountsMu; never spawns a subprocess.
+func (m *Manager) MarkFamilyCooldown(accountID, family string, until time.Time) {
+	if m == nil || accountID == "" || family == "" {
+		return
+	}
+	m.accountsMu.Lock()
+	defer m.accountsMu.Unlock()
+
+	for i := range m.accounts {
+		acc := &m.accounts[i]
+		if acc.ID != accountID {
+			continue
+		}
+		if acc.FamilyCooldowns == nil {
+			acc.FamilyCooldowns = make(map[string]time.Time, 2)
+		}
+		if !time.Now().Before(until) {
+			delete(acc.FamilyCooldowns, family)
+			summarizeCooldown(acc)
+			return
+		}
+		acc.FamilyCooldowns[family] = until
+		// Folding the family map into Status/CooldownUntil here is what makes the operator-facing view
+		// and the Retry-After hint agree with eligibility. Without it a family-cooled account kept
+		// reporting HEALTHY with no cooldown, so `NextAvailableIn` returned 0 and the client was told to
+		// "retry later" with no hint of when.
+		summarizeCooldown(acc)
+		return
+	}
+}
+
 // MarkAccountStatus updates an account's status and its derived cooldown state.
 //
 // @purpose Applies a credential- or quota-level verdict to one account atomically.
@@ -592,17 +870,13 @@ func (m *Manager) MarkAccountStatus(accountID string, status AccountStatus, cool
 				acc.FamilyCooldowns[QuotaFamilyThirdParty] = until
 				acc.CooldownUntil = until
 			case StatusHealthy:
-				acc.VaultExpired = false
 				acc.FamilyCooldowns = nil
 				acc.CooldownUntil = time.Time{}
 			case StatusAuthExpired:
 				// Bucket windows are irrelevant to a credential fault. The expiry is bounded, not
 				// permanent: a runtime-detected failure (a bad export, an upstream 401) may clear on its
 				// own, and a permanently-clean account would otherwise disappear from the vault with no
-				// recovery path. `AuthExpiredRetryInterval` is how long it stays out of service; a
-				// vault-reported expiry is applied by Sync with a zero window and stays permanent.
-				// Provenance is runtime, so Sync is free to restore the account once the vault agrees.
-				acc.VaultExpired = false
+				// recovery path. `AuthExpiredRetryInterval` is how long it stays out of service.
 				acc.FamilyCooldowns = nil
 				if cooldown > 0 {
 					acc.CooldownUntil = time.Now().Add(cooldown)
@@ -654,7 +928,6 @@ func (m *Manager) findNextEligibleAccountLocked(excludeAccountID string, model s
 				acc.Status = StatusHealthy
 				acc.CooldownUntil = time.Time{}
 				acc.FamilyCooldowns = nil
-				acc.VaultExpired = false
 				continue
 			}
 			// Recover every family whose window has elapsed; clearing the map is what makes the
@@ -857,6 +1130,12 @@ func (m *Manager) GetQuota(ctx context.Context, query string) (*AccountsQuotaRes
 		m.logger.Warn("failed to fetch per-account quota", "err", usageErr)
 	}
 
+	// Accounts `agy-auth usage` refuses to report on would otherwise render as unreadable here while
+	// the poller (which does run the fallback) knows their real buckets — the admin view and the
+	// rotation decisions then disagree. Resolve the same fallback so one call answers with the same
+	// truth the scheduler acts on.
+	fallbacks := m.ResolveQuotaFallbacks(ctx, usageByAccount)
+
 	now := time.Now().UTC()
 	result := make([]AccountQuotaInfo, 0, len(accounts))
 
@@ -868,11 +1147,7 @@ func (m *Manager) GetQuota(ctx context.Context, query string) (*AccountsQuotaRes
 			continue
 		}
 
-		planDisplay := acc.Tier
-		if planDisplay == "" {
-			planDisplay = "free"
-		}
-		planDisplay = strings.ToUpper(planDisplay[:1]) + planDisplay[1:]
+		planDisplay := m.planLabelFor(acc.ID)
 
 		info := AccountQuotaInfo{
 			ID:         acc.ID,
@@ -902,11 +1177,25 @@ func (m *Manager) GetQuota(ctx context.Context, query string) (*AccountsQuotaRes
 			// A per-account usage_error in a successful fetch means this account's groups are absent,
 			// which is the same unreadable state as a failed snapshot — treat it identically.
 			if usage.UsageError != "" {
-				info.Groups = nil
-				info.Quotas = nil
-				info.QuotasKnown = false
-				info.UsageError = usage.UsageError
-				info.QuotaAvailable = false
+				if groups, recovered := fallbacks[acc.ID]; recovered {
+					info.Groups = toQuotaGroupInfos(groups)
+					info.Quotas = QuotaGroups(groups)
+					info.QuotasKnown = true
+					info.UsageError = ""
+					info.QuotaAvailable = acc.Status == StatusHealthy && acc.Enabled
+					for _, q := range info.Quotas {
+						if q.IsExhausted {
+							info.QuotaAvailable = false
+							break
+						}
+					}
+				} else {
+					info.Groups = nil
+					info.Quotas = nil
+					info.QuotasKnown = false
+					info.UsageError = usage.UsageError
+					info.QuotaAvailable = false
+				}
 			} else {
 				info.Groups = toQuotaGroupInfos(usage.Groups)
 				info.Quotas = QuotaGroups(usage.Groups)
@@ -1005,13 +1294,23 @@ func (m *Manager) ProvisionWorkerHome(workerID int, accountID string) (string, s
 
 	homeDir := filepath.Join(m.cfg.Storage.WorkersRootDir, fmt.Sprintf("w%d", workerID))
 	tmpDir := filepath.Join(m.cfg.Storage.WorkersTmpDir, fmt.Sprintf("w%d", workerID))
-	workDir := filepath.Join(m.cfg.Storage.WorkspacesRootDir, fmt.Sprintf("w%d", workerID))
+	// Every worker shares ONE workspace root so the agent's own files survive an account rotation, a
+	// worker recycle, and a restart. The per-worker directory that used to live here is what destroyed
+	// context on every switch and fed the rewrite loop.
+	workDir := m.cfg.Storage.EffectiveWorkspaceDir()
+	if workDir == "" {
+		return "", "", "", fmt.Errorf("storage.workspace_dir is not configured")
+	}
 
 	for _, d := range []string{homeDir, tmpDir, workDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return "", "", "", fmt.Errorf("failed to create directory %s: %w", d, err)
 		}
 	}
+	// The shared workspace is where an external harness mounts its own files, so it must be traversable
+	// by the mounted uid while remaining writable by this process only where the operator allows it.
+	// 0755 is deliberate: the container image runs agy as a non-root uid and the host bind-mount must
+	// be usable, so restricting it further would break external file CRUD.
 	// The worker's TMPDIR holds the per-session MCP socket, and the directory is that socket's access
 	// control: since TMPDIR is inherited by the child agent as its temp dir, it must not be readable
 	// or traversable by another uid in the container, or any local process could invoke the consumer's
@@ -1033,22 +1332,80 @@ func (m *Manager) ProvisionWorkerHome(workerID int, accountID string) (string, s
 	return homeDir, tmpDir, workDir, nil
 }
 
-// SwitchAccount executes agy-auth switch <query>.
-func (m *Manager) SwitchAccount(ctx context.Context, query string) error {
+// SwitchAccount sets the vault's active account and makes every worker use it.
+//
+// @purpose Turns "switch" into an operation with an observable effect on traffic.
+// @rationale `agy-auth switch` rewrites the global CLI credential and the keyring, which no worker
+// reads: each worker authenticates with its own materialised token. Calling it alone therefore changed
+// nothing about who serves a request, while the CLI and the admin API both reported success. The vault
+// call is still made, because that is what `agy-auth list` reports as active and what an operator sees
+// in `agy-auth current`; the worker rebind is what makes it real.
+// @preconditions The vault holds an account matching query.
+// @param ctx Cancellation root for the vault call and each credential install.
+// @param query Account id, alias, email, or unique prefix as `agy-auth` accepts.
+// @returns The resolved account id and the per-worker transitions. A resolution failure or an
+// `ambiguous_query` from the vault is returned as an error and nothing is rebound.
+// @throws The wrapped vault error; a worker rebind error after the vault already changed.
+// @invariants At most one vault subprocess plus one per worker; never holds vaultMu across them.
+func (m *Manager) SwitchAccount(ctx context.Context, query string) (string, error) {
 	m.vaultMu.Lock()
-	defer m.vaultMu.Unlock()
-
 	_, err := m.execAgyAuth(ctx, "switch", query)
-	return err
+	m.vaultMu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	// Sync picks up the new `active` flag and any plan data, so the resolved id is known before
+	// anything is installed on a worker.
+	if syncErr := m.Sync(ctx); syncErr != nil {
+		m.logger.Warn("vault resync after account switch failed", "err", syncErr)
+	}
+	_ = m.RefreshPlan(ctx)
+	target := m.activeAccountID()
+	return target, nil
 }
 
-// RotateAccount executes agy-auth rotate.
+// activeAccountID reports which vault account is flagged active, or "" when none is.
+//
+// @purpose Gives switch a concrete account to install on workers.
+// @rationale `agy-auth switch` reports success without naming the resolved account, and a query can be
+// an alias or a prefix, so the id has to be read back from the account set.
+// @preconditions None.
+// @param None.
+// @returns The active account id, or "" when the vault has no active flag.
+// @throws None.
+// @invariants O(accounts); takes a read lock.
+func (m *Manager) activeAccountID() string {
+	for _, acc := range m.GetAccounts() {
+		if acc.ActiveInVault {
+			return acc.ID
+		}
+	}
+	return ""
+}
+
+// RotateAccount changes the vault's active account.
+//
+// @purpose Keeps the vault coherent with the operator's intent.
+// @rationale The worker-level rotation is performed by the pool, which knows eligibility and bindings.
+// This only advances the vault so `agy-auth current` and the admin account list agree with what the
+// workers are actually doing. A "no rotation needed" answer from the vault is not an error.
+// @preconditions None.
+// @param ctx Cancellation root for the subprocess.
+// @returns None.
+// @throws The wrapped vault error.
+// @invariants One subprocess; never holds vaultMu across the resync.
 func (m *Manager) RotateAccount(ctx context.Context) error {
 	m.vaultMu.Lock()
-	defer m.vaultMu.Unlock()
-
 	_, err := m.execAgyAuth(ctx, "rotate")
-	return err
+	m.vaultMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if syncErr := m.Sync(ctx); syncErr != nil {
+		m.logger.Warn("vault resync after account rotation failed", "err", syncErr)
+	}
+	_ = m.RefreshPlan(ctx)
+	return nil
 }
 
 // RemoveAccount deletes an account from the vault and purges what this gateway installed for it.
@@ -1140,6 +1497,9 @@ func (m *Manager) ExecAgy(ctx context.Context, homeDir string, args ...string) (
 	if homeDir == "" {
 		homeDir = os.Getenv("HOME")
 	}
+	if m.agyForTest != nil {
+		return m.agyForTest(ctx, homeDir, args)
+	}
 
 	maxRetries := m.cfg.Execution.MaxRetries
 	if maxRetries < 0 {
@@ -1188,6 +1548,9 @@ func (m *Manager) ExecAgy(ctx context.Context, homeDir string, args ...string) (
 }
 
 func (m *Manager) execAgyAuth(ctx context.Context, args ...string) ([]byte, error) {
+	if m.agyAuthForTest != nil {
+		return m.agyAuthForTest(ctx, args)
+	}
 	maxRetries := m.cfg.Execution.MaxRetries
 	if maxRetries < 0 {
 		maxRetries = 0

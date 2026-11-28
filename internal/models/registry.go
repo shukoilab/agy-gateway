@@ -6,10 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -159,54 +156,15 @@ func (mr *ModelRegistry) SyncModels(ctx context.Context) error {
 
 	discovered := make(map[string]*ModelInfo)
 
-	// Identify candidate home directories to query models from
-	candidateHomes := make([]string, 0)
-
-	// 1. Worker directories
-	if mr.cfg.Storage.WorkersRootDir != "" {
-		for i := 0; i < mr.cfg.Pool.WorkerCount; i++ {
-			wHome := filepath.Join(mr.cfg.Storage.WorkersRootDir, fmt.Sprintf("w%d", i))
-			tokenPath := filepath.Join(wHome, ".gemini", "antigravity-cli", "antigravity-oauth-token")
-			if _, err := os.Stat(tokenPath); err == nil {
-				candidateHomes = append(candidateHomes, wHome)
-			}
-		}
-	}
-
-	// 2. Default user home
-	if home := os.Getenv("HOME"); home != "" {
-		tokenPath := filepath.Join(home, ".gemini", "antigravity-cli", "antigravity-oauth-token")
-		if _, err := os.Stat(tokenPath); err == nil {
-			candidateHomes = append(candidateHomes, home)
-		}
-	}
-
-	// If no candidate homes found with tokens, use default home as fallback
-	if len(candidateHomes) == 0 {
-		candidateHomes = append(candidateHomes, os.Getenv("HOME"))
-	}
-
-	// Query models from candidate homes
-	for _, homeDir := range candidateHomes {
-		out, err := mr.authMgr.ExecAgy(ctx, homeDir, "models")
-		if err != nil {
-			mr.logger.Debug("failed to query agy models from home", "homeDir", homeDir, "err", err)
-			continue
-		}
-
-		models := parseAgyModelsOutput(out)
-		for _, m := range models {
-			if existing, exists := discovered[m.ID]; exists {
-				// Merge accounts if present
-				for _, acc := range m.AccountIDs {
-					if !contains(existing.AccountIDs, acc) {
-						existing.AccountIDs = append(existing.AccountIDs, acc)
-					}
-				}
-			} else {
-				discovered[m.ID] = m
-			}
-		}
+	// Discovery needs exactly ONE valid credential: every account yields the identical catalog
+	// (measured byte-for-byte on a Free and a Pro account), so looping over all of them would cost
+	// ~2 s per account for zero extra models. Preference order is cheapest-first, and each candidate
+	// is tried until one answers so a single broken credential cannot empty the catalog.
+	if err := mr.discoverModels(ctx, discovered); err != nil {
+		// Keep the previous catalog: an empty catalog over a working one would turn every request into
+		// model_not_found.
+		mr.logger.Warn("dynamic model discovery failed; retaining previous catalog", "err", err)
+		return nil
 	}
 
 	// If discovery succeeded, update internal cache
@@ -269,6 +227,37 @@ func (mr *ModelRegistry) NeedsOnboarding() bool {
 	if mr.authMgr != nil && len(mr.authMgr.GetAccounts()) > 0 {
 		return false
 	}
+	mr.mu.RLock()
+	defer mr.mu.RUnlock()
+	return len(mr.models) == 0
+}
+
+// HasAccounts reports whether the vault holds any usable account.
+//
+// @purpose Lets a handler distinguish "nothing is configured" from "configured but not enumerable".
+// @rationale `NeedsOnboarding` short-circuits on a non-empty vault by design, so it cannot report a
+// catalog that is empty despite accounts existing — exactly the state a failing credential export
+// produces. That state needs its own actionable error, not `model_not_found`.
+// @preconditions None.
+// @param None.
+// @returns True when at least one account is tracked.
+// @throws None.
+// @invariants O(1).
+func (mr *ModelRegistry) HasAccounts() bool {
+	return mr.authMgr != nil && len(mr.authMgr.GetAccounts()) > 0
+}
+
+// CatalogEmpty reports that no model is currently registered.
+//
+// @purpose Completes the S26 distinction on the handler side.
+// @rationale Read under the registry lock so a concurrent successful discovery cannot be reported as
+// empty.
+// @preconditions None.
+// @param None.
+// @returns True when the catalog holds no model.
+// @throws None.
+// @invariants O(1).
+func (mr *ModelRegistry) CatalogEmpty() bool {
 	mr.mu.RLock()
 	defer mr.mu.RUnlock()
 	return len(mr.models) == 0
@@ -557,8 +546,6 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 			ownedBy = "openai"
 		}
 
-		requiresPaidTier := strings.Contains(modelID, "opus")
-
 		contextWindow := 1048576 // 1M tokens default for Gemini family
 		maxOutputTokens := 65536
 		if strings.Contains(modelID, "claude") {
@@ -570,13 +557,16 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 		}
 
 		result = append(result, &ModelInfo{
-			ID:               modelID,
-			DisplayName:      displayName,
-			UpstreamModel:    upstreamModel,
-			PresetEffort:     presetEffort,
-			OwnedBy:          ownedBy,
-			Created:          1740000000,
-			RequiresPaidTier: requiresPaidTier,
+			ID:            modelID,
+			DisplayName:   displayName,
+			UpstreamModel: upstreamModel,
+			PresetEffort:  presetEffort,
+			OwnedBy:       ownedBy,
+			Created:       1740000000,
+			// Catalog-sourced only: no model is refused because of its NAME. A Free account was measured
+			// serving claude-opus-4-6-thinking successfully, so a substring rule would refuse working
+			// requests. Upstream tier enforcement surfaces as a provider-native error instead.
+			RequiresPaidTier: false,
 			SupportedEfforts: supportedEfforts,
 			AccountIDs:       []string{},
 			ContextWindow:    contextWindow,
@@ -618,7 +608,7 @@ func parseAgyModelsOutput(output []byte) []*ModelInfo {
 				PresetEffort:     "",
 				OwnedBy:          ownedBy,
 				Created:          1740000000,
-				RequiresPaidTier: strings.Contains(baseID, "opus"),
+				RequiresPaidTier: false,
 				SupportedEfforts: []string{"low", "medium", "high", "xhigh"},
 				AccountIDs:       []string{},
 				ContextWindow:    baseContextWindow,

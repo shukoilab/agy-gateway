@@ -3,12 +3,14 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"agy-gateway/internal/auth"
 	"agy-gateway/internal/config"
 	"agy-gateway/internal/models"
+	"agy-gateway/internal/pool"
 	"agy-gateway/internal/updater"
 )
 
@@ -19,6 +21,9 @@ type AdminHandlers struct {
 	onboard       *auth.OAuthOnboardingManager
 	modelRegistry *models.ModelRegistry
 	updaterSvc    *updater.Service
+	// pool rebinds workers so switch/rotate affect live traffic, not just the vault.
+	pool   *pool.Pool
+	logger *slog.Logger
 }
 
 // NewAdminHandlers creates an AdminHandlers instance.
@@ -28,13 +33,20 @@ func NewAdminHandlers(
 	onboard *auth.OAuthOnboardingManager,
 	modelRegistry *models.ModelRegistry,
 	updaterSvc *updater.Service,
+	workerPool *pool.Pool,
+	logger *slog.Logger,
 ) *AdminHandlers {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &AdminHandlers{
 		cfg:           cfg,
 		authMgr:       authMgr,
 		onboard:       onboard,
 		modelRegistry: modelRegistry,
 		updaterSvc:    updaterSvc,
+		pool:          workerPool,
+		logger:        logger,
 	}
 }
 
@@ -194,17 +206,38 @@ func (h *AdminHandlers) HandleSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.authMgr.SwitchAccount(r.Context(), body.Query); err != nil {
+	accountID, err := h.authMgr.SwitchAccount(r.Context(), body.Query)
+	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: err.Error()})
 		return
+	}
+
+	// A vault switch alone changes nothing about who serves traffic: workers authenticate with their
+	// own materialised credentials. Rebinding them is what makes the operator's intent observable.
+	result := pool.BindingResult{Unchanged: true}
+	if h.pool != nil && accountID != "" {
+		if res, bindErr := h.pool.RebindWorkersForAccount(r.Context(), accountID); bindErr != nil {
+			h.logger.Warn("worker rebind after account switch failed", "err", bindErr)
+			result = res
+		} else {
+			result = res
+		}
+		h.pool.RecycleTainted(r.Context(), h.cfg.Pool.HandshakeTimeout*2)
 	}
 	if h.modelRegistry != nil {
 		_ = h.modelRegistry.SyncModels(r.Context())
 	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(StatusResponse{Status: "switched", Target: body.Query})
+	_ = json.NewEncoder(w).Encode(SwitchResultResponse{
+		Status:      "switched",
+		Target:      body.Query,
+		AccountID:   accountID,
+		Unchanged:   result.Unchanged,
+		WorkerMoves: result.WorkerMoves,
+	})
 }
 
 // HandleRotate serves POST /admin/v1/accounts/rotate.
@@ -227,11 +260,29 @@ func (h *AdminHandlers) HandleRotate(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(AdminErrorResponse{Error: err.Error()})
 		return
 	}
+
+	// `agy-auth rotate` moves the vault's active flag only. The workers keep their bindings, so the
+	// rotation an operator asked for has to be performed here, per worker, and reported per worker.
+	result := pool.BindingResult{Unchanged: true}
+	if h.pool != nil {
+		if res, rotErr := h.pool.RotateWorkersOneStep(r.Context(), "", false); rotErr != nil {
+			h.logger.Warn("worker rotation failed", "err", rotErr)
+			result = res
+		} else {
+			result = res
+		}
+		h.pool.RecycleTainted(r.Context(), h.cfg.Pool.HandshakeTimeout*2)
+	}
 	if h.modelRegistry != nil {
 		_ = h.modelRegistry.SyncModels(r.Context())
 	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(StatusResponse{Status: "rotated"})
+	_ = json.NewEncoder(w).Encode(RotateResultResponse{
+		Status:      "rotated",
+		Unchanged:   result.Unchanged,
+		WorkerMoves: result.WorkerMoves,
+	})
 }
 
 // HandleLoginInit serves POST /admin/v1/accounts/login/init.

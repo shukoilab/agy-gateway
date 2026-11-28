@@ -42,19 +42,9 @@ type Account struct {
 	// struct field that nothing consumed, so an operator's choice of active account had no effect on
 	// gateway allocation.
 	// @invariants True when the vault reports this account as active; at most one account per sync.
-	ActiveInVault  bool `json:"active_in_vault,omitempty"`
-	AssignedWorker int  `json:"assigned_worker" example:"0"` // -1 if unassigned
-	// VaultExpired records that the AUTH_EXPIRED state came from the vault's own report rather than
-	// from a runtime failure.
-	//
-	// @purpose Lets Sync tell "the vault still says this credential is dead" apart from "the vault has
-	// since been refreshed by `agy-auth login`", so a re-login actually restores the account.
-	// @rationale A runtime auth fault is retried on a timer, but a vault-reported expiry is permanent
-	// until the credential changes. Without this flag both look identical in the previous snapshot and
-	// a carried-forward AUTH_EXPIRED would outlive the re-login that fixed it.
-	// @invariants True only while Status is AUTH_EXPIRED and the vault itself reported the expiry.
-	VaultExpired  bool      `json:"vault_expired,omitempty"`
-	CooldownUntil time.Time `json:"cooldown_until,omitempty" example:"2026-11-24T17:47:05Z"`
+	ActiveInVault  bool      `json:"active_in_vault,omitempty"`
+	AssignedWorker int       `json:"assigned_worker" example:"0"` // -1 if unassigned
+	CooldownUntil  time.Time `json:"cooldown_until,omitempty" example:"2026-11-24T17:47:05Z"`
 	// FamilyCooldowns holds a cooldown window per quota family ("gemini", "3p").
 	//
 	// @purpose Keeps an exhausted third-party bucket from deleting healthy Gemini capacity.
@@ -101,22 +91,6 @@ const (
 	QuotaFamilyGemini     = "gemini"
 	QuotaFamilyThirdParty = "3p"
 )
-
-// IsEligible returns true if the account is enabled, healthy, and has available quota across every
-// bucket.
-//
-// @purpose The conservative "any family" check for callers that have no model context.
-// @rationale Kept unchanged so existing callers keep their strict semantics; model-aware callers
-// must use IsEligibleForModel, which is what the pool actually needs.
-// @preconditions None.
-// @param requiresPaidTier Reject free accounts when the model demands a paid tier.
-// @param minRemainingPct Minimum remaining percentage required per bucket.
-// @returns True only when enabled, healthy, tier-eligible, and no bucket is at or below the floor.
-// @throws None.
-// @invariants O(number of buckets); no allocation.
-func (a *Account) IsEligible(requiresPaidTier bool, minRemainingPct float64) bool {
-	return a.IsEligibleForModel("", requiresPaidTier, minRemainingPct)
-}
 
 // QuotaFamilyForModel maps an upstream model id onto its quota family.
 //

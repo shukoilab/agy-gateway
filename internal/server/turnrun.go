@@ -48,6 +48,10 @@ type turnInput struct {
 	ClientToolNames   []string
 	// StopSequences are client-supplied sequences that must truncate the stream gateway-side.
 	StopSequences []string
+	// WorkspaceDir overrides the directory this turn runs in. Empty means the worker's own Cwd (which
+	// is already the shared workspace root). The provider handlers set it to a per-conversation
+	// subdirectory when the harness supplied a conversation identifier.
+	WorkspaceDir string
 	// AdditionalDirectories are extra workspace roots the consumer granted (OpenAI has no field for
 	// this, Anthropic neither; populated from the admin/config layer when available).
 	AdditionalDirectories []string
@@ -158,6 +162,10 @@ func executeTurnAttempt(
 		text     strings.Builder
 		thoughts strings.Builder
 		stopSeq  = NewStopSequenceMatcher(in.StopSequences)
+		// refusalGate holds back the leading bytes of an assistant message while they could still be a
+		// quota refusal. agy reports an exhausted account as a normal end_turn with plain text, so the
+		// only way to fail over instead of forwarding an upsell is to recognise that text here.
+		refusalGate = &quotaRefusalGate{}
 		// bar serialises update-listener invocations against the post-Call snapshot: the snapshot
 		// holds it for writing, every callback holds it for its whole body. late makes a callback
 		// that lost the race refuse immediately instead of blocking the turn.
@@ -320,6 +328,11 @@ func executeTurnAttempt(
 				return
 			}
 			emit, matched := stopSeq.Feed(chunk)
+			// A quota refusal must never reach the client: check the gate before anything else can
+			// treat this text as a real answer.
+			if emit != "" {
+				emit = refusalGate.Feed(emit)
+			}
 			mu.Lock()
 			if emit != "" {
 				text.WriteString(emit)
@@ -329,6 +342,11 @@ func executeTurnAttempt(
 				in.OnText(emit)
 			}
 			if matched {
+				cancelPrompt()
+			}
+			if refusalGate.Matched() {
+				// Stop the turn as soon as the refusal is identified: the account cannot serve this
+				// request and every further chunk would be more of the same message.
 				cancelPrompt()
 			}
 
@@ -503,11 +521,22 @@ func executeTurnAttempt(
 
 	// Emit the tail withheld for stop-sequence overlap detection, unless a sequence matched.
 	if tail := stopSeq.Flush(); tail != "" {
+		if released := refusalGate.Feed(tail); released != "" {
+			mu.Lock()
+			text.WriteString(released)
+			mu.Unlock()
+			if in.OnText != nil {
+				in.OnText(released)
+			}
+		}
+	}
+	// Anything the gate was still holding belongs to the client unless the turn was a refusal.
+	if released := refusalGate.Flush(); released != "" {
 		mu.Lock()
-		text.WriteString(tail)
+		text.WriteString(released)
 		mu.Unlock()
 		if in.OnText != nil {
-			in.OnText(tail)
+			in.OnText(released)
 		}
 	}
 
@@ -533,6 +562,23 @@ func executeTurnAttempt(
 		result.Usage = usage
 		mu.Unlock()
 		result.UsageFromAgent = true
+	}
+
+	// The account refused this turn for want of quota. Report it as a failure so the failover
+	// coordinator cools this account and retries on one that still has capacity, instead of handing the
+	// client a subscription upsell as if it were the answer.
+	if refusalGate.Matched() {
+		// The refusal text was suppressed from the response, so the message has to come from the gate
+		// itself; result.Text is empty by construction on this path.
+		msg := strings.TrimSpace(refusalGate.Text())
+		if msg == "" {
+			msg = "account quota exhausted"
+		}
+		err := &quotaRefusalError{message: msg}
+		if reset, ok := parseResetDuration(refusalGate.Text()); ok {
+			err.reset, err.hasReset = reset, true
+		}
+		return result, pool.MarkZeroTokens(err)
 	}
 
 	if callErr == nil && result.StopReason == "end_turn" &&
@@ -628,6 +674,7 @@ func setupACPSession(
 		ClientToolNames:       in.ClientToolNames,
 		AdditionalDirectories: in.AdditionalDirectories,
 		ClientMCPServers:      in.ClientMCPServers,
+		WorkspaceDir:          in.WorkspaceDir,
 	})
 
 	var newResult acp.SessionNewResult
@@ -655,7 +702,9 @@ func setupACPSession(
 	// arbitrary file read/write primitive for a remote harness.
 	if handlers := worker.Transport.Handlers(); handlers != nil {
 		roots := make([]string, 0, len(newParams.AdditionalDirectories)+1)
-		roots = append(roots, worker.Cwd)
+		// Use the session's actual CWD, not the worker's default: a per-conversation subdirectory is
+		// where the agent will read and write, so it must be inside the roots the fs handlers allow.
+		roots = append(roots, newParams.CWD)
 		roots = append(roots, newParams.AdditionalDirectories...)
 		handlers.RegisterSession(newResult.SessionID, roots)
 	}

@@ -21,8 +21,7 @@ import (
 func guardTestConfig(t *testing.T) *config.Config {
 	t.Helper()
 	return &config.Config{
-		Execution: config.ExecutionConfig{CleanWorkspaceBetweenRequests: true},
-		Storage:   config.StorageConfig{WorkspacesRootDir: t.TempDir()},
+		Storage: config.StorageConfig{WorkspacesRootDir: t.TempDir()},
 	}
 }
 
@@ -146,45 +145,54 @@ func TestSafeRemoveEntry_DoesNotFollowSymlink(t *testing.T) {
 	}
 }
 
-// TestCleanWorkspace_RefusesDangerousRoot proves the worker-level entry point honours the guard.
+// TestPurgeWorkspace_RefusesDangerousRoot proves the worker-level entry point honours the guard.
 //
-// @purpose Verifies FR-24 end to end: CleanWorkspace leaves files intact when the root is unsafe.
-// @rationale The unit guard is useless if CleanWorkspace bypasses it.
-// @preconditions A worker config with a workspace outside the configured root exists.
+// @purpose Verifies FR-24 end to end: the explicit workspace purge leaves files intact when the path is
+// outside the configured root.
+// @rationale The unit guard is useless if the only caller bypasses it.
+// @preconditions A worker whose Cwd is outside the configured workspace root.
 // @param t Standard Go test handle.
 // @returns None.
 // @throws Fatal if the sentinel file disappears.
 // @invariants Only touches its own temp directories.
-func TestCleanWorkspace_RefusesDangerousRoot(t *testing.T) {
+func TestPurgeWorkspace_RefusesDangerousRoot(t *testing.T) {
 	cfg := guardTestConfig(t)
+	cfg.Storage.WorkspaceDir = filepath.Join(cfg.Storage.WorkspacesRootDir, "shared")
 
-	cwd := t.TempDir() // outside the configured root
+	root := t.TempDir() // outside the configured root
+	cwd := filepath.Join(root, "elsewhere")
+	if err := os.MkdirAll(cwd, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
 	sentinel := filepath.Join(cwd, "precious.txt")
 	if err := os.WriteFile(sentinel, []byte("precious"), 0o600); err != nil {
 		t.Fatalf("write sentinel: %v", err)
 	}
 
 	w := NewWorker(0, "", "", cwd, nil, cfg, nil)
-	w.CleanWorkspace()
-
+	if n := w.PurgeWorkspace(); n != 0 {
+		t.Fatalf("PurgeWorkspace removed %d entries outside the configured root", n)
+	}
 	if _, err := os.Stat(sentinel); err != nil {
-		t.Fatalf("CleanWorkspace destroyed a file outside the configured root: %v", err)
+		t.Fatalf("PurgeWorkspace destroyed a file outside the configured root: %v", err)
 	}
 }
 
-// TestCleanWorkspace_RemovesInsideRoot proves normal cleanup still works after the guard.
+// TestPurgeWorkspace_RemovesInsideRoot proves the explicit purge works on the configured root.
 //
-// @purpose Prevents a false sense of safety where the guard silently disables all cleanup.
-// @rationale Storage growth between requests is a real leak; the guard must not break it.
-// @preconditions A worker workspace nested under the configured root contains scratch files.
+// @purpose Prevents a false sense of safety where the guard silently disables the operator command.
+// @rationale `agy-accounts clean --workspace` must work on the real workspace root, which the guard
+// refuses when compared against itself; the caller therefore validates against the root's parent.
+// @preconditions A workspace root under the configured workspaces root contains scratch files.
 // @param t Standard Go test handle.
 // @returns None.
-// @throws Fatal when files survive.
+// @throws Fatal when files survive or .git is destroyed.
 // @invariants Only touches its own temp directories.
-func TestCleanWorkspace_RemovesInsideRoot(t *testing.T) {
+func TestPurgeWorkspace_RemovesInsideRoot(t *testing.T) {
 	cfg := guardTestConfig(t)
 
-	cwd := filepath.Join(cfg.Storage.WorkspacesRootDir, "w0")
+	cwd := filepath.Join(cfg.Storage.WorkspacesRootDir, "shared")
+	cfg.Storage.WorkspaceDir = cwd
 	if err := os.MkdirAll(cwd, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -198,7 +206,9 @@ func TestCleanWorkspace_RemovesInsideRoot(t *testing.T) {
 	}
 
 	w := NewWorker(0, "", "", cwd, nil, cfg, nil)
-	w.CleanWorkspace()
+	if n := w.PurgeWorkspace(); n != 1 {
+		t.Fatalf("PurgeWorkspace removed %d entries, want 1", n)
+	}
 
 	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
 		t.Fatalf("expected scratch file removed, got %v", err)

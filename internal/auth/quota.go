@@ -133,6 +133,11 @@ func (qp *QuotaPoller) Poll(ctx context.Context) {
 	minPct := qp.cfg.Accounts.MinRemainingQuotaPct
 	autoRotate := qp.cfg.Accounts.AutoRotateEnabled
 
+	// The `agy /usage` fallback spawns a subprocess, which must never happen while accountsMu is held:
+	// the pool reads accounts lock-free on the lease path and would stall behind a ~2 s subprocess on
+	// every poll. Resolve all fallbacks first, then apply every result under one short lock.
+	fallbacks := qp.mgr.ResolveQuotaFallbacks(ctx, usage)
+
 	qp.mgr.accountsMu.Lock()
 	defer qp.mgr.accountsMu.Unlock()
 
@@ -151,17 +156,25 @@ func (qp *QuotaPoller) Poll(ctx context.Context) {
 		// failure must not erase good data) and mark the state unknown so ranking demotes the account
 		// instead of silently treating it as unlimited.
 		if live.UsageError != "" {
-			acc.QuotasKnown = false
-			acc.UsageError = truncateForError([]byte(live.UsageError))
-			qp.logger.Warn("quota read failed for account; retaining previous quota data",
-				"accountID", acc.ID, "usageError", acc.UsageError)
-			// Do not touch acc.Quotas, and do not derive family cooldowns from data we do not have.
-			continue
+			if groups, recovered := fallbacks[acc.ID]; recovered {
+				acc.Quotas = QuotaGroups(groups)
+				acc.QuotasKnown = true
+				acc.UsageError = ""
+				qp.logger.Info("quota recovered via agy /usage fallback",
+					"accountID", acc.ID, "groups", len(groups))
+			} else {
+				acc.QuotasKnown = false
+				acc.UsageError = truncateForError([]byte(live.UsageError))
+				qp.logger.Warn("quota read failed for account; retaining previous quota data",
+					"accountID", acc.ID, "usageError", acc.UsageError)
+				// Do not touch acc.Quotas, and do not derive family cooldowns from data we do not have.
+				continue
+			}
+		} else {
+			acc.Quotas = QuotaGroups(live.Groups)
+			acc.QuotasKnown = true
+			acc.UsageError = ""
 		}
-
-		acc.Quotas = QuotaGroups(live.Groups)
-		acc.QuotasKnown = true
-		acc.UsageError = ""
 
 		// A credential-level fault is owned by the auth layer, not by quota data: refreshing the
 		// buckets must not replace AUTH_EXPIRED/DISABLED with a quota summary and thereby resurrect an

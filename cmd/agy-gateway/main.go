@@ -28,7 +28,7 @@ import (
 )
 
 // @title           agy-gateway API
-// @version         3.17.0
+// @version         3.18.3
 // @description     An experimental research gateway and protocol bridge connecting OpenAI and Anthropic client applications to Google Antigravity CLI via standard Agent Client Protocol (ACP).
 // @termsOfService  https://github.com/shukoilab/agy-gateway
 
@@ -175,6 +175,11 @@ func main() {
 	if err := modelRegistry.SyncModels(ctx); err != nil {
 		logger.Warn("initial dynamic model discovery encountered issue", "err", err)
 	}
+	// Plan labels are a separate lookup: the cheap vault read behind Sync cannot see `plan`, and the
+	// only command that emits it is the expensive one. Reporting only — never used for eligibility.
+	if err := authMgr.RefreshPlan(ctx); err != nil {
+		logger.Debug("plan refresh at boot failed; plan will be reported as unknown", "err", err)
+	}
 
 	// 8b. Initialize background auto-updater service
 	updaterSvc := updater.NewService(cfg, workerPool, logger)
@@ -185,7 +190,7 @@ func main() {
 	loopbackServer := mcp.NewLoopbackServer(cfg.MCP.ClientToolCalling.MaxClientTools)
 	openaiHandlers := server.NewOpenAIHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
 	anthropicHandlers := server.NewAnthropicHandlers(cfg, workerPool, failoverCoord, modelRegistry, loopbackServer, logger)
-	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry, updaterSvc)
+	adminHandlers := server.NewAdminHandlers(cfg, authMgr, onboardingMgr, modelRegistry, updaterSvc, workerPool, logger)
 	opsHandlers := server.NewOpsHandlers(workerPool)
 
 	srv := server.NewServer(cfg, openaiHandlers, anthropicHandlers, adminHandlers, opsHandlers, loopbackServer, logger)

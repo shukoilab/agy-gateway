@@ -254,6 +254,20 @@ func (m *Manager) accountByID(accountID string) (Account, error) {
 	return Account{}, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
 }
 
+// AccountByID returns the vault representation of one account.
+//
+// @purpose Lets callers outside this package install a specific account on a worker.
+// @rationale Rebind needs the full Account (tier, quota snapshot) to publish a truthful binding, and
+// the unexported lookup was the only accessor.
+// @preconditions None.
+// @param accountID Account to look up.
+// @returns The account and nil, or an empty account and a wrapped ErrAccountNotFound.
+// @throws ErrAccountNotFound when the vault has no such id.
+// @invariants O(accounts); takes a read lock via GetAccounts.
+func (m *Manager) AccountByID(accountID string) (Account, error) {
+	return m.accountByID(accountID)
+}
+
 // readSingleCredential reads the one credential file an export produced.
 //
 // @purpose Enforces "exactly one file" so a whole-vault export can never be installed for one account.

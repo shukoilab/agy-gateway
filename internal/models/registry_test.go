@@ -58,13 +58,16 @@ gpt-oss-120b-medium	GPT-OSS 120B (Medium)
 		t.Errorf("invalid base model config: %+v", base)
 	}
 
-	// Verify claude opus requires paid tier
+	// Verify claude opus is NOT gated on tier.
+	//
+	// @rationale A Free account was measured serving claude-opus-4-6-thinking successfully, so the old
+	// "model id contains opus => paid" heuristic refused requests that work. Tier is reporting-only.
 	opus, exists := modelMap["claude-opus-4-6-thinking"]
 	if !exists {
 		t.Fatal("missing claude-opus-4-6-thinking")
 	}
-	if !opus.RequiresPaidTier {
-		t.Error("expected claude-opus to require paid tier")
+	if opus.RequiresPaidTier {
+		t.Error("opus must not be gated on tier: a Free account serves it")
 	}
 	if opus.OwnedBy != "anthropic" {
 		t.Errorf("expected owned_by anthropic, got %s", opus.OwnedBy)

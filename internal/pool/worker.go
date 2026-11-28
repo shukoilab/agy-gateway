@@ -173,48 +173,89 @@ func (w *Worker) Start(ctx context.Context) error {
 	return nil
 }
 
-// CleanWorkspace removes transient files from the worker workspace and purges
-// ephemeral ACP session databases and brain artifacts between requests.
+// PurgeAccountCaches removes the agent caches that belong to the account this worker HOME held.
 //
-// @purpose Eliminates storage and memory leakages across sequential requests on pooled workers.
-// @rationale Enforces true JIT isolation and prevents unbounded disk growth from internal ACP SQLite session DBs.
-// @invariants Safe against missing directories and concurrent read operations.
-func (w *Worker) CleanWorkspace() {
-	if !w.cfg.Execution.CleanWorkspaceBetweenRequests {
-		return
+// @purpose Gives the next account a clean agent cache when a worker is rebound, without touching the
+// workspace (which must persist) or the credential (which is being replaced).
+// @rationale These paths are per-account, not per-workspace: `conversations/` holds the agent's own
+// session databases, `brain/` its scratch artifacts, and `conversation_summaries.db*` plus
+// `annotations/` live beside them. Leaving them means the new account inherits the previous account's
+// conversation state, which is both a privacy problem and a source of stale-context confusion.
+// @preconditions None; missing directories are a no-op.
+// @param None.
+// @returns True when at least one entry was removed; failures are logged.
+// @throws None.
+// @invariants O(entries in four directories); never deletes the token file or anything in Cwd.
+func (w *Worker) PurgeAccountCaches() bool {
+	if w.HomeDir == "" {
+		return false
 	}
-	// 1. Purge transient workspace working directory files, but only after proving the root is a
-	// disposable scratch directory. A misconfigured root must never destroy user data.
-	if err := validateWorkspaceRoot(w.cfg.Storage.WorkspacesRootDir, w.Cwd); err != nil {
-		w.logger.Error("refusing to clean workspace: guard rejected the path", "cwd", w.Cwd, "err", err)
-	} else if entries, err := os.ReadDir(w.Cwd); err == nil {
+	removed := false
+	cliDir := filepath.Join(w.HomeDir, ".gemini", "antigravity-cli")
+	for _, sub := range []string{"conversations", "brain", "annotations"} {
+		dir := filepath.Join(cliDir, sub)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
 		for _, entry := range entries {
-			if entry.Name() == ".git" {
+			if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+				w.logger.Warn("failed to purge account cache entry", "dir", sub, "entry", entry.Name(), "err", err)
 				continue
 			}
-			if err := safeRemoveEntry(w.Cwd, entry.Name()); err != nil {
-				w.logger.Warn("failed to remove workspace entry", "entry", entry.Name(), "err", err)
-			}
+			removed = true
 		}
 	}
+	// SQLite databases and their WAL/SHM companions live directly under the CLI directory.
+	for _, name := range []string{"conversation_summaries.db", "conversation_summaries.db-wal", "conversation_summaries.db-shm"} {
+		if err := os.Remove(filepath.Join(cliDir, name)); err == nil {
+			removed = true
+		}
+	}
+	return removed
+}
 
-	// 2. Purge ephemeral ACP session databases, WAL/SHM journals, and brain artifacts in worker home
-	if w.HomeDir != "" {
-		geminiCliDir := filepath.Join(w.HomeDir, ".gemini", "antigravity-cli")
-		convDir := filepath.Join(geminiCliDir, "conversations")
-		if convEntries, err := os.ReadDir(convDir); err == nil {
-			for _, ce := range convEntries {
-				// Purge all ephemeral conversation databases, WAL journals, and SHM shared memory files
-				_ = os.RemoveAll(filepath.Join(convDir, ce.Name()))
-			}
-		}
-		brainDir := filepath.Join(geminiCliDir, "brain")
-		if brainEntries, err := os.ReadDir(brainDir); err == nil {
-			for _, be := range brainEntries {
-				_ = os.RemoveAll(filepath.Join(brainDir, be.Name()))
-			}
-		}
+// PurgeWorkspace removes every entry in the shared workspace except `.git`.
+//
+// @purpose Implements the operator's explicit `agy-accounts clean --workspace`, and nothing else.
+// @rationale This used to run on every Release, which deleted the agent's own output between turns and
+// caused an unbounded rewrite loop. It is now reachable only from a deliberate command, so the durable
+// workspace stays durable by default.
+// @preconditions The configured workspace root must pass the guard; otherwise nothing is deleted.
+// @param None.
+// @returns The number of top-level entries removed.
+// @throws None; failures are logged.
+// @invariants O(entries); never removes `.git`; refuses any path the guard rejects.
+func (w *Worker) PurgeWorkspace() int {
+	// Validate against the PARENT of the configured root: with the shared workspace the target IS the
+	// root, which the guard refuses by design (it exists to stop a recursive delete of a root). Its
+	// parent check keeps every other protection: refuses filesystem root, home, symlinks, and any path
+	// that escapes.
+	root := w.cfg.Storage.EffectiveWorkspaceDir()
+	guardRoot := root
+	if parent := filepath.Dir(filepath.Clean(root)); parent != "" {
+		guardRoot = parent
 	}
+	if err := validateWorkspaceRoot(guardRoot, w.Cwd); err != nil {
+		w.logger.Error("refusing to clean workspace: guard rejected the path", "cwd", w.Cwd, "err", err)
+		return 0
+	}
+	entries, err := os.ReadDir(w.Cwd)
+	if err != nil {
+		return 0
+	}
+	removed := 0
+	for _, entry := range entries {
+		if entry.Name() == ".git" {
+			continue
+		}
+		if err := safeRemoveEntry(w.Cwd, entry.Name()); err != nil {
+			w.logger.Warn("failed to remove workspace entry", "entry", entry.Name(), "err", err)
+			continue
+		}
+		removed++
+	}
+	return removed
 }
 
 // Close gracefully terminates the worker process.

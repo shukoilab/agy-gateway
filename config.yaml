@@ -47,7 +47,6 @@ execution:
   # auto forwards image content to agy, which decodes and describes it natively; reject refuses
   # image input with a provider-native 400 (for deployments that must not accept binary payloads).
   vision_mode: "auto"
-  clean_workspace_between_requests: true
   max_retries: 3
   retry_initial_backoff: "500ms"
   retry_max_backoff: "10s"
@@ -77,6 +76,12 @@ storage:
   workers_root_dir: "/var/lib/agy-gateway/workers"
   workers_tmp_dir: "/var/lib/agy-gateway/tmp"
   workspaces_root_dir: "/var/lib/agy-gateway/workspaces"
+  # The directory every worker runs in. Durable: nothing clears it on a request path, because a
+  # workspace that is wiped between turns makes the agent rewrite the same files forever. Clear it
+  # explicitly with `agy-accounts clean --workspace`. Mount this path on the host if a harness
+  # outside the container must edit the same files. It must live under workspaces_root_dir and not
+  # inside workers_root_dir (validated at startup).
+  workspace_dir: "/var/lib/agy-gateway/workspaces/shared"
 
 pool:
   worker_count: 2

@@ -31,6 +31,9 @@ type SessionSetupInput struct {
 	ClientToolNames      []string
 	// AdditionalDirectories are extra absolute workspace roots the consumer granted for this turn.
 	AdditionalDirectories []string
+	// WorkspaceDir overrides the session CWD. Empty means the worker's own Cwd, which is the shared
+	// workspace root; a non-empty value is a per-conversation subdirectory of that root.
+	WorkspaceDir string
 	// ClientMCPServers are MCP servers declared by the consumer (stdio/http/sse), forwarded verbatim
 	// per docs/acp-conformance.md §4.1 so a harness's own context servers reach the agent.
 	ClientMCPServers []acp.MCPServerInfo
@@ -53,8 +56,12 @@ type SessionSetupInput struct {
 // be the reason one request behaves differently from another.
 // Pure construction; thread-safe, zero shared state mutation.
 func buildACPSessionNewParams(in SessionSetupInput) acp.SessionNewParams {
+	cwd := in.Worker.Cwd
+	if in.WorkspaceDir != "" {
+		cwd = in.WorkspaceDir
+	}
 	newParams := acp.SessionNewParams{
-		CWD: in.Worker.Cwd,
+		CWD: cwd,
 	}
 
 	// Forward the consumer's extra workspace roots. agy uses them for reads and writes outside cwd,

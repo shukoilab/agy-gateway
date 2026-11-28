@@ -19,7 +19,7 @@ func TestAdminUpdaterEndpoints(t *testing.T) {
 	cfg.AutoUpdate.BinDir = t.TempDir()
 
 	updaterSvc := updater.NewService(cfg, nil, nil)
-	adminHandlers := NewAdminHandlers(cfg, nil, nil, nil, updaterSvc)
+	adminHandlers := NewAdminHandlers(cfg, nil, nil, nil, updaterSvc, nil, nil)
 	opsHandlers := NewOpsHandlers(nil)
 	srv := NewServer(cfg, nil, nil, adminHandlers, opsHandlers, nil, nil)
 
@@ -57,7 +57,7 @@ func TestAdminUpdaterEndpoints(t *testing.T) {
 	}
 
 	// 4. Test uninitialized updater -> 503
-	handlersNoSvc := NewAdminHandlers(cfg, nil, nil, nil, nil)
+	handlersNoSvc := NewAdminHandlers(cfg, nil, nil, nil, nil, nil, nil)
 	srvNoSvc := NewServer(cfg, nil, nil, handlersNoSvc, opsHandlers, nil, nil)
 
 	req4 := httptest.NewRequest(http.MethodGet, "/admin/v1/updater/status", nil)

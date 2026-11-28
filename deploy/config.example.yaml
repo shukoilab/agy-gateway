@@ -41,7 +41,6 @@ execution:
   # The ACP argv is fixed by the gateway (always --dangerously-skip-permissions) and the system
   # prompt is always delivered as the first prompt block; neither is configurable.
   vision_mode: "auto"           # auto forwards images (agy decodes them); reject refuses them
-  clean_workspace_between_requests: true
   max_history_tokens: 60000     # estimated-token budget for forwarded history; 0 disables
   unsupported_parameter_policy: "ignore"  # ignore (header) | reject (provider-native 400)
   media:
@@ -57,6 +56,9 @@ storage:
   workers_root_dir: "/var/lib/agy-gateway/workers"
   workers_tmp_dir: "/var/lib/agy-gateway/tmp"
   workspaces_root_dir: "/var/lib/agy-gateway/workspaces"
+  # Durable workspace every worker runs in. Never cleared on a request path (a wiped workspace makes
+  # the agent rewrite its own files forever); clear it with `agy-accounts clean --workspace`.
+  workspace_dir: "/var/lib/agy-gateway/workspaces/shared"
 
 pool:
   worker_count: 2

@@ -121,6 +121,12 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 
 	modelEntry, found := h.modelRegistry.FindModel(req.Model)
 	if !found {
+		// Accounts exist but the catalog is empty: an operational fault, not a misspelled model.
+		if h.modelRegistry.HasAccounts() && h.modelRegistry.CatalogEmpty() {
+			h.writeAnthropicError(w, http.StatusServiceUnavailable, "api_error",
+				"Antigravity accounts are configured but no models could be enumerated (code: model_discovery_failed); check that the stored credentials can be exported")
+			return
+		}
 		h.writeAnthropicError(w, http.StatusNotFound, "not_found_error", fmt.Sprintf("The model %q does not exist", req.Model))
 		return
 	}
@@ -200,10 +206,20 @@ func (h *AnthropicHandlers) HandleMessages(w http.ResponseWriter, r *http.Reques
 
 	completionID := fmt.Sprintf("msg_%s", uuid.New().String()[:24])
 
+	// Anthropic has no body-level conversation identifier, so only the harness headers can isolate
+	// this turn's workspace directory. Resolving before the lease keeps the failure honest (an
+	// unwritable configured root is an operator fault, not a caller mistake).
+	workspaceDir, _, wsErr := workspaceDirForRequest(h.cfg, r, "")
+	if wsErr != nil {
+		h.writeAnthropicError(w, http.StatusInternalServerError, "api_error",
+			"The configured workspace directory is not writable: "+wsErr.Error())
+		return
+	}
+
 	if req.Stream {
-		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID)
+		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, workspaceDir, completionID)
 	} else {
-		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID)
+		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, workspaceDir, completionID)
 	}
 }
 
@@ -215,6 +231,7 @@ func (h *AnthropicHandlers) handleSync(
 	thoughtLevel string,
 	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
+	workspaceDir string,
 	completionID string,
 ) {
 	in := turnInput{
@@ -223,6 +240,7 @@ func (h *AnthropicHandlers) handleSync(
 		ThoughtLevel:  thoughtLevel,
 		SystemPrompt:  systemPrompt,
 		PromptBlocks:  promptBlocks,
+		WorkspaceDir:  workspaceDir,
 		StopSequences: req.StopSequences,
 	}
 
@@ -355,6 +373,7 @@ func (h *AnthropicHandlers) handleStreaming(
 	thoughtLevel string,
 	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
+	workspaceDir string,
 	completionID string,
 ) {
 	telemetry.DefaultMetrics.RequestsStreaming.Add(1)
@@ -434,6 +453,7 @@ func (h *AnthropicHandlers) handleStreaming(
 		ThoughtLevel:  thoughtLevel,
 		SystemPrompt:  systemPrompt,
 		PromptBlocks:  promptBlocks,
+		WorkspaceDir:  workspaceDir,
 		StopSequences: req.StopSequences,
 	}
 

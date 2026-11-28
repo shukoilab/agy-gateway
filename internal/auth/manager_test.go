@@ -227,26 +227,26 @@ func TestAuthExpired_RecoversAfterRetryWindow(t *testing.T) {
 	}
 }
 
-// TestSync_KeepsVaultReportedExpiryPermanent pins the counterpart: only an operator can fix a
-// credential the vault itself reports as expired.
+// TestSync_ExpiredIsARefresherStateNotAFault pins D2.
 //
-// @purpose Prevents the bounded retry window from masking a genuinely dead credential.
-// @Rationale Sync is authoritative about expiry; a runtime retry window must not survive it.
+// @purpose Stops a mere access-token refresh from removing an account from service.
+// @rationale `agy-auth list --json` reports `expired: true` for an account whose access token has
+// lapsed but whose refresh token is fine; `agy -p` keeps working with that same credential (measured).
+// Mapping it to AUTH_EXPIRED removed a working account for the whole retry window, and no caller ever
+// set it back.
 // @preconditions None.
 // @param t Standard Go test handle.
 // @returns None.
 // @throws None; failures are reported through t.Fatalf.
 // @invariants O(accounts); no subprocess.
-func TestSync_KeepsVaultReportedExpiryPermanent(t *testing.T) {
+func TestSync_ExpiredIsARefresherStateNotAFault(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(cfg, nil)
 	mgr.SetAccountsForTest([]Account{
 		{ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
-			Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{},
-			CooldownUntil: time.Now().Add(time.Hour)},
+			Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
 	})
 
-	// The vault reports this credential as expired; a stale runtime window must not revive it.
 	mgr.listForTest = func(context.Context) ([]byte, error) {
 		return []byte(`{"data":{"accounts":[{"id":"acct_a","email":"a@example.com","expired":true}]}}`), nil
 	}
@@ -255,11 +255,37 @@ func TestSync_KeepsVaultReportedExpiryPermanent(t *testing.T) {
 	}
 
 	acc := mgr.GetAccounts()[0]
-	if acc.Status != StatusAuthExpired {
-		t.Fatalf("status = %s, want AUTH_EXPIRED", acc.Status)
+	if acc.Status != StatusHealthy {
+		t.Fatalf("status = %s, want HEALTHY: `expired` describes a refresher state, not a dead credential", acc.Status)
 	}
-	if !acc.CooldownUntil.IsZero() {
-		t.Fatalf("a vault-reported expiry must be permanent, got cooldown until %v", acc.CooldownUntil)
+	if _, err := mgr.FindNextEligibleAccount("", "gemini-3.8-flash", false, nil); err != nil {
+		t.Fatalf("an account whose access token merely lapsed must stay selectable: %v", err)
+	}
+}
+
+// TestSync_SkipsUnstoredVaultEntry pins the `stored` contract.
+//
+// @purpose Stops a vault entry with no local snapshot from being offered as a usable account.
+// @rationale `agy-auth list` can report a row for an account whose snapshot is missing (for example
+// after a partial import). There is no credential to export, so treating it as healthy produced a
+// worker materialisation failure on every lease.
+// @preconditions None.
+// @param t Standard Go test handle.
+// @returns None.
+// @throws None; failures are reported through t.Fatalf.
+// @invariants O(accounts); no subprocess.
+func TestSync_SkipsUnstoredVaultEntry(t *testing.T) {
+	cfg := config.DefaultConfig()
+	mgr := NewManager(cfg, nil)
+	mgr.listForTest = func(context.Context) ([]byte, error) {
+		return []byte(`{"data":{"accounts":[{"id":"acct_a","email":"a@example.com","stored":false},{"id":"acct_b","email":"b@example.com","stored":true}]}}`), nil
+	}
+	if err := mgr.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	accounts := mgr.GetAccounts()
+	if len(accounts) != 1 || accounts[0].ID != "acct_b" {
+		t.Fatalf("only stored accounts may be used, got %+v", accounts)
 	}
 }
 
@@ -357,53 +383,35 @@ func TestSync_UnreadablePayloadKeepsAccounts(t *testing.T) {
 	}
 }
 
-// TestSync_RecoversAfterRelogin pins FINDING-C2-02.
+// TestSync_RuntimeAuthExpiredSurvivesVaultRefresh pins the lifecycle of a runtime fault.
 //
-// @purpose Makes `agy-auth login` actually restore an account instead of requiring a restart.
-// @Rationale A vault-reported AUTH_EXPIRED was carried forward even after the vault reported
-// `expired:false`, so the operator's fresh credential stayed invisible.
+// @purpose Proves a runtime credential fault is cleared only by its own retry window, not by a vault
+// refresh that has nothing to say about it.
+// @rationale Sync now reconstructs every field from the vault except status, which the fault and retry
+// machinery owns. A refresh that silently reset it to HEALTHY would return a dead credential to
+// service on every poll.
 // @preconditions None.
 // @param t Standard Go test handle.
 // @returns None.
 // @throws None; failures are reported through t.Fatalf.
 // @invariants O(accounts); no subprocess.
-func TestSync_RecoversAfterRelogin(t *testing.T) {
+func TestSync_RuntimeAuthExpiredSurvivesVaultRefresh(t *testing.T) {
 	cfg := config.DefaultConfig()
 	mgr := NewManager(cfg, nil)
 	mgr.SetAccountsForTest([]Account{
-		{ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusHealthy,
-			Quotas: map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
+		{ID: "acct_a", Email: "a@example.com", Enabled: true, Status: StatusAuthExpired,
+			CooldownUntil: time.Now().Add(time.Hour),
+			Quotas:        map[string]QuotaGroup{}, FamilyCooldowns: map[string]time.Time{}},
 	})
 
-	expired := func(context.Context) ([]byte, error) {
-		return []byte(`{"data":{"accounts":[{"id":"acct_a","email":"a@example.com","expired":true}]}}`), nil
-	}
-	healthy := func(context.Context) ([]byte, error) {
+	mgr.listForTest = func(context.Context) ([]byte, error) {
 		return []byte(`{"data":{"accounts":[{"id":"acct_a","email":"a@example.com","expired":false}]}}`), nil
 	}
-
-	mgr.listForTest = expired
 	if err := mgr.Sync(context.Background()); err != nil {
-		t.Fatalf("Sync(expired): %v", err)
+		t.Fatalf("Sync: %v", err)
 	}
 	if got := mgr.GetAccounts()[0].Status; got != StatusAuthExpired {
-		t.Fatalf("status = %s, want AUTH_EXPIRED", got)
-	}
-
-	// The operator ran `agy-auth login`; the vault now reports the credential as healthy.
-	mgr.listForTest = healthy
-	if err := mgr.Sync(context.Background()); err != nil {
-		t.Fatalf("Sync(healthy): %v", err)
-	}
-	acc := mgr.GetAccounts()[0]
-	if acc.Status != StatusHealthy {
-		t.Fatalf("status after re-login = %s, want HEALTHY", acc.Status)
-	}
-	if acc.VaultExpired {
-		t.Fatal("vault_expired must be cleared once the vault reports the credential healthy")
-	}
-	if _, err := mgr.FindNextEligibleAccount("", "gemini-3.8-flash", false, nil); err != nil {
-		t.Fatalf("the re-logged-in account must be selectable: %v", err)
+		t.Fatalf("status = %s, want AUTH_EXPIRED carried across a vault refresh", got)
 	}
 }
 

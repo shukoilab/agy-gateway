@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"agy-gateway/internal/models"
+	"agy-gateway/internal/pool"
 )
 
 // SwitchAccountRequest defines the payload for switching the default active Antigravity account.
@@ -25,6 +26,32 @@ type StatusResponse struct {
 	Status string `json:"status" example:"switched"`
 	// Target account or entity impacted by the operation, if applicable
 	Target string `json:"target,omitempty" example:"work-account"`
+}
+
+// SwitchResultResponse reports what a switch actually did.
+//
+//	@purpose	Distinguishes "the vault now says X is active" from "workers now serve X".
+//	@rationale	A vault switch alone leaves every worker on its previous credential, so an operator
+//	reading an unconditional success concluded traffic had moved when it had not.
+//	@invariants	Unchanged is true exactly when WorkerMoves is empty.
+type SwitchResultResponse struct {
+	Status      string            `json:"status" example:"switched"`
+	Target      string            `json:"target,omitempty" example:"work-account"`
+	AccountID   string            `json:"account_id,omitempty" example:"acct_cb5897f277"`
+	Unchanged   bool              `json:"unchanged"`
+	WorkerMoves []pool.WorkerMove `json:"worker_moves"`
+}
+
+// RotateResultResponse reports what a rotation actually did.
+//
+//	@purpose	Makes an honest no-op visible instead of answering "rotated" unconditionally.
+//	@rationale	`agy-auth rotate` exits 0 when it decides nothing needs to move; the gateway's own
+//	rotation is per worker, so the moved set is the only truthful report.
+//	@invariants	Unchanged is true exactly when WorkerMoves is empty.
+type RotateResultResponse struct {
+	Status      string            `json:"status" example:"rotated"`
+	Unchanged   bool              `json:"unchanged"`
+	WorkerMoves []pool.WorkerMove `json:"worker_moves"`
 }
 
 // LoginInitRequest defines input parameters to initialize a headless OAuth onboarding flow.

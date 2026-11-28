@@ -112,6 +112,14 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 
 	modelEntry, found := h.modelRegistry.FindModel(req.Model)
 	if !found {
+		// Accounts exist but no model could be enumerated: that is an operational fault, not a typo.
+		// Answering model_not_found here sent operators looking for a misspelled id.
+		if h.modelRegistry.HasAccounts() && h.modelRegistry.CatalogEmpty() {
+			h.writeOpenAIError(w, http.StatusServiceUnavailable,
+				"Antigravity accounts are configured but no models could be enumerated; check that the stored credentials can be exported (`agy-accounts list`)",
+				"api_error", "model_discovery_failed", "")
+			return
+		}
 		h.writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf("The model %q does not exist", req.Model), "invalid_request_error", "model_not_found", "model")
 		return
 	}
@@ -171,14 +179,25 @@ func (h *OpenAIHandlers) HandleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 	thoughtLevel := config.MapReasoningEffort(effort, h.cfg.OpenAI.DefaultReasoningEffort)
 
+	// Resolve the workspace directory before any worker is leased: the directory is derived from the
+	// harness's own conversation identifier, so two live conversations cannot overwrite each other's
+	// files. A failure here is an operational fault (the configured root is not writable), not a
+	// caller mistake.
+	workspaceDir, _, wsErr := workspaceDirForRequest(h.cfg, r, req.PromptCacheKey)
+	if wsErr != nil {
+		h.writeOpenAIError(w, http.StatusInternalServerError,
+			"The configured workspace directory is not writable: "+wsErr.Error(), "api_error", "workspace_unavailable", "")
+		return
+	}
+
 	// 2. Execute turn through worker pool with transparent failover
 	createdTime := time.Now().Unix()
 	completionID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:14])
 
 	if req.Stream {
-		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID, createdTime)
+		h.handleStreaming(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, workspaceDir, completionID, createdTime)
 	} else {
-		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, completionID, createdTime)
+		h.handleSync(w, r, &req, modelEntry, thoughtLevel, systemPrompt, promptBlocks, workspaceDir, completionID, createdTime)
 	}
 }
 
@@ -190,6 +209,7 @@ func (h *OpenAIHandlers) handleSync(
 	thoughtLevel string,
 	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
+	workspaceDir string,
 	completionID string,
 	createdTime int64,
 ) {
@@ -199,6 +219,7 @@ func (h *OpenAIHandlers) handleSync(
 		ThoughtLevel:  thoughtLevel,
 		SystemPrompt:  systemPrompt,
 		PromptBlocks:  promptBlocks,
+		WorkspaceDir:  workspaceDir,
 		StopSequences: normalizeStopSequences(req.Stop),
 	}
 
@@ -302,6 +323,7 @@ func (h *OpenAIHandlers) handleStreaming(
 	thoughtLevel string,
 	systemPrompt string,
 	promptBlocks []acp.PromptBlock,
+	workspaceDir string,
 	completionID string,
 	createdTime int64,
 ) {
@@ -373,6 +395,7 @@ func (h *OpenAIHandlers) handleStreaming(
 		ThoughtLevel:  thoughtLevel,
 		SystemPrompt:  systemPrompt,
 		PromptBlocks:  promptBlocks,
+		WorkspaceDir:  workspaceDir,
 		StopSequences: normalizeStopSequences(req.Stop),
 	}
 

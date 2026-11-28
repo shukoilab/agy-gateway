@@ -99,12 +99,11 @@ type BinariesConfig struct {
 // system_prompt_channel is gone for the same reason: only one delivery path works, so a knob to pick
 // another would only exist to be misconfigured.
 type ExecutionConfig struct {
-	CleanWorkspaceBetweenRequests bool          `yaml:"clean_workspace_between_requests"`
-	StrictClientToolDelegation    bool          `yaml:"strict_client_tool_delegation"`
-	VisionMode                    string        `yaml:"vision_mode"`
-	MaxRetries                    int           `yaml:"max_retries"`
-	RetryInitialBackoff           time.Duration `yaml:"retry_initial_backoff"`
-	RetryMaxBackoff               time.Duration `yaml:"retry_max_backoff"`
+	StrictClientToolDelegation bool          `yaml:"strict_client_tool_delegation"`
+	VisionMode                 string        `yaml:"vision_mode"`
+	MaxRetries                 int           `yaml:"max_retries"`
+	RetryInitialBackoff        time.Duration `yaml:"retry_initial_backoff"`
+	RetryMaxBackoff            time.Duration `yaml:"retry_max_backoff"`
 	// MaxHistoryTokens bounds the conversational history forwarded to the agent per turn. Above
 	// ~100K estimated tokens the agent stops converging and re-issues the same tool calls, so the
 	// budget is enforced by compacting the oldest tool results first (head and tail kept), which
@@ -161,12 +160,28 @@ type CapabilitiesConfig struct {
 	SessionMetadata bool `yaml:"session_metadata"`
 }
 
+// defaultBaseDataDir is the shipped storage root; EffectiveWorkspaceDir uses it to detect an untouched
+// default workspace_dir that should follow a relocated workspaces root.
+const defaultBaseDataDir = "/var/lib/agy-gateway"
+
 type StorageConfig struct {
 	BaseDataDir       string `yaml:"base_data_dir"`
 	VaultXDGConfigDir string `yaml:"vault_xdg_config_dir"`
 	WorkersRootDir    string `yaml:"workers_root_dir"`
 	WorkersTmpDir     string `yaml:"workers_tmp_dir"`
 	WorkspacesRootDir string `yaml:"workspaces_root_dir"`
+	// WorkspaceDir is the durable workspace ROOT every worker runs in.
+	//
+	// @purpose Gives all workers, and therefore all accounts, one directory, so a file the agent wrote
+	// survives an account rotation, a worker recycle, and a restart.
+	// @rationale Previously each worker had its own `workspaces/wN` and the tree was wiped on every
+	// release. Both facts destroyed the agent's own output between turns: with rotation enabled the
+	// agent re-created the same files forever, which is the loop this setting exists to end. The
+	// directory is also the operator's mount point for external harnesses, so it must be a
+	// configuration value rather than a literal.
+	// @invariants Defaults to `<workspaces_root_dir>/shared`; must not sit inside the workers root or
+	// equal a worker HOME (validated at startup), because deleting an account removes worker HOMEs.
+	WorkspaceDir string `yaml:"workspace_dir"`
 }
 
 type PoolConfig struct {
@@ -409,14 +424,13 @@ func DefaultConfig() *Config {
 			AgyAuthPath:   "/usr/local/bin/agy-auth",
 		},
 		Execution: ExecutionConfig{
-			CleanWorkspaceBetweenRequests: true,
-			StrictClientToolDelegation:    true,
-			VisionMode:                    VisionModeAuto,
-			MaxRetries:                    3,
-			RetryInitialBackoff:           500 * time.Millisecond,
-			RetryMaxBackoff:               10 * time.Second,
-			MaxHistoryTokens:              60000,
-			UnsupportedParameterPolicy:    UnsupportedParameterPolicyIgnore,
+			StrictClientToolDelegation: true,
+			VisionMode:                 VisionModeAuto,
+			MaxRetries:                 3,
+			RetryInitialBackoff:        500 * time.Millisecond,
+			RetryMaxBackoff:            10 * time.Second,
+			MaxHistoryTokens:           60000,
+			UnsupportedParameterPolicy: UnsupportedParameterPolicyIgnore,
 		},
 		Identity: IdentityConfig{
 			Profile: IdentityProfileZed,
@@ -437,6 +451,7 @@ func DefaultConfig() *Config {
 			WorkersRootDir:    "/var/lib/agy-gateway/workers",
 			WorkersTmpDir:     "/var/lib/agy-gateway/tmp",
 			WorkspacesRootDir: "/var/lib/agy-gateway/workspaces",
+			WorkspaceDir:      "/var/lib/agy-gateway/workspaces/shared",
 		},
 		Pool: PoolConfig{
 			WorkerCount:            2,
@@ -582,6 +597,7 @@ var removedConfigKeys = []struct{ section, key string }{
 	{"execution", "acp_session_mode"},
 	{"execution", "auto_approve_permissions"},
 	{"execution", "system_prompt_channel"},
+	{"execution", "clean_workspace_between_requests"},
 	{"binaries", "agy_acp_args"},
 	{"openai", "unsupported_param_policy"},
 	{"anthropic", "unsupported_param_policy"},
@@ -599,6 +615,7 @@ var removedEnvKeys = []string{
 	"ACP_SESSION_MODE",
 	"AGY_GW_AUTO_APPROVE_PERMISSIONS",
 	"AGY_GW_SYSTEM_PROMPT_CHANNEL",
+	"AGY_GW_CLEAN_WORKSPACE",
 	"AGY_GW_AGY_ACP_ARGS",
 	"AGY_GW_UNSUPPORTED_PARAM_POLICY",
 	"AGY_GW_ANTHROPIC_UNSUPPORTED_PARAM_POLICY",
@@ -611,15 +628,17 @@ var removedEnvKeys = []string{
 // This map is the single source of truth for both the YAML and env key sets; keys absent here emit no
 // note, which Validate-free lookups in tests assert against.
 var removedKeyNotes = map[string]string{
-	"execution.acp_session_mode":         "plan vs build is now decided by the consumer system prompt",
-	"execution.auto_approve_permissions": "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"execution.system_prompt_channel":    "the consumer system prompt is always sent as the first prompt block",
-	"binaries.agy_acp_args":              "the ACP argv is fixed by the gateway",
-	"AGY_GW_ACP_SESSION_MODE":            "plan vs build is now decided by the consumer system prompt",
-	"ACP_SESSION_MODE":                   "plan vs build is now decided by the consumer system prompt",
-	"AGY_GW_AUTO_APPROVE_PERMISSIONS":    "auto-approval is unconditional (--dangerously-skip-permissions)",
-	"AGY_GW_SYSTEM_PROMPT_CHANNEL":       "the consumer system prompt is always sent as the first prompt block",
-	"AGY_GW_AGY_ACP_ARGS":                "the ACP argv is fixed by the gateway",
+	"execution.acp_session_mode":                 "plan vs build is now decided by the consumer system prompt",
+	"execution.auto_approve_permissions":         "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"execution.system_prompt_channel":            "the consumer system prompt is always sent as the first prompt block",
+	"execution.clean_workspace_between_requests": "the workspace is durable; clear it with `agy-accounts clean --workspace`",
+	"AGY_GW_CLEAN_WORKSPACE":                     "the workspace is durable; clear it with `agy-accounts clean --workspace`",
+	"binaries.agy_acp_args":                      "the ACP argv is fixed by the gateway",
+	"AGY_GW_ACP_SESSION_MODE":                    "plan vs build is now decided by the consumer system prompt",
+	"ACP_SESSION_MODE":                           "plan vs build is now decided by the consumer system prompt",
+	"AGY_GW_AUTO_APPROVE_PERMISSIONS":            "auto-approval is unconditional (--dangerously-skip-permissions)",
+	"AGY_GW_SYSTEM_PROMPT_CHANNEL":               "the consumer system prompt is always sent as the first prompt block",
+	"AGY_GW_AGY_ACP_ARGS":                        "the ACP argv is fixed by the gateway",
 	// Both policies were replaced by one key covering every provider:
 	// execution.unsupported_parameter_policy / AGY_GW_UNSUPPORTED_PARAMETER_POLICY (ignore|reject).
 	"openai.unsupported_param_policy":           "replaced by execution.unsupported_parameter_policy (ignore|reject)",
@@ -788,6 +807,9 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 		if cfg.Storage.WorkspacesRootDir == "" || strings.HasPrefix(cfg.Storage.WorkspacesRootDir, "/var/lib/agy-gateway") {
 			cfg.Storage.WorkspacesRootDir = filepath.Join(v, "workspaces")
 		}
+		if cfg.Storage.WorkspaceDir == "" || strings.HasPrefix(cfg.Storage.WorkspaceDir, "/var/lib/agy-gateway") {
+			cfg.Storage.WorkspaceDir = filepath.Join(cfg.Storage.WorkspacesRootDir, "shared")
+		}
 	}
 	if v := os.Getenv("AGY_GW_VAULT_DIR"); v != "" {
 		cfg.Storage.VaultXDGConfigDir = v
@@ -797,6 +819,9 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	}
 	if v := os.Getenv("AGY_GW_WORKSPACES_DIR"); v != "" {
 		cfg.Storage.WorkspacesRootDir = v
+	}
+	if v := os.Getenv("AGY_GW_WORKSPACE_DIR"); v != "" {
+		cfg.Storage.WorkspaceDir = v
 	}
 	if v := os.Getenv("AGY_GW_TMP_DIR"); v != "" {
 		cfg.Storage.WorkersTmpDir = v
@@ -970,9 +995,6 @@ func applyEnvOverrides(cfg *Config) { // 1. Server Overrides
 	// 5d. Execution Policy Overrides
 	// acp_session_mode, auto_approve_permissions and agy_acp_args are no longer read: they are
 	// product invariants now (see acp.SpawnArgs).
-	if v := os.Getenv("AGY_GW_CLEAN_WORKSPACE"); v != "" {
-		cfg.Execution.CleanWorkspaceBetweenRequests = parseBoolEnv(v, cfg.Execution.CleanWorkspaceBetweenRequests)
-	}
 	if v := os.Getenv("AGY_GW_VISION_MODE"); v != "" {
 		cfg.Execution.VisionMode = strings.TrimSpace(v)
 	}
@@ -1230,6 +1252,9 @@ func validate(cfg *Config) error {
 	if cfg.Binaries.AgyAuthPath == "" {
 		return fmt.Errorf("binaries.agy_auth_path cannot be empty")
 	}
+	if err := validateWorkspaceDir(cfg.Storage.WorkspaceDir, cfg.Storage.WorkspacesRootDir, cfg.Storage.WorkersRootDir); err != nil {
+		return err
+	}
 	if !validVisionMode(cfg.Execution.VisionMode) {
 		return fmt.Errorf("execution.vision_mode must be one of %v, got %q",
 			visionModes, cfg.Execution.VisionMode)
@@ -1391,4 +1416,75 @@ func validate(cfg *Config) error {
 	}
 
 	return nil
+}
+
+// validateWorkspaceDir refuses a workspace root whose deletion or accidental reuse would destroy
+// credentials.
+//
+// @purpose Keeps the shared workspace a data directory, never a place that overlaps worker HOMEs.
+// @rationale The workspace is the mount point for external harnesses and the directory every worker
+// runs in, so a misconfiguration such as `/` or `<workers_root>/w0` would either wipe the filesystem
+// or make the account-purge path delete the very directory the agent is writing into.
+// @preconditions None; any of the three paths may be empty (validation is then skipped).
+// @param dir Configured storage.workspace_dir.
+// @param workspacesRoot Configured storage.workspaces_root_dir.
+// @param workersRoot Configured storage.workers_root_dir.
+// @returns A typed error naming the offending field, or nil.
+// @throws None; all failures are returned as values.
+// @invariants O(1) path comparisons; no filesystem access.
+func validateWorkspaceDir(dir, workspacesRoot, workersRoot string) error {
+	if strings.TrimSpace(dir) == "" {
+		// Empty means "derive from storage.workspaces_root_dir"; EffectiveWorkspaceDir does that.
+		return nil
+	}
+	cleanDir := filepath.Clean(dir)
+	if !filepath.IsAbs(cleanDir) {
+		return fmt.Errorf("storage.workspace_dir must be absolute, got %q", dir)
+	}
+	if cleanDir == string(filepath.Separator) {
+		return fmt.Errorf("storage.workspace_dir refuses the filesystem root")
+	}
+	// A workspace inside the workers root would be deleted along with a worker HOME during an account
+	// purge, and could equal a worker's own home — either way the agent's files would be collateral.
+	if workersRoot != "" {
+		cleanWorkers := filepath.Clean(workersRoot)
+		if cleanDir == cleanWorkers || strings.HasPrefix(cleanDir, cleanWorkers+string(filepath.Separator)) {
+			return fmt.Errorf("storage.workspace_dir %q must not be inside storage.workers_root_dir %q",
+				dir, workersRoot)
+		}
+	}
+	// The workspace may be the workspaces root itself, but must not escape it either.
+	if workspacesRoot != "" {
+		cleanRoot := filepath.Clean(workspacesRoot)
+		if cleanDir != cleanRoot && !strings.HasPrefix(cleanDir, cleanRoot+string(filepath.Separator)) {
+			return fmt.Errorf("storage.workspace_dir %q must be inside storage.workspaces_root_dir %q",
+				dir, workspacesRoot)
+		}
+	}
+	return nil
+}
+
+// EffectiveWorkspaceDir returns the workspace directory actually used at runtime.
+//
+// @purpose Single source of truth for a path that both the worker pool and the HTTP handlers need.
+// @rationale `workspace_dir` defaults to a path under the deployment's base data directory. A process
+// whose `workspaces_root_dir` was overridden (every test, and any relocation) would otherwise try the
+// default absolute path and fail with a permission error. A value that is still the shipped default
+// therefore follows the configured root; an explicitly set value always wins.
+// @preconditions None.
+// @param None.
+// @returns The workspace root, or "" when neither field is configured.
+// @throws None.
+// @invariants O(path components); pure.
+func (s StorageConfig) EffectiveWorkspaceDir() string {
+	if s.WorkspaceDir != "" && !strings.HasPrefix(filepath.Clean(s.WorkspaceDir), defaultBaseDataDir) {
+		return s.WorkspaceDir
+	}
+	if s.WorkspacesRootDir != "" {
+		return filepath.Join(s.WorkspacesRootDir, "shared")
+	}
+	// An untouched default with no root configured means storage was never set up in this process (a
+	// test, or a handler constructed without a full config). Reporting "" keeps the caller on the
+	// worker's own Cwd instead of trying to create a path under the shipped absolute default.
+	return ""
 }

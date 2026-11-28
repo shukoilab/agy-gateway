@@ -250,7 +250,6 @@ func TestConfig_ParseDurationEnv(t *testing.T) {
 func TestConfig_NewEnvOverrides(t *testing.T) {
 	t.Setenv("AGY_GW_QUOTA_POLL_INTERVAL", "1800s")
 	t.Setenv("AGY_GW_VISION_MODE", "reject")
-	t.Setenv("AGY_GW_CLEAN_WORKSPACE", "false")
 	t.Setenv("AGY_GW_DEFAULT_COOLDOWN_5H", "45m")
 	t.Setenv("AGY_GW_DEFAULT_COOLDOWN_WEEKLY", "12h")
 
@@ -262,9 +261,6 @@ func TestConfig_NewEnvOverrides(t *testing.T) {
 	}
 	if cfg.Execution.VisionMode != VisionModeReject {
 		t.Errorf("expected VisionMode %q, got %v", VisionModeReject, cfg.Execution.VisionMode)
-	}
-	if cfg.Execution.CleanWorkspaceBetweenRequests {
-		t.Errorf("expected CleanWorkspaceBetweenRequests false, got %v", cfg.Execution.CleanWorkspaceBetweenRequests)
 	}
 	if cfg.Accounts.DefaultCooldown5h != 45*time.Minute {
 		t.Errorf("expected DefaultCooldown5h 45m, got %v", cfg.Accounts.DefaultCooldown5h)

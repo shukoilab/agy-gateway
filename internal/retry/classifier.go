@@ -26,6 +26,20 @@ import (
 // @invariants Immutable; safe for concurrent use.
 var ErrEmptyCompletion = errors.New("agent returned an empty completion")
 
+// ErrQuotaRefusal reports that an account refused a turn because its own quota is exhausted.
+//
+// @purpose Marks a quota refusal that arrived as ordinary assistant text instead of an error.
+// @rationale agy answers an exhausted account with `stopReason: "end_turn"` and a plain
+// `agent_message_chunk` saying "Individual quota reached…". Nothing in the transport marks it as a
+// failure, so without this sentinel the gateway reported success and the client saw a subscription
+// upsell. Detecting the text and returning this sentinel is what lets the existing rotation machinery
+// take over.
+// @preconditions None.
+// @returns A shared sentinel matched with errors.Is.
+// @throws None.
+// @invariants Immutable; safe for concurrent use.
+var ErrQuotaRefusal = errors.New("account quota exhausted")
+
 // FailureClass enumerates the deterministic category of a runtime error.
 type FailureClass int
 
@@ -130,6 +144,13 @@ func ClassifyFailure(err error) FailureClass {
 	// string heuristics below (which could otherwise misclassify its wording).
 	if errors.Is(err, ErrEmptyCompletion) {
 		return FailureClassEmptyCompletion
+	}
+
+	// A quota refusal detected in assistant text must be classified before the string heuristics: the
+	// message is entirely human-readable prose, and "resets in" would otherwise fall through to
+	// NON_RETRYABLE and end the request instead of rotating to an account that still has quota.
+	if errors.Is(err, ErrQuotaRefusal) {
+		return FailureClassQuotaExhausted
 	}
 
 	// 3. Check for typed network / syscall errors

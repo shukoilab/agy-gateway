@@ -6,7 +6,7 @@
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker" alt="Docker Ready"></a>
   <a href="https://github.com/shukoilab/agy-gateway/pkgs/container/agy-gateway"><img src="https://img.shields.io/badge/GHCR-Package-blue?logo=github" alt="GHCR"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
-  <a href="https://github.com/shukoilab/agy-gateway/releases"><img src="https://img.shields.io/badge/Release-v3.17.0-purple.svg" alt="Release"></a>
+  <a href="https://github.com/shukoilab/agy-gateway/releases"><img src="https://img.shields.io/badge/Release-v3.18.3-purple.svg" alt="Release"></a>
 </p>
 
 <p align="center">
@@ -94,9 +94,21 @@ block telling the model its workspace is empty and that only `mcp_client-tools_*
 is deliberate: `agy` otherwise begins reaching for built-in container tools that cannot work here. It
 is the only text the gateway adds, and it is configurable off.
 
-**Between requests** the worker's workspace is cleared (everything except `.git`), together with
-`~/.gemini/antigravity-cli/conversations/*` and `.../brain/*`, so an account's state never leaks into
-the next turn.
+**The workspace is durable, and that is load-bearing.** Every worker runs in the same configured
+directory (`storage.workspace_dir`, default `<workspaces_root_dir>/shared`), and nothing deletes it
+between requests. Previously each worker had its own directory and it was wiped on every release,
+so any file the agent wrote vanished before it could use it — the agent rewrote it forever, which is
+an infinite loop with extra steps. Only the account-owned caches
+(`~/.gemini/antigravity-cli/{conversations,brain,annotations}` and
+`conversation_summaries.db*`) are cleared, and only when a worker is rebound to a different account.
+Clearing the workspace itself is an explicit operator action: `agy-accounts clean --workspace`.
+
+**Per-conversation directories.** If the caller sends a conversation id in a header
+(`x-session-affinity`, `X-Session-Id`, `Session-Id`, `x-opencode-session`, `x-opencode-session-id` —
+any of which OpenCode, LiteLLM, LangChain-Fireworks, pi and openclaw already send) or as the body field
+`prompt_cache_key`, the turn runs in `<workspace_dir>/<sha256 of that id>` instead of the root. The
+hash keeps caller input out of the path, two conversations cannot collide, and a harness that sends
+nothing behaves exactly as before. The id never influences which account serves the turn.
 
 **Observability.** `/metrics` exposes 17 series: request and stream counts, `acp_sessions_created_total`,
 `acp_sessions_closed_total`, `acp_sessions_live` (created − closed, i.e. the leak detector),
@@ -216,6 +228,38 @@ by one policy layer: scheme allow-list, size cap, fetch timeout, content-type al
 re-validation, and refusal of loopback / private / link-local targets unless
 `media.allow_private_hosts` is explicitly enabled.
 
+### Workspace
+
+| Setting | Env | Default | Meaning |
+| :--- | :--- | :--- | :--- |
+| `storage.workspace_dir` | `AGY_GW_WORKSPACE_DIR` | `<workspaces_root_dir>/shared` | The directory every worker runs in. Durable: never cleared on a request path. Mount it on the host if a harness outside the container must edit the same files. |
+| `accounts.allocation_strategy` | `AGY_GW_ALLOCATION_STRATEGY` | `round_robin` | `round_robin` \| `least_used` \| `sticky` — all three now filter by eligibility. |
+
+Bind-mount it in compose so opencode, Hermes, or any editor can do real file CRUD:
+
+```yaml
+volumes:
+  - ./workspace:/var/lib/agy-gateway/workspaces/shared
+```
+
+The directory must lie under `workspaces_root_dir` and must not be inside `workers_root_dir`; startup
+validates both, because a workspace inside the workers tree would be destroyed by the purge.
+
+### Model catalog
+
+`/v1/models` is discovered from one borrowed credential (`agy models`, ~2 s, cached in process). Every
+account returns the identical catalog, so one is enough; the credential comes from an existing worker
+home when one holds a token, otherwise from a scratch home holding the vault's active account. The
+gateway does **not** infer tier from a model id: a Free account was measured serving
+`claude-opus-4-6-thinking`, so entitlement is whatever upstream accepts. If accounts exist but nothing
+could be enumerated, chat answers `503 model_discovery_failed` instead of a misleading
+`model_not_found`.
+
+### Plan labels
+
+`plan` is read by a separate command from the vault read and cached. When upstream omits it — it omits
+`plan` and `usage` together whenever quota is unavailable — it is rendered `Unknown`, never `Free`.
+
 ### Proxy
 
 Set `AGY_GW_PROXY_ENABLED` plus `AGY_GW_PROXY_HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (or the bare
@@ -259,6 +303,7 @@ Provider-native shapes only; there are no gateway-invented codes.
 | Agent lacks a required ACP method (`-32601`) | `500` | `api_error` |
 | Agent ended the turn with no output | `502` | `empty_completion` |
 | Credential needs re-login | `401` | `account_auth_required` |
+| Accounts exist but no models could be enumerated | `503` | `model_discovery_failed` |
 
 `empty_completion` matters: `agy` reports an internally exhausted quota as a successful `end_turn`
 with no content. Returning `200` there would claim work that did not happen.
@@ -306,7 +351,20 @@ agy-accounts remove <id|alias|email>
 agy-accounts switch <id|alias|email>
 agy-accounts rotate
 agy-accounts alias set|clear <query> [alias]
+agy-accounts clean [--dry-run] [--workspace]
 ```
+
+`switch` and `rotate` are honest about their scope: run from the CLI they change the vault and say so,
+because that process owns no workers. Through `POST /admin/v1/accounts/{switch,rotate}` the daemon
+additionally rebinds every worker, respawns them, and returns the per-worker `from` → `to` transitions
+plus an `unchanged` flag.
+
+`clean` removes orphan worker homes (any `w<N>` beyond `worker_count`, including surplus homes left by a
+previously larger configuration) and, with `--dry-run`, lists exactly what it would remove. Account
+deletion removes the whole worker home that held the deleted credential — token, conversations,
+summaries and brain artifacts — regardless of `worker_count`. Only `agy-auth`'s own plaintext
+`backups/registry-*.json` metadata is beyond the gateway's reach; the CLI says so rather than pretending
+otherwise.
 
 Menu options: `[1]` list + live quotas, `[2]` add (OAuth), `[3]` switch active, `[4]` force rotation,
 `[5]` set alias, `[7]` remove, `[8]` clean vault cache, `[10]` Anthropic model aliases and ranking,
